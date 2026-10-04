@@ -7,7 +7,7 @@ FROM alpine:3.24
 ARG EXTRA_PACKAGES=""
 ARG EXTRA_COMMANDS=""
 
-RUN apk update && apk upgrade && apk add libgcc
+RUN apk update && apk upgrade && apk add libgcc bash vim
 
 # Optional additional packages (populated by build-runner from the
 # `extra-packages` file).
@@ -28,6 +28,7 @@ RUN addgroup -g ${GROUP_ID} clanky 2>/dev/null || true && \
     mkdir -p /home/clanky/.clanky && chown ${USER_ID}:${GROUP_ID} /home/clanky/.clanky
 ENV HOME=/home/clanky
 ENV TERM=xterm-256color
+ENV EDITOR=/usr/bin/vim
 
 COPY clanky /usr/local/bin/clanky
 ENTRYPOINT ["/usr/local/bin/clanky"]

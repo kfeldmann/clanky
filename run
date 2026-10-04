@@ -21,6 +21,17 @@ set -eu
 # (docker would otherwise create it as root).
 mkdir -p "$HOME/.clanky"
 
+if [ -z $DEEPINFRA_URL ]
+then
+    echo "ERROR: Missing required environment variable: DEEPINFRA_URL" >&2
+    exit 1
+fi
+if [ -z $DEEPINFRA_TOKEN ]
+then
+    echo "ERROR: Missing required environment variable: DEEPINFRA_TOKEN" >&2
+    exit 1
+fi
+
 if [ -t 0 ]; then
     INTERACTIVE_FLAGS="-it" # real terminal
 elif read -t 0 <&0; then
@@ -33,6 +44,8 @@ fi
 # "-it"/"-i" word-splits into docker run's -i/-t flags.
 docker run \
   ${INTERACTIVE_FLAGS} --rm \
+  --env DEEPINFRA_URL \
+  --env DEEPINFRA_TOKEN \
   -v "$(pwd):/work" \
   -v "$HOME/.clanky:/home/clanky/.clanky" \
   -w /work \
