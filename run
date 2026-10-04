@@ -1,0 +1,39 @@
+#!/bin/sh
+# Run the clanky runner container.
+#
+# Mounts the current working directory as the working directory inside the
+# container (project-scope .clanky lives in there), and ~/.clanky as the
+# container user's ~/.clanky (user-scope config/state). All state therefore
+# stays in these mounts, so the container is run with --rm.
+#
+# Any arguments are passed through to clanky, e.g.:
+#   ./run                  (interactive TUI)
+#   ./run -p "prompt"      (CLI mode)
+#
+# Terminal detection:
+#   real terminal            -> -it
+#   pipe/redirect, data ready-> -i
+#   pipe/redirect, no data   -> no flags
+
+set -eu
+
+# Make sure the host side of the user-scope mount exists and is owned by us
+# (docker would otherwise create it as root).
+mkdir -p "$HOME/.clanky"
+
+if [ -t 0 ]; then
+    INTERACTIVE_FLAGS="-it" # real terminal
+elif read -t 0 <&0; then
+    INTERACTIVE_FLAGS="-i"  # pipe/redirect with data ready
+else
+    INTERACTIVE_FLAGS=""    # pipe/redirect but no data — skip -i
+fi
+
+# ${INTERACTIVE_FLAGS} is intentionally unquoted: empty expands to nothing,
+# "-it"/"-i" word-splits into docker run's -i/-t flags.
+docker run \
+  ${INTERACTIVE_FLAGS} --rm \
+  -v "$(pwd):/work" \
+  -v "$HOME/.clanky:/home/clanky/.clanky" \
+  -w /work \
+  clanky-runner:latest "$@"

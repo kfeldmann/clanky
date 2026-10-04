@@ -1,0 +1,49 @@
+#!/bin/sh
+# Build the clanky runner image: Alpine + the compiled release binary, with
+# a user matching the invoking user's UID:GID (so the directories mounted by
+# the `run` script are read/writable inside the container).
+#
+# Optional, personal (gitignored) files in the project root:
+# - extra-packages: package names (one per line, '#' comments), appended to
+#   an `apk add` line
+# - extra-commands: shell commands ('#'-commented lines skipped), appended
+#   to a `RUN` line. Intended for things like `pip3 install --break-system-
+#   packages ...`; put multiple commands on one line with &&
+
+set -eu
+
+cd "$(dirname "$0")"
+
+# Stage the release binary where the Dockerfile can COPY it (docker/ is the
+# build context, so the huge target/ dir stays out of it). Requires a musl
+# binary, so it must have been produced by ./build-linux-musl.
+if [ ! -x target/release/clanky ]; then
+  echo "ERROR: target/release/clanky not found. Run ./build-linux-musl first." >&2
+  exit 1
+fi
+cp target/release/clanky docker/clanky
+
+# Get user and group ids
+USER_ID=$(id -u)
+GROUP_ID=$(id -g)
+
+# Read optional extra packages
+EXTRA_PACKAGES=""
+if [ -f extra-packages ]; then
+  EXTRA_PACKAGES=$(grep -v '^#' extra-packages | tr '\n' ' ' | xargs)
+fi
+
+# Read optional extra commands (first non-comment line)
+EXTRA_COMMANDS=""
+if [ -f extra-commands ]; then
+  EXTRA_COMMANDS=$(grep -v '^#' extra-commands | head -1)
+fi
+
+docker build \
+  --build-arg USER_ID="${USER_ID}" \
+  --build-arg GROUP_ID="${GROUP_ID}" \
+  --build-arg EXTRA_PACKAGES="${EXTRA_PACKAGES}" \
+  --build-arg EXTRA_COMMANDS="${EXTRA_COMMANDS}" \
+  -f docker/runner.Dockerfile \
+  -t clanky-runner:latest \
+  docker

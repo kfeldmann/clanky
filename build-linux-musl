@@ -1,0 +1,35 @@
+#!/bin/sh
+# Build clanky inside an Alpine (musl) docker container.
+#
+# - builds the build image (docker/build-musl.Dockerfile)
+# - runs the container with the project directory mounted, as the invoking
+#   user's UID:GID, so that everything under ./target (and the release
+#   binary) ends up owned by the host user
+# - sets CARGO_HOME to a directory inside the mounted project, so cargo's
+#   cache is created there (writable by the host user) instead of ~/.cargo
+#   inside the container, and it persists across runs
+# - runs the test suite, then compiles a release binary (dynamically linked
+#   against musl, stripped)
+
+set -eu
+
+cd "$(dirname "$0")"
+
+USER_ID=$(id -u)
+GROUP_ID=$(id -g)
+
+docker build \
+  --build-arg USER_ID="${USER_ID}" \
+  --build-arg GROUP_ID="${GROUP_ID}" \
+  -f docker/build-musl.Dockerfile \
+  -t clanky-build:latest \
+  .
+
+docker run --rm \
+  -u "${USER_ID}:${GROUP_ID}" \
+  -e CARGO_HOME=/project/.cargo-cache \
+  -e HOME=/project \
+  -v "${PWD}:/project" \
+  -w /project \
+  clanky-build:latest \
+  sh -c 'cargo test && cargo build --release && strip target/release/clanky'

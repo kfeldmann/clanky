@@ -1,1 +1,8 @@
 /target
+/.clanky
+
+# docker
+/.cargo-cache/
+/docker/clanky
+/extra-packages
+/extra-commands
