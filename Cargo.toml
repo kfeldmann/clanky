@@ -6,7 +6,7 @@ members = ["crates/clanky"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/pidev/clanky"
+repository = "https://github.com/kfeldmann/clanky"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
