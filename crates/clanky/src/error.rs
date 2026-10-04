@@ -50,6 +50,36 @@ pub enum Error {
 
     #[error("tool loop exceeded {0} chat rounds; aborting to avoid an endless cycle")]
     ToolLoopLimit(usize),
+
+    #[error("failed to write session {}: {source}", path.display())]
+    WriteSession {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("invalid session file {}: {message}", path.display())]
+    InvalidSession { path: PathBuf, message: String },
+
+    #[error("unsupported session format version {found} in {} (this build reads version {supported})", path.display())]
+    UnsupportedSessionVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+
+    #[error("session `{0}` already exists")]
+    SessionExists(String),
+
+    #[error(
+        "invalid session name `{0}`: use letters, digits, `-`, `_` and `.` only (max 64 chars)"
+    )]
+    InvalidSessionName(String),
+
+    #[error("no session named `{0}` in .clanky/sessions")]
+    SessionNotFound(String),
+
+    #[error("cannot use --resume in non-interactive mode")]
+    ResumeNonInteractive,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -43,6 +43,9 @@ fn run(cli: &cli::Cli) -> Result<()> {
     settings.overlay(cli.overrides());
 
     if cli.print || !tui::available() {
+        if cli.resume.is_some() {
+            return Err(clanky::error::Error::ResumeNonInteractive);
+        }
         // No prompt on the command line and no piped stdin: nothing to do
         // in command-line mode, so show usage instead of a cryptic error.
         if cli.prompt.is_empty() && !cli.print && std::io::stdin().is_terminal() {
@@ -58,7 +61,9 @@ fn run(cli: &cli::Cli) -> Result<()> {
         .provider
         .clone()
         .unwrap_or_else(|| provider::DEFAULT_PROVIDER.into());
-    tui::run(tui::Launch::from_settings(&provider_name, &settings))
+    let mut launch = tui::Launch::from_settings(&provider_name, &settings);
+    launch.resume = cli.resume.clone();
+    tui::run(launch)
 }
 
 /// Non-interactive single turn: prompt from argv or stdin, response to
@@ -73,11 +78,13 @@ fn run_pipe(settings: &mut Settings) -> Result<()> {
     let handler = provider::create(&provider_name)?;
     let config = turn::TurnConfig::from_settings(&provider_name, settings);
 
+    let mut messages = context::system_messages();
+    messages.push(clanky_protocol::ChatMessage::user(&prompt_text));
+
     let output = turn::run_turn(
         handler,
         &tools::default_tools(),
-        context::system_messages(),
-        &prompt_text,
+        messages,
         &config,
         &mut print_event,
     )?;
@@ -103,6 +110,9 @@ fn print_event(event: TurnEvent) {
         TurnEvent::Thinking { delta } => {
             eprint!("{delta}");
         }
+        // Round summaries are for the session recorder (M4); pipe mode
+        // has already streamed the text deltas.
+        TurnEvent::Round { .. } => {}
         TurnEvent::ToolCall { name, arguments } => {
             eprintln!("\n● {name} {arguments}");
         }

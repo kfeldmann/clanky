@@ -64,7 +64,7 @@ Architectural decisions already made:
 - Status line: provider · model, streaming/queued state, last-turn token usage
 - Done when: interactive chat works with streaming, `|` pipe still prints plain.
 
-## ☐ M4 — Sessions
+## ✔ M4 — Sessions
 - Session file format (JSONL: one record per event, versioned header)
 - `/name`, `/resume` (picker), autosave
 - Done when: kill the TUI mid-session, resume, full context restored.

@@ -5,13 +5,14 @@
 //! (`App::transcript_lines`), so the scroll offset in rows is exact.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget as _};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget as _};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use super::app::App;
+use super::picker::Picker;
 
 /// Prompt symbol for the input line.
 const INPUT_PROMPT: &str = "❯ ";
@@ -20,16 +21,20 @@ const INPUT_PROMPT: &str = "❯ ";
 pub struct Status<'a> {
     pub provider: &'a str,
     pub model: Option<&'a str>,
+    /// Display name of the current session file, when one exists.
+    pub session: Option<&'a str>,
 }
 
 /// Draw one frame. `transcript` must be the app's transcript pre-wrapped to
-/// the terminal width; `scroll_from_top` is the clamped scroll offset.
+/// the terminal width; `scroll_from_top` is the clamped scroll offset. When
+/// `picker` is open it is drawn as a centered overlay on top.
 pub fn draw(
     frame: &mut Frame,
     app: &App,
     transcript: Vec<Line<'static>>,
     scroll_from_top: usize,
     status: &Status<'_>,
+    picker: Option<&Picker>,
 ) {
     let area = frame.area();
     let layout = Layout::vertical([
@@ -47,9 +52,38 @@ pub fn draw(
 
     draw_status(frame, status_area, app, status);
     draw_input(frame, input_area, app);
+    if let Some(picker) = picker {
+        draw_picker(frame, area, picker);
+    }
 }
 
-fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, status: &Status<'_>) {
+/// Draw the picker as a centered bordered overlay.
+fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker) {
+    if area.width < 10 || area.height < 6 {
+        return;
+    }
+    let width = area.width.clamp(20, 72);
+    // Enough rows for query + a bounded list, never more than fits.
+    let max_visible = area.height.saturating_sub(4).max(3) as usize;
+    let lines = picker.lines(max_visible);
+    let height = ((lines.len() + 2) as u16).min(area.height);
+    let box_area = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    Clear.render(box_area, frame.buffer_mut());
+    let block = Block::bordered().title(Span::styled(
+        format!(" {} ", picker.title()),
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(box_area);
+    block.render(box_area, frame.buffer_mut());
+    Paragraph::new(lines).render(inner, frame.buffer_mut());
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, app: &App, status: &Status<'_>) {
     let base = Style::new().fg(Color::DarkGray);
     let mut left = vec![Span::styled(
         status.provider.to_string(),
@@ -58,6 +92,10 @@ fn draw_status(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, status
     if let Some(model) = status.model {
         left.push(Span::styled(" · ", base));
         left.push(Span::styled(model.to_string(), base));
+    }
+    if let Some(session) = status.session {
+        left.push(Span::styled(" · ", base));
+        left.push(Span::styled(session.to_string(), base));
     }
 
     let mut right = Vec::new();
@@ -223,7 +261,9 @@ mod tests {
                     &Status {
                         provider: "deepinfra",
                         model: Some("mock/model"),
+                        session: None,
                     },
+                    None,
                 )
             })
             .unwrap();
@@ -320,7 +360,9 @@ mod tests {
                     &Status {
                         provider: "an-very-long-provider-name",
                         model: Some("model"),
+                        session: None,
                     },
+                    None,
                 )
             })
             .unwrap();
@@ -336,5 +378,65 @@ mod tests {
         });
         let buffer = draw_app(&app, 60, 4);
         assert!(screen_text(&buffer, 60, 4).contains("↑1523 ↓87 tok"));
+    }
+
+    #[test]
+    fn session_name_shown_in_status() {
+        let app = App::new();
+        let buffer = draw_app(&app, 60, 4);
+        assert!(!screen_text(&buffer, 60, 4).contains("my-session"));
+        // With a session name it appears next to provider and model.
+        let mut terminal = Terminal::new(TestBackend::new(90, 4)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(
+                    f,
+                    &app,
+                    Vec::new(),
+                    0,
+                    &Status {
+                        provider: "deepinfra",
+                        model: Some("mock/model"),
+                        session: Some("my-session"),
+                    },
+                    None,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert!(screen_text(&buffer, 90, 4).contains("my-session"));
+    }
+
+    #[test]
+    fn picker_overlays_the_chat() {
+        let mut app = App::new();
+        app.entries.push(Entry::User("underneath".into()));
+        let picker = Picker::new(
+            "resume",
+            vec![super::super::picker::PickerItem {
+                label: "session-a".into(),
+                detail: "detail".into(),
+            }],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(
+                    f,
+                    &app,
+                    app.transcript_lines(60),
+                    0,
+                    &Status {
+                        provider: "deepinfra",
+                        model: None,
+                        session: None,
+                    },
+                    Some(&picker),
+                )
+            })
+            .unwrap();
+        let screen = screen_text(terminal.backend().buffer(), 60, 10);
+        assert!(screen.contains("session-a"), "{screen}");
+        assert!(screen.contains("search:"), "{screen}");
     }
 }

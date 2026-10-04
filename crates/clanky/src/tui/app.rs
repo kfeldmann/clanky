@@ -1,11 +1,12 @@
 //! TUI application state (M3): transcript entries, input line, scrolling.
 
-use clanky_protocol::Usage;
+use clanky_protocol::{ChatMessage, Usage};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::markdown;
 use crate::error::Result;
+use crate::session::Record;
 use crate::turn::{TurnEvent, TurnOutput};
 
 /// How many lines of a tool result are shown in the transcript (the full
@@ -18,9 +19,18 @@ pub enum Entry {
     User(String),
     Assistant(String),
     Thinking(String),
-    ToolCall { name: String, arguments: String },
-    ToolResult { name: String, output: String },
+    ToolCall {
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        name: String,
+        output: String,
+    },
     Error(String),
+    /// A UI-only note (command feedback, etc.); not sent to the model
+    /// and not recorded in the session file.
+    Info(String),
 }
 
 /// Which transcript entry streaming deltas currently append to.
@@ -45,6 +55,9 @@ pub struct App {
     pub scroll_from_bottom: usize,
     /// Usage of the most recently completed turn, for the status line.
     pub last_usage: Option<Usage>,
+    /// The complete conversation (system context first): what is passed
+    /// to the next turn. Updated after each turn, restored on resume (M4).
+    pub history: Vec<ChatMessage>,
     open: Option<OpenKind>,
 }
 
@@ -64,6 +77,7 @@ impl App {
             pending: None,
             scroll_from_bottom: 0,
             last_usage: None,
+            history: Vec::new(),
             open: None,
         }
     }
@@ -88,6 +102,9 @@ impl App {
                 self.entries.push(Entry::ToolResult { name, output });
                 self.open = None;
             }
+            // Round summaries are for the session recorder only; the
+            // transcript is built from the streaming deltas above.
+            TurnEvent::Round { .. } => {}
         }
     }
 
@@ -119,6 +136,48 @@ impl App {
         };
         text.push_str(delta);
         self.open = Some(kind);
+    }
+
+    // --- session (M4) -------------------------------------------------------
+
+    /// Replace the transcript with a loaded session's records and return
+    /// the rebuilt conversation history (system context excluded; the
+    /// caller prepends fresh system messages).
+    pub fn restore(&mut self, records: &[Record]) -> Vec<ChatMessage> {
+        self.entries.clear();
+        self.scroll_from_bottom = 0;
+        self.last_usage = None;
+        self.open = None;
+        for record in records {
+            match record {
+                Record::User { text } => self.entries.push(Entry::User(text.clone())),
+                Record::Thinking { text } => self.entries.push(Entry::Thinking(text.clone())),
+                Record::Assistant { text, calls } => {
+                    self.entries.push(Entry::Assistant(text.clone()));
+                    for call in calls {
+                        self.entries.push(Entry::ToolCall {
+                            name: call.name.clone(),
+                            arguments: call.arguments.to_string(),
+                        });
+                    }
+                }
+                Record::ToolResult { name, output } => self.entries.push(Entry::ToolResult {
+                    name: name.clone(),
+                    output: output.clone(),
+                }),
+                Record::Error { message } => self.entries.push(Entry::Error(message.clone())),
+                Record::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                } => {
+                    self.last_usage = Some(Usage {
+                        prompt_tokens: *prompt_tokens,
+                        completion_tokens: *completion_tokens,
+                    })
+                }
+            }
+        }
+        crate::session::history_from_records(records)
     }
 
     // --- input --------------------------------------------------------------
@@ -253,6 +312,12 @@ impl App {
                         Style::new().fg(Color::Red),
                     )));
                 }
+                Entry::Info(message) => {
+                    lines.push(Line::from(Span::styled(
+                        format!("· {message}"),
+                        Style::new().fg(Color::DarkGray),
+                    )));
+                }
             }
         }
         lines
@@ -348,6 +413,7 @@ mod tests {
             text: "hi".into(),
             finish_reason: clanky_protocol::FinishReason::Stop,
             usage,
+            history: Vec::new(),
         }));
         assert_eq!(app.last_usage, usage);
         assert!(!app.busy);
@@ -493,5 +559,66 @@ mod tests {
         app.clear();
         assert!(app.entries.is_empty());
         assert_eq!(app.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn restore_rebuilds_entries_usage_and_history() {
+        use serde_json::json;
+        let records = vec![
+            Record::User { text: "hi".into() },
+            Record::Assistant {
+                text: "checking".into(),
+                calls: vec![clanky_protocol::ToolCall {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "ls"}),
+                }],
+            },
+            Record::ToolResult {
+                name: "bash".into(),
+                output: "a\nb".into(),
+            },
+            Record::Assistant {
+                text: "done".into(),
+                calls: vec![],
+            },
+            Record::Usage {
+                prompt_tokens: Some(9),
+                completion_tokens: Some(2),
+            },
+        ];
+        let mut app = App::new();
+        app.push_user("old");
+        let history = app.restore(&records);
+        assert_eq!(
+            app.entries.len(),
+            5,
+            "user, assistant, call, result, assistant"
+        );
+        assert_eq!(app.last_usage.and_then(|u| u.completion_tokens), Some(2));
+        assert_eq!(history.len(), 4, "user, assistant+call, tool, assistant");
+
+        let lines = app.transcript_lines(80);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("❯ hi")));
+        assert!(texts.iter().any(|t| t.contains("● bash")));
+        assert!(texts.iter().any(|t| t.contains("└─ bash: a")));
+    }
+
+    #[test]
+    fn info_entries_render_dimmed() {
+        let mut app = App::new();
+        app.entries.push(Entry::Info("renamed".into()));
+        let lines = app.transcript_lines(40);
+        assert!(lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+                .contains("· renamed")
+        }));
     }
 }

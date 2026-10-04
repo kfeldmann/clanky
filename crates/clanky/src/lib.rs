@@ -8,6 +8,7 @@ pub mod context;
 pub mod error;
 pub mod prompt;
 pub mod provider;
+pub mod session;
 pub mod settings;
 pub mod tools;
 pub mod tui;

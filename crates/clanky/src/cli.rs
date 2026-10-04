@@ -31,6 +31,11 @@ pub struct Cli {
     #[arg(long, value_parser = parse_sampling)]
     pub sampling: Option<SamplingParams>,
 
+    /// Resume a saved session (interactive mode only). With a NAME, load
+    /// it directly; without, show a picker of saved sessions.
+    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    pub resume: Option<String>,
+
     /// Prompt text. Multiple words are joined with spaces;
     /// piped stdin is picked up in M1.
     #[arg(trailing_var_arg = true)]

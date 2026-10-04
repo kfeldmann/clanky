@@ -51,6 +51,15 @@ pub enum TurnEvent {
     Text { delta: String },
     /// Delta of the assistant's thinking text.
     Thinking { delta: String },
+    /// One chat round completed: the round's final text and thinking plus
+    /// its parsed tool calls. The TUI renders from deltas and ignores
+    /// this event; the session recorder uses it to store the round as
+    /// one record (see `session::Record::Assistant`).
+    Round {
+        text: String,
+        thinking: String,
+        calls: Vec<ToolCall>,
+    },
     /// The model asked to call a tool; `arguments` is compact JSON.
     ToolCall { name: String, arguments: String },
     /// The tool finished; `output` is the result fed back to the model.
@@ -63,14 +72,22 @@ pub struct TurnOutput {
     pub text: String,
     pub finish_reason: clanky_protocol::FinishReason,
     pub usage: Option<clanky_protocol::Usage>,
+    /// The complete message list after the turn: system context, the
+    /// user prompt, every assistant round, and tool results. The TUI
+    /// keeps this as the conversation so subsequent turns (and resumed
+    /// sessions) restore the full context (M4).
+    pub history: Vec<ChatMessage>,
 }
 
 /// Run one full agentic turn against `handler` (in-process until M8).
+///
+/// `messages` is the complete conversation so far, ending with the new
+/// user prompt (system context first). The returned [`TurnOutput::history`]
+/// is this list with the turn's assistant rounds and tool results appended.
 pub fn run_turn(
     handler: Box<dyn Handler>,
     tools: &ToolSet,
-    context_messages: Vec<ChatMessage>,
-    prompt: &str,
+    messages: Vec<ChatMessage>,
     config: &TurnConfig,
     on_event: &mut dyn FnMut(TurnEvent),
 ) -> Result<TurnOutput> {
@@ -88,8 +105,9 @@ pub fn run_turn(
     let sampling = sampling_from(&config.sampling)?;
     let thinking = thinking_from(&config.thinking)?;
 
-    let mut messages = context_messages;
-    messages.push(ChatMessage::user(prompt));
+    // The caller passes the complete conversation (system context + the
+    // new user prompt); this local copy accumulates the turn's additions.
+    let mut messages = messages;
 
     let mut text = String::new();
     let mut usage_total = Usage::default();
@@ -124,7 +142,15 @@ pub fn run_turn(
             client.chat(request, &mut on_chunk)?
         };
 
-        text.push_str(assembler.text());
+        let round_text = assembler.text().to_string();
+        let round_thinking = assembler.thinking().to_string();
+        text.push_str(&round_text);
+        let calls = assembler.tool_calls();
+        on_event(TurnEvent::Round {
+            text: round_text.clone(),
+            thinking: round_thinking,
+            calls: calls.clone(),
+        });
         if let Some(usage) = done.usage {
             usage_seen = true;
             usage_total.prompt_tokens =
@@ -136,10 +162,16 @@ pub fn run_turn(
 
         let calls = assembler.tool_calls();
         if done.finish_reason != FinishReason::ToolCalls || calls.is_empty() {
+            // The final plain-text round is part of the conversation too.
+            messages.push(ChatMessage::Assistant {
+                content: round_text,
+                tool_calls: None,
+            });
             return Ok(TurnOutput {
                 text,
                 finish_reason: done.finish_reason,
                 usage: usage_seen.then_some(usage_total),
+                history: messages,
             });
         }
 
@@ -436,7 +468,9 @@ mod tests {
     ) -> (Result<TurnOutput>, RefCell<Vec<TurnEvent>>) {
         let sink: RefCell<Vec<TurnEvent>> = RefCell::new(Vec::new());
         let mut on_event = |event: TurnEvent| sink.borrow_mut().push(event);
-        let output = run_turn(handler, tools, context, prompt, config, &mut on_event);
+        let mut messages = context;
+        messages.push(ChatMessage::user(prompt));
+        let output = run_turn(handler, tools, messages, config, &mut on_event);
         (output, sink)
     }
 
@@ -456,9 +490,16 @@ mod tests {
         assert_eq!(output.usage.and_then(|u| u.completion_tokens), Some(2));
         assert_eq!(
             sink.into_inner(),
-            vec![TurnEvent::Text {
-                delta: "echo".into()
-            }]
+            vec![
+                TurnEvent::Text {
+                    delta: "echo".into()
+                },
+                TurnEvent::Round {
+                    text: "echo".into(),
+                    thinking: "".into(),
+                    calls: vec![]
+                },
+            ]
         );
     }
 
@@ -485,6 +526,15 @@ mod tests {
         assert_eq!(
             sink,
             vec![
+                TurnEvent::Round {
+                    text: "".into(),
+                    thinking: "".into(),
+                    calls: vec![clanky_protocol::ToolCall {
+                        id: "call_1".into(),
+                        name: "echo_tool".into(),
+                        arguments: serde_json::json!({"input": "hello"}),
+                    }],
+                },
                 TurnEvent::ToolCall {
                     name: "echo_tool".into(),
                     arguments: r#"{"input":"hello"}"#.into(),
@@ -495,6 +545,11 @@ mod tests {
                 },
                 TurnEvent::Text {
                     delta: "done".into()
+                },
+                TurnEvent::Round {
+                    text: "done".into(),
+                    thinking: "".into(),
+                    calls: vec![]
                 },
             ]
         );
@@ -516,7 +571,7 @@ mod tests {
         assert_eq!(output.unwrap().text, "recovered");
         let sink = sink.into_inner();
         assert!(
-            matches!(&sink[1], TurnEvent::ToolResult { output, .. } if output.starts_with("ERROR:")),
+            matches!(&sink[2], TurnEvent::ToolResult { output, .. } if output.starts_with("ERROR:")),
             "unexpected events: {sink:?}"
         );
     }
@@ -537,7 +592,7 @@ mod tests {
         assert_eq!(output.unwrap().text, "recovered");
         let sink = sink.into_inner();
         assert!(
-            matches!(&sink[1], TurnEvent::ToolResult { output, .. } if output.contains("ERROR:")),
+            matches!(&sink[2], TurnEvent::ToolResult { output, .. } if output.contains("ERROR:")),
             "unexpected events: {sink:?}"
         );
     }
@@ -556,9 +611,16 @@ mod tests {
         assert_eq!(output.unwrap().text, "plain");
         assert_eq!(
             sink.into_inner(),
-            vec![TurnEvent::Text {
-                delta: "plain".into()
-            }]
+            vec![
+                TurnEvent::Text {
+                    delta: "plain".into()
+                },
+                TurnEvent::Round {
+                    text: "plain".into(),
+                    thinking: "".into(),
+                    calls: vec![]
+                },
+            ]
         );
     }
 
@@ -645,6 +707,37 @@ mod tests {
                 completion_tokens: Some(6)
             })
         );
+    }
+
+    #[test]
+    fn history_contains_context_and_all_rounds() {
+        let handler = Box::new(MockHandler::scripted(vec![
+            tool_turn("echo_tool", r#"{"input": "x"}"#),
+            text_turn("done"),
+        ]));
+        let (output, _) = run(
+            handler,
+            &toolset(),
+            vec![ChatMessage::system("Be terse.")],
+            "hi",
+            &config("mock/model"),
+        );
+        let history = output.unwrap().history;
+        assert_eq!(history.len(), 5, "system, user, assistant, tool, assistant");
+        assert!(matches!(history[0], ChatMessage::System { .. }));
+        assert!(matches!(history[1], ChatMessage::User { .. }));
+        assert!(matches!(
+            &history[2],
+            ChatMessage::Assistant { tool_calls: Some(calls), .. } if calls.len() == 1
+        ));
+        assert!(matches!(history[3], ChatMessage::Tool { .. }));
+        assert!(matches!(
+            &history[4],
+            ChatMessage::Assistant {
+                tool_calls: None,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -236,8 +236,11 @@ fn tool_loop_transcript_matches_golden() {
     let output = run_turn(
         Box::new(provider),
         &fake_tools(),
-        vec![ChatMessage::system("You are a terminal coding agent.")],
-        "use the tool on hello",
+        [
+            vec![ChatMessage::system("You are a terminal coding agent.")],
+            vec![ChatMessage::user("use the tool on hello")],
+        ]
+        .concat(),
         &config(),
         &mut |_| {},
     )
@@ -276,8 +279,9 @@ fn bash_tool_transcript_matches_golden() {
     let output = run_turn(
         Box::new(provider),
         &bash_tools(),
-        vec![],
-        "run `echo 42` and tell me what it printed",
+        vec![ChatMessage::user(
+            "run `echo 42` and tell me what it printed",
+        )],
         &config(),
         &mut |_| {},
     )
@@ -323,8 +327,7 @@ fn sampling_and_thinking_are_plumbed_through_every_round() {
     run_turn(
         Box::new(provider),
         &fake_tools(),
-        vec![],
-        "go",
+        vec![ChatMessage::user("go")],
         &config(),
         &mut |_| {},
     )

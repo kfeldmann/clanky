@@ -14,6 +14,7 @@ use crate::messages::{ChunkPayload, ToolCall};
 #[derive(Debug, Default)]
 pub struct StreamAssembler {
     text: String,
+    thinking: String,
     calls: Vec<AssembledCall>,
 }
 
@@ -30,9 +31,9 @@ impl StreamAssembler {
     pub fn ingest(&mut self, payload: &ChunkPayload) {
         match payload {
             ChunkPayload::Text { text } => self.text.push_str(text),
-            // Thinking deltas are displayed/stored by the caller; they are
-            // not part of the assembled assistant message.
-            ChunkPayload::Thinking { .. } => {}
+            // Thinking deltas are assembled for display/session storage;
+            // they are not part of the assistant message sent back.
+            ChunkPayload::Thinking { text } => self.thinking.push_str(text),
             ChunkPayload::ToolCallStart { index, id, name } => {
                 let slot = self.slot(*index);
                 slot.id = id.clone();
@@ -55,6 +56,11 @@ impl StreamAssembler {
     /// The assistant's visible text, assembled from `text` deltas.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The assistant's thinking text, assembled from `thinking` deltas.
+    pub fn thinking(&self) -> &str {
+        &self.thinking
     }
 
     /// The tool calls announced during the turn, with argument strings
@@ -117,6 +123,25 @@ mod tests {
         );
         assert_eq!(assembler.text(), "There are 42");
         assert!(assembler.tool_calls().is_empty());
+    }
+
+    #[test]
+    fn thinking_deltas_concatenate_separately() {
+        let mut assembler = StreamAssembler::default();
+        ingest_all(
+            &mut assembler,
+            &[
+                ChunkPayload::Thinking {
+                    text: "need to".into(),
+                },
+                ChunkPayload::Text { text: "hi".into() },
+                ChunkPayload::Thinking {
+                    text: " check".into(),
+                },
+            ],
+        );
+        assert_eq!(assembler.text(), "hi");
+        assert_eq!(assembler.thinking(), "need to check");
     }
 
     #[test]
