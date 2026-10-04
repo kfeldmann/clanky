@@ -1,0 +1,106 @@
+{
+  "output": {
+    "finishReason": "stop",
+    "text": "Let me use the tool.The tool said: fake ran with input=hello",
+    "usage": {
+      "completionTokens": 12,
+      "promptTokens": 19
+    }
+  },
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "You are a terminal coding agent.",
+          "role": "system"
+        },
+        {
+          "content": "use the tool on hello",
+          "role": "user"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "maxTokens": 4096,
+        "temperature": 0.7,
+        "topP": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "A fake tool for tests",
+          "name": "fake",
+          "parameters": {
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "content": "You are a terminal coding agent.",
+          "role": "system"
+        },
+        {
+          "content": "use the tool on hello",
+          "role": "user"
+        },
+        {
+          "content": "Let me use the tool.",
+          "role": "assistant",
+          "toolCalls": [
+            {
+              "arguments": {
+                "input": "hello"
+              },
+              "id": "call_1",
+              "name": "fake"
+            }
+          ]
+        },
+        {
+          "content": "fake ran with input=hello",
+          "role": "tool",
+          "toolCallId": "call_1"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "maxTokens": 4096,
+        "temperature": 0.7,
+        "topP": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "A fake tool for tests",
+          "name": "fake",
+          "parameters": {
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

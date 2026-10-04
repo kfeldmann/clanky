@@ -1,0 +1,92 @@
+{
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "run `echo 42` and tell me what it printed",
+          "role": "user"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "maxTokens": 4096,
+        "temperature": 0.7,
+        "topP": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "Run a bash shell command in the project directory and return its stdout and stderr.",
+          "name": "bash",
+          "parameters": {
+            "properties": {
+              "command": {
+                "description": "The bash command to run",
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "content": "run `echo 42` and tell me what it printed",
+          "role": "user"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "toolCalls": [
+            {
+              "arguments": {
+                "command": "echo 42"
+              },
+              "id": "call_1",
+              "name": "bash"
+            }
+          ]
+        },
+        {
+          "content": "42",
+          "role": "tool",
+          "toolCallId": "call_1"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "maxTokens": 4096,
+        "temperature": 0.7,
+        "topP": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "Run a bash shell command in the project directory and return its stdout and stderr.",
+          "name": "bash",
+          "parameters": {
+            "properties": {
+              "command": {
+                "description": "The bash command to run",
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

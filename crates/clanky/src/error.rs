@@ -9,9 +9,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("interactive mode is not implemented yet: {0}")]
-    NotImplementedYet(&'static str),
-
     #[error("cannot locate home directory; set $HOME")]
     NoHomeDir,
 
@@ -26,6 +23,33 @@ pub enum Error {
         path: PathBuf,
         source: toml::de::Error,
     },
+
+    #[error("no prompt given: pass a prompt on the command line or pipe one via stdin")]
+    NoPrompt,
+
+    #[error("unknown provider `{0}`; available: deepinfra")]
+    UnknownProvider(String),
+
+    #[error("no model configured: set `model` in settings.toml or pass --model")]
+    NoModel,
+
+    #[error("invalid --sampling: {0}")]
+    InvalidSampling(String),
+
+    #[error("invalid --thinking value `{0}`; expected an integer token budget, or `off`")]
+    InvalidThinking(String),
+
+    #[error("io error: {source}")]
+    Io {
+        #[from]
+        source: std::io::Error,
+    },
+
+    #[error("provider error: {0}")]
+    Provider(#[from] clanky_protocol::Error),
+
+    #[error("tool loop exceeded {0} chat rounds; aborting to avoid an endless cycle")]
+    ToolLoopLimit(usize),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

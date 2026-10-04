@@ -66,7 +66,7 @@ impl Settings {
                 return Err(Error::ReadSettings {
                     path: path.to_path_buf(),
                     source,
-                })
+                });
             }
         };
         toml::from_str(&text)
@@ -95,71 +95,8 @@ impl Settings {
             self.prompt = over.prompt;
         }
     }
-
-    /// Render the settings as a TOML document (only the fields that are
-    /// set), useful for diagnostics.
-    pub fn render_toml(&self) -> String {
-        let mut out = String::new();
-        let mut emit = |key: &str, value: String| {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(key);
-            out.push_str(" = ");
-            out.push_str(&value);
-        };
-        if let Some(provider) = &self.provider {
-            emit("provider", toml_str(provider));
-        }
-        if let Some(model) = &self.model {
-            emit("model", toml_str(model));
-        }
-        if let Some(thinking) = &self.thinking {
-            emit("thinking", toml_str(thinking));
-        }
-        if let Some(prompt) = &self.prompt {
-            emit("prompt", toml_str(prompt));
-        }
-        if let Some(sampling) = &self.sampling {
-            let items: Vec<String> = sampling
-                .iter()
-                .map(|(k, v)| format!("{} = {}", toml_key(k), toml_str(v)))
-                .collect();
-            emit("sampling", format!("{{ {} }}", items.join(", ")));
-        }
-        out
-    }
 }
 
-/// Quote a string as a TOML basic string.
-fn toml_str(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Quote a key if it is not a bare TOML key.
-fn toml_key(key: &str) -> String {
-    if !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        key.to_string()
-    } else {
-        toml_str(key)
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,8 +136,7 @@ mod tests {
             &tmp.join("clanky-test-project"),
             "model = \"project-model\"\n[sampling]\ntemperature = \"0.7\"\n",
         );
-        let merged =
-            Settings::load_from_paths(&[user.clone(), project.clone()]).unwrap();
+        let merged = Settings::load_from_paths(&[user.clone(), project.clone()]).unwrap();
 
         assert_eq!(merged.provider.as_deref(), Some("deepinfra"));
         assert_eq!(merged.model.as_deref(), Some("project-model"));
@@ -220,7 +156,10 @@ mod tests {
         let path = write_temp_settings(&tmp, "provieder = \"oops\"\n");
         let err = Settings::load_from_paths(std::slice::from_ref(&path)).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("settings.toml"), "message should name the file: {msg}");
+        assert!(
+            msg.contains("settings.toml"),
+            "message should name the file: {msg}"
+        );
 
         std::fs::remove_file(path).unwrap();
     }
@@ -243,20 +182,5 @@ mod tests {
             settings.sampling.as_ref().unwrap().get("temperature"),
             Some(&"0.5".to_string())
         );
-    }
-
-    #[test]
-    fn render_toml_roundtrip() {
-        let settings = Settings {
-            provider: Some("deepinfra".into()),
-            sampling: Some(sampling(&[
-                ("reasoning", "medium"),
-                ("style", "concise"),
-            ])),
-            ..Settings::default()
-        };
-        let rendered = settings.render_toml();
-        let parsed: Settings = toml::from_str(&rendered).unwrap();
-        assert_eq!(parsed, settings);
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "clanky-protocol"
+description = "Provider plugin protocol for Clanky: message shapes, transport, client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[lints]
+workspace = true

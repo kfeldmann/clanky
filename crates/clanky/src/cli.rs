@@ -8,7 +8,7 @@ use crate::settings::SamplingParams;
 
 /// An AI coding agent for the terminal.
 #[derive(Debug, Parser)]
-#[command(name = "clanky", version, about, arg_required_else_help = true)]
+#[command(name = "clanky", version, about)]
 pub struct Cli {
     /// Print mode: run one turn non-interactively and print the response.
     #[arg(short = 'p', long = "print")]
@@ -141,10 +141,6 @@ mod tests {
         // `--help` must parse and short-circuit with exit success.
         let result = Cli::try_parse_from(["clanky", "--help"]);
         assert!(result.is_err()); // clap signals help via a DisplayHelp "error"
-        assert_eq!(
-            result.unwrap_err().exit_code(),
-            0,
-            "--help must exit 0"
-        );
+        assert_eq!(result.unwrap_err().exit_code(), 0, "--help must exit 0");
     }
 }
