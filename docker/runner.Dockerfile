@@ -30,5 +30,6 @@ ENV HOME=/home/clanky
 ENV TERM=xterm-256color
 
 COPY clanky /usr/local/bin/clanky
+ENTRYPOINT ["/usr/local/bin/clanky"]
 
 USER clanky

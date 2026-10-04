@@ -22,6 +22,7 @@ if [ ! -x target/release/clanky ]; then
   exit 1
 fi
 cp target/release/clanky docker/clanky
+chmod 555 docker/clanky
 
 # Get user and group ids
 USER_ID=$(id -u)
