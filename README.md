@@ -39,6 +39,37 @@ resource:
 A project-root `AGENTS.md` (the ecosystem convention) is honored in
 addition to `./.clanky/AGENTS.md`, and comes after both scopes.
 
+### `settings.toml`
+
+All fields are optional; unknown keys are rejected with a parse error.
+
+| Field      | Type             | Meaning                                            |
+| ---------- | ---------------- | -------------------------------------------------- |
+| `provider` | string           | Provider name (e.g. `deepinfra`)                   |
+| `model`    | string           | Model identifier as known to the provider          |
+| `thinking` | string           | Thinking budget or level (`1024`, `low`, `off`)    |
+| `sampling` | table of strings | Sampling parameters, e.g. `temperature = "0.7"`    |
+| `prompt`   | string           | Prompt text (mainly useful on the CLI, not in a file) |
+
+Example:
+
+```toml
+provider = "deepinfra"
+model = "meta-llama/Llama-3.3-70B-Instruct"
+thinking = "off"
+
+[sampling]
+temperature = "0.7"
+top_p = "0.9"
+```
+
+Notes:
+
+- Sampling values stay strings in the file; the provider validates and
+  coerces them, so an invalid value fails at call time, not load time.
+- Precedence is per field: CLI flag > project file > user file, and a
+  scope only overrides fields it actually sets.
+
 ### Session precedence note
 
 Sessions always live in the **project scope** (`./.clanky/sessions/`);
