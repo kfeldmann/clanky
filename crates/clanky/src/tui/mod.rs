@@ -11,6 +11,12 @@
 //! the file, `/resume` reopens a saved session via a picker; resuming
 //! restores the transcript and the full conversation history.
 //!
+//! Slash commands (M5): `/model`, `/provider`, `/thinking`, `/sampling`
+//! reconfigure the session for subsequent turns; `/<template>` inserts a
+//! prompt template from `.clanky/prompts/` into the input. Configuration
+//! commands and `/<model id>` open pickers; unknown commands error
+//! cleanly and are never sent to the model.
+//!
 //! Layout (see `ui.rs`):
 //! ┌────────────────────────────────┐
 //! │ transcript (markdown, scroll)  │
@@ -19,6 +25,7 @@
 //! └────────────────────────────────┘
 
 mod app;
+mod commands;
 mod markdown;
 mod picker;
 mod ui;
@@ -28,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
-use clanky_protocol::ChatMessage;
+use clanky_protocol::{ChatMessage, ModelInfo};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseEventKind,
@@ -40,12 +47,23 @@ use ratatui::crossterm::terminal::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::error::Result;
+use crate::prompts::{self, Template};
 use crate::session::{self, SessionInfo, SessionWriter};
 use crate::settings::{SamplingParams, Settings};
 use crate::turn::{TurnConfig, TurnEvent, TurnOutput};
+use commands::{Command, SamplingEdit};
 
 /// Half a screen per PageUp/PageDown press.
 const SCROLL_PAGE: u16 = 16;
+
+/// Presets offered by the bare `/thinking` picker.
+const THINKING_OPTIONS: &[(&str, &str)] = &[
+    ("off", "disable thinking"),
+    ("1024", "small budget"),
+    ("4096", "typical budget"),
+    ("16384", "large budget"),
+    ("32768", "very large budget"),
+];
 
 /// True when the terminal can run the TUI: both stdin and stdout must be
 /// attached to a terminal (plan.md: no TUI when redirected).
@@ -90,17 +108,19 @@ impl Launch {
     }
 }
 
-/// What the worker thread reports back to the UI loop.
+/// What the worker threads report back to the UI loop.
 enum WorkerEvent {
     Turn(TurnEvent),
     /// Terminal status of the turn.
     Done(crate::error::Result<TurnOutput>),
+    /// Model list for the `/model` picker.
+    Models(crate::error::Result<Vec<ModelInfo>>),
 }
 
 /// Run the interactive session until the user quits.
-pub fn run(launch: Launch) -> Result<()> {
+pub fn run(mut launch: Launch) -> Result<()> {
     let mut terminal = setup()?;
-    let result = event_loop(&launch, &mut terminal);
+    let result = event_loop(&mut launch, &mut terminal);
     match restore(&mut terminal) {
         Ok(()) => result,
         Err(restore_err) => {
@@ -156,40 +176,150 @@ fn spawn_turn(history: Vec<ChatMessage>, launch: &Launch, prompt: String, tx: Se
         .expect("failed to spawn turn worker thread");
 }
 
+/// Fetch the provider's model list on a worker thread (network I/O must
+/// not block the render loop); the result opens the `/model` picker.
+fn spawn_models(provider_name: String, tx: Sender<WorkerEvent>) {
+    std::thread::Builder::new()
+        .name("clanky-models".into())
+        .spawn(move || {
+            let outcome: crate::error::Result<Vec<ModelInfo>> = (|| {
+                let handler = crate::provider::create(&provider_name)?;
+                let mut client = clanky_protocol::ProviderClient::new(
+                    clanky_protocol::LoopbackTransport::new(handler),
+                );
+                client.handshake()?;
+                Ok(client.list_models()?)
+            })();
+            let _ = tx.send(WorkerEvent::Models(outcome));
+        })
+        .expect("failed to spawn model-listing thread");
+}
+
 /// What a key press asks the main loop to do.
 enum Action {
     None,
     Quit,
     Clear,
     Submit(String),
-    /// Open the `/resume` picker over the current sessions.
-    OpenPicker,
+    /// Open a picker; the kind carries the data it selects from.
+    OpenPicker(PickerKind),
 }
 
-/// Slash commands (M4). M5 adds more and a picker component for pickers.
-#[derive(Debug, PartialEq)]
-enum Command {
-    /// `/name [name]`: rename the session file.
-    Name(Option<String>),
-    /// `/resume`: pick and load a saved session.
-    Resume,
+/// What an open picker selects (M5): the payload decides what Enter does.
+enum PickerKind {
+    /// Pick a saved session and load it.
+    Resume(Vec<SessionInfo>),
+    /// Pick a model for the current provider.
+    Models(Vec<ModelInfo>),
+    /// Pick a provider from the known list.
+    Providers,
+    /// Pick a thinking preset.
+    Thinking,
+    /// The command palette (opened by bare `/`): built-in commands and
+    /// prompt templates.
+    Palette(Vec<PaletteItem>),
 }
 
-/// Parse a slash command. `None` = not a command (plain prompt);
-/// `Some(Err)` = unknown or malformed command (never sent to the model).
-fn parse_command(input: &str) -> Option<std::result::Result<Command, String>> {
-    let rest = input.strip_prefix('/')?;
-    let (word, arg) = rest.split_once(' ').unwrap_or((rest, ""));
-    let arg = arg.trim();
-    match word {
-        "name" => Some(Ok(Command::Name(
-            (!arg.is_empty()).then(|| arg.to_string()),
-        ))),
-        "resume" if arg.is_empty() => Some(Ok(Command::Resume)),
-        other => Some(Err(format!(
-            "unknown command `/{other}` (known: /name, /resume)"
-        ))),
-    }
+/// One entry of the command palette.
+enum PaletteItem {
+    /// A built-in command; `text` is inserted into the input (trailing
+    /// space included) so the user can add arguments.
+    Builtin { text: String, hint: String },
+    /// A prompt template; selecting inserts its body into the input.
+    Template(Template),
+}
+
+/// Built-in commands offered by the palette: (input text, hint).
+const PALETTE_BUILTINS: &[(&str, &str)] = &[
+    ("/model", "pick a model"),
+    ("/provider", "pick a provider"),
+    ("/thinking", "thinking presets"),
+    ("/sampling ", "edit sampling parameters"),
+    ("/name ", "rename the session"),
+    ("/resume", "load a saved session"),
+];
+
+/// The palette picker kind: built-ins first, then templates by name.
+fn palette_kind(templates: Vec<Template>) -> PickerKind {
+    let mut items: Vec<PaletteItem> = PALETTE_BUILTINS
+        .iter()
+        .map(|(text, hint)| PaletteItem::Builtin {
+            text: (*text).to_string(),
+            hint: (*hint).to_string(),
+        })
+        .collect();
+    items.extend(templates.into_iter().map(PaletteItem::Template));
+    PickerKind::Palette(items)
+}
+
+/// Build the picker UI for a kind (the kind carries its own data). The
+/// item order is the order [`apply_picker_selection`] indexes into.
+fn picker_for(kind: &PickerKind) -> picker::Picker {
+    let (title, items) = match kind {
+        PickerKind::Resume(infos) => (
+            "resume",
+            infos
+                .iter()
+                .map(|info| picker::PickerItem {
+                    label: info.name.clone(),
+                    detail: format!(
+                        "{} · {} turns",
+                        session::format_datetime(info.modified),
+                        info.turns
+                    ),
+                })
+                .collect(),
+        ),
+        PickerKind::Models(models) => (
+            "model",
+            models
+                .iter()
+                .map(|model| picker::PickerItem {
+                    label: model.id.clone(),
+                    detail: model_detail(model),
+                })
+                .collect(),
+        ),
+        PickerKind::Providers => (
+            "provider",
+            crate::provider::available()
+                .iter()
+                .map(|name| picker::PickerItem {
+                    label: (*name).to_string(),
+                    detail: crate::provider::default_model(name)
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect(),
+        ),
+        PickerKind::Thinking => (
+            "thinking",
+            THINKING_OPTIONS
+                .iter()
+                .map(|(value, detail)| picker::PickerItem {
+                    label: (*value).to_string(),
+                    detail: (*detail).to_string(),
+                })
+                .collect(),
+        ),
+        PickerKind::Palette(items) => (
+            "commands",
+            items
+                .iter()
+                .map(|item| match item {
+                    PaletteItem::Builtin { text, hint } => picker::PickerItem {
+                        label: text.clone(),
+                        detail: hint.clone(),
+                    },
+                    PaletteItem::Template(template) => picker::PickerItem {
+                        label: format!("/{}", template.name),
+                        detail: first_line(&template.content),
+                    },
+                })
+                .collect(),
+        ),
+    };
+    picker::Picker::new(title, items)
 }
 
 /// Autosave state: the open session file, lazily created on the first
@@ -314,19 +444,22 @@ fn session_by_name(name: &str) -> Result<SessionInfo> {
     })
 }
 
-fn event_loop(launch: &Launch, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn event_loop(
+    launch: &mut Launch,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
     let mut app = app::App::new();
     let mut state = SessionState::new(launch.clone());
-    // Open picker with the sessions it lists, when active.
-    let mut picker: Option<(picker::Picker, Vec<SessionInfo>)> = None;
+    // Open picker with the payload it selects from, when active.
+    let mut picker: Option<(picker::Picker, PickerKind)> = None;
 
     // `--resume NAME` loads the session before the first frame; plain
     // `--resume` opens the picker.
     match launch.resume.as_deref() {
         Some("") => {
-            let infos = session::list(&state.dir);
-            picker = Some((resume_picker(&infos), infos));
+            let kind = PickerKind::Resume(session::list(&state.dir));
+            picker = Some((picker_for(&kind), kind));
         }
         Some(name) => {
             let info = session_by_name(name)?;
@@ -379,7 +512,7 @@ fn event_loop(launch: &Launch, terminal: &mut Terminal<CrosstermBackend<Stdout>>
                 Event::Key(key) => {
                     if let Some(key) = pressed(key) {
                         if picker.is_some() {
-                            match picker_key(&mut picker, key, &mut app, &mut state) {
+                            match picker_key(&mut picker, key, &mut app, &mut state, launch, &tx) {
                                 PickerOutcome::Quit => break,
                                 PickerOutcome::Cancel => picker = None,
                                 PickerOutcome::Selected => {
@@ -388,12 +521,11 @@ fn event_loop(launch: &Launch, terminal: &mut Terminal<CrosstermBackend<Stdout>>
                                 PickerOutcome::None => {}
                             }
                         } else {
-                            match handle_key(&mut app, &mut state, key) {
+                            match handle_key(&mut app, &mut state, launch, &tx, key) {
                                 Action::Quit => break,
                                 Action::Clear => app.clear(),
-                                Action::OpenPicker => {
-                                    let infos = session::list(&state.dir);
-                                    picker = Some((resume_picker(&infos), infos));
+                                Action::OpenPicker(kind) => {
+                                    picker = Some((picker_for(&kind), kind));
                                 }
                                 Action::Submit(prompt) => {
                                     app.push_user(&prompt);
@@ -437,6 +569,20 @@ fn event_loop(launch: &Launch, terminal: &mut Terminal<CrosstermBackend<Stdout>>
                     app.on_turn_done(&result);
                     turn_finished = true;
                 }
+                WorkerEvent::Models(result) => match result {
+                    Ok(models) if models.is_empty() => {
+                        app.entries.push(app::Entry::Info(format!(
+                            "`{}` lists no models",
+                            launch.provider
+                        )));
+                    }
+                    Ok(models) if picker.is_none() => {
+                        let kind = PickerKind::Models(models);
+                        picker = Some((picker_for(&kind), kind));
+                    }
+                    Ok(_) => {} // a picker is already open; leave it
+                    Err(err) => app.entries.push(app::Entry::Error(err.to_string())),
+                },
             }
         }
         if let (true, Some(prompt)) = (turn_finished, app.pending.take()) {
@@ -527,13 +673,15 @@ enum PickerOutcome {
 }
 
 fn picker_key(
-    picker: &mut Option<(picker::Picker, Vec<SessionInfo>)>,
+    picker: &mut Option<(picker::Picker, PickerKind)>,
     key: KeyEvent,
     app: &mut app::App,
     state: &mut SessionState,
+    launch: &mut Launch,
+    tx: &Sender<WorkerEvent>,
 ) -> PickerOutcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let Some((picker_state, infos)) = picker.as_mut() else {
+    let Some((picker_state, _kind)) = picker.as_mut() else {
         return PickerOutcome::None;
     };
     match (ctrl, key.code) {
@@ -548,18 +696,8 @@ fn picker_key(
         }
         (_, KeyCode::Esc) => PickerOutcome::Cancel,
         (_, KeyCode::Enter) => {
-            if let Some(index) = picker_state.confirm() {
-                let info = infos[index].clone();
-                *picker = None;
-                if let Err(err) = load_session(&info, app, state) {
-                    app.entries.push(app::Entry::Error(err.to_string()));
-                }
-                PickerOutcome::Selected
-            } else {
-                // Nothing selectable (empty list): close the picker.
-                *picker = None;
-                PickerOutcome::Cancel
-            }
+            apply_picker_selection(picker, app, state, launch, tx);
+            PickerOutcome::Selected
         }
         (_, KeyCode::Backspace) => {
             picker_state.pop_char();
@@ -573,24 +711,111 @@ fn picker_key(
     }
 }
 
-/// Build the `/resume` picker from a session listing.
-fn resume_picker(infos: &[SessionInfo]) -> picker::Picker {
-    let items = infos
-        .iter()
-        .map(|info| picker::PickerItem {
-            label: info.name.clone(),
-            detail: format!(
-                "{} · {} turns",
-                session::format_datetime(info.modified),
-                info.turns
-            ),
-        })
-        .collect();
-    picker::Picker::new("resume", items)
+/// Act on a confirmed picker selection; the picker closes first (the
+/// action may surface errors or open follow-up pickers via commands).
+/// An empty selection (no filtered items) simply closes the picker.
+fn apply_picker_selection(
+    picker: &mut Option<(picker::Picker, PickerKind)>,
+    app: &mut app::App,
+    state: &mut SessionState,
+    launch: &mut Launch,
+    tx: &Sender<WorkerEvent>,
+) {
+    let Some(index) = picker
+        .as_mut()
+        .and_then(|(picker_state, _)| picker_state.confirm())
+    else {
+        // Nothing selectable (empty list): close the picker.
+        *picker = None;
+        return;
+    };
+    let Some((_, kind)) = picker.take() else {
+        unreachable!("picker was just read");
+    };
+    match kind {
+        PickerKind::Resume(infos) => {
+            if let Some(info) = infos.get(index)
+                && let Err(err) = load_session(info, app, state)
+            {
+                app.entries.push(app::Entry::Error(err.to_string()));
+            }
+        }
+        PickerKind::Models(models) => {
+            if let Some(model) = models.get(index) {
+                let id = model.id.clone();
+                launch.model = Some(id.clone());
+                app.entries
+                    .push(app::Entry::Info(format!("model set to `{id}`")));
+            }
+        }
+        PickerKind::Providers => {
+            // Item order matches provider::available().
+            if let Some(name) = crate::provider::available().get(index) {
+                match set_provider(launch, name) {
+                    Ok(message) => app.entries.push(app::Entry::Info(message)),
+                    Err(message) => app.entries.push(app::Entry::Error(message)),
+                }
+            }
+        }
+        PickerKind::Thinking => {
+            if let Some((value, _)) = THINKING_OPTIONS.get(index) {
+                launch.thinking = crate::turn::parse_thinking(value)
+                    .ok()
+                    .flatten()
+                    .map(|_| value.to_string());
+                app.entries.push(app::Entry::Info(match launch.thinking {
+                    Some(_) => format!("thinking set to `{value}`"),
+                    None => "thinking disabled".into(),
+                }));
+            }
+        }
+        PickerKind::Palette(items) => match items.get(index) {
+            Some(PaletteItem::Template(template)) => {
+                *picker = None;
+                apply_template(app, template, None);
+            }
+            Some(PaletteItem::Builtin { text, .. }) => {
+                *picker = None;
+                match text.as_str() {
+                    "/model" => {
+                        handle_command(app, state, launch, Command::Model(None), tx);
+                    }
+                    "/provider" => {
+                        *picker = Some((picker_for(&PickerKind::Providers), PickerKind::Providers));
+                    }
+                    "/thinking" => {
+                        *picker = Some((picker_for(&PickerKind::Thinking), PickerKind::Thinking));
+                    }
+                    "/resume" => {
+                        // Re-run the command; apply the picker it asks for.
+                        if let Action::OpenPicker(kind) =
+                            handle_command(app, state, launch, Command::Resume, tx)
+                        {
+                            *picker = Some((picker_for(&kind), kind));
+                        }
+                    }
+                    // Commands that need arguments (`/name `, `/sampling `)
+                    // land in the input line for the user to complete.
+                    arg_command => {
+                        app.input = (*arg_command).to_string();
+                        app.cursor = app.input.len();
+                    }
+                }
+            }
+            None => {}
+        },
+    }
 }
 
-/// Handle a slash command. Commands never produce model turns.
-fn handle_command(app: &mut app::App, state: &mut SessionState, command: Command) -> Action {
+/// Execute a slash command. Commands never produce model turns; they only
+/// reconfigure the session, touch session files, or open pickers.
+fn handle_command(
+    app: &mut app::App,
+    state: &mut SessionState,
+    launch: &mut Launch,
+    command: Command,
+    tx: &Sender<WorkerEvent>,
+) -> Action {
     match command {
         Command::Name(name) => {
             state.set_name(app, name);
@@ -609,9 +834,174 @@ fn handle_command(app: &mut app::App, state: &mut SessionState, command: Command
                     .push(app::Entry::Info("no saved sessions".into()));
                 return Action::None;
             }
-            Action::OpenPicker
+            Action::OpenPicker(PickerKind::Resume(infos))
+        }
+        Command::Model(Some(id)) => {
+            launch.model = Some(id.clone());
+            app.entries
+                .push(app::Entry::Info(format!("model set to `{id}`")));
+            Action::None
+        }
+        Command::Model(None) => {
+            app.entries.push(app::Entry::Info(format!(
+                "loading models from {}…",
+                launch.provider
+            )));
+            spawn_models(launch.provider.clone(), tx.clone());
+            Action::None
+        }
+        Command::Provider(Some(name)) => {
+            match set_provider(launch, &name) {
+                Ok(message) => app.entries.push(app::Entry::Info(message)),
+                Err(message) => app.entries.push(app::Entry::Error(message)),
+            }
+            Action::None
+        }
+        Command::Provider(None) => Action::OpenPicker(PickerKind::Providers),
+        Command::Thinking(Some(raw)) => {
+            match crate::turn::parse_thinking(&raw) {
+                Ok(parsed) => {
+                    launch.thinking = parsed.map(|_| raw.clone());
+                    app.entries.push(app::Entry::Info(match parsed {
+                        Some(_) => format!("thinking set to `{raw}`"),
+                        None => "thinking disabled".into(),
+                    }));
+                }
+                Err(err) => app.entries.push(app::Entry::Error(err.to_string())),
+            }
+            Action::None
+        }
+        Command::Thinking(None) => Action::OpenPicker(PickerKind::Thinking),
+        Command::Sampling(edit) => {
+            apply_sampling(launch, &edit, app);
+            Action::None
+        }
+        Command::Palette => Action::OpenPicker(palette_kind(prompts::templates())),
+        Command::Template { template, extra } => {
+            apply_template(app, &template, extra.as_deref());
+            Action::None
         }
     }
+}
+
+/// Switch provider; the model resets to the new provider's default (model
+/// ids do not transfer between providers).
+fn set_provider(launch: &mut Launch, name: &str) -> std::result::Result<String, String> {
+    let Some(default_model) = crate::provider::default_model(name) else {
+        return Err(format!(
+            "unknown provider `{name}`; available: {}",
+            crate::provider::available().join(", ")
+        ));
+    };
+    launch.provider = name.to_string();
+    launch.model = Some(default_model.to_string());
+    Ok(format!(
+        "provider set to `{name}` (model `{default_model}`)"
+    ))
+}
+
+/// Apply a `/sampling` edit to the launch config, reporting as an entry.
+/// Parameter values are validated the same way turns validate them, so
+/// typos surface immediately instead of at the next turn.
+fn apply_sampling(launch: &mut Launch, edit: &SamplingEdit, app: &mut app::App) {
+    match edit {
+        SamplingEdit::Show => {
+            let description = launch
+                .sampling
+                .as_ref()
+                .map(|p| format!("sampling: {}", describe_sampling(p)))
+                .unwrap_or_else(|| "no sampling parameters set".into());
+            app.entries.push(app::Entry::Info(description));
+        }
+        SamplingEdit::Clear => {
+            launch.sampling = None;
+            app.entries
+                .push(app::Entry::Info("sampling parameters cleared".into()));
+        }
+        SamplingEdit::Set(pairs) => {
+            let merged: SamplingParams = pairs.iter().cloned().collect();
+            if let Err(err) = crate::turn::sampling_from(&Some(merged)) {
+                app.entries.push(app::Entry::Error(err.to_string()));
+                return;
+            }
+            let current = launch.sampling.get_or_insert_with(SamplingParams::new);
+            for (key, value) in pairs {
+                current.insert(key.clone(), value.clone());
+            }
+            app.entries.push(app::Entry::Info(format!(
+                "sampling: {}",
+                describe_sampling(current)
+            )));
+        }
+        SamplingEdit::Unset(keys) => {
+            if let Some(current) = launch.sampling.as_mut() {
+                for key in keys {
+                    current.remove(key.as_str());
+                }
+            }
+            let description = launch
+                .sampling
+                .as_ref()
+                .filter(|p| !p.is_empty())
+                .map(|p| format!("sampling: {}", describe_sampling(p)))
+                .unwrap_or_else(|| "no sampling parameters set".into());
+            app.entries.push(app::Entry::Info(description));
+        }
+    }
+}
+
+/// `key=value` pairs joined for display.
+fn describe_sampling(params: &SamplingParams) -> String {
+    params
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Put a prompt template into the input line (plus any extra text typed
+/// after the command) for editing; nothing is sent until Enter.
+fn apply_template(app: &mut app::App, template: &Template, extra: Option<&str>) {
+    let mut text = template.content.clone();
+    if let Some(extra) = extra.map(str::trim).filter(|e| !e.is_empty()) {
+        text.push_str("\n\n");
+        text.push_str(extra);
+    }
+    app.input = text;
+    app.cursor = app.input.len();
+    app.entries.push(app::Entry::Info(format!(
+        "inserted template `/{}` — edit and press Enter",
+        template.name
+    )));
+}
+
+/// Detail line for a model in the `/model` picker.
+fn model_detail(model: &ModelInfo) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(name) = &model.display_name {
+        parts.push(name.clone());
+    }
+    if let Some(window) = model.context_window {
+        parts.push(format!("ctx {window}"));
+    }
+    if model.supports_thinking == Some(true) {
+        parts.push("thinking".into());
+    }
+    parts.join(" · ")
+}
+
+/// First non-empty line of a template body, truncated for the picker.
+fn first_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut out: String = line.chars().take(60).collect();
+    if line.chars().count() > 60 {
+        out.push('…');
+    }
+    out
 }
 
 /// Only act on press events (release events come from Windows terminals).
@@ -623,7 +1013,13 @@ fn pressed(key: KeyEvent) -> Option<KeyEvent> {
     }
 }
 
-fn handle_key(app: &mut app::App, state: &mut SessionState, key: KeyEvent) -> Action {
+fn handle_key(
+    app: &mut app::App,
+    state: &mut SessionState,
+    launch: &mut Launch,
+    tx: &Sender<WorkerEvent>,
+    key: KeyEvent,
+) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match (ctrl, key.code) {
         (true, KeyCode::Char('c')) | (true, KeyCode::Char('q')) => Action::Quit,
@@ -632,9 +1028,9 @@ fn handle_key(app: &mut app::App, state: &mut SessionState, key: KeyEvent) -> Ac
 
         (false, KeyCode::Enter) => match app.take_input() {
             Some(prompt) => {
-                if let Some(parsed) = parse_command(&prompt) {
+                if let Some(parsed) = commands::parse_command(&prompt, &prompts::templates()) {
                     match parsed {
-                        Ok(command) => handle_command(app, state, command),
+                        Ok(command) => handle_command(app, state, launch, command, tx),
                         Err(message) => {
                             app.entries.push(app::Entry::Error(message));
                             Action::None
@@ -698,34 +1094,15 @@ fn handle_key(app: &mut app::App, state: &mut SessionState, key: KeyEvent) -> Ac
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
 
-    #[test]
-    fn commands_parse() {
-        assert_eq!(
-            parse_command("hello"),
-            None,
-            "plain prompt is not a command"
-        );
-        assert_eq!(parse_command("/resume"), Some(Ok(Command::Resume)));
-        assert_eq!(
-            parse_command("/name my-session"),
-            Some(Ok(Command::Name(Some("my-session".into()))))
-        );
-        assert_eq!(parse_command("/name"), Some(Ok(Command::Name(None))));
-        assert_eq!(parse_command("/name   "), Some(Ok(Command::Name(None))));
-        assert!(matches!(
-            parse_command("/foo"),
-            Some(Err(message)) if message.contains("unknown command `/foo`")
-        ));
-        assert!(matches!(
-            parse_command("/resume later"),
-            Some(Err(message)) if message.contains("unknown command")
-        ));
+    fn launch() -> Launch {
+        Launch::from_settings("deepinfra", &Settings::default())
     }
 
     #[test]
-    fn resume_picker_labels_sessions() {
-        let infos = vec![
+    fn picker_for_labels_resume_sessions() {
+        let kind = PickerKind::Resume(vec![
             SessionInfo {
                 path: PathBuf::from(".clanky/sessions/a.jsonl"),
                 name: "a".into(),
@@ -738,8 +1115,9 @@ mod tests {
                 modified: 0,
                 turns: 0,
             },
-        ];
-        let picker = resume_picker(&infos);
+        ]);
+        let picker = picker_for(&kind);
+        assert_eq!(picker.title(), "resume");
         let lines = picker.lines(10);
         let texts: Vec<String> = lines
             .iter()
@@ -751,5 +1129,281 @@ mod tests {
                 .any(|t| t.contains("a") && t.contains("2023-11-14 22:13"))
         );
         assert!(texts.iter().any(|t| t.contains("3 turns")));
+    }
+
+    #[test]
+    fn picker_builders_for_m5_commands() {
+        let models = PickerKind::Models(vec![ModelInfo {
+            id: "meta/Llama-3-70B".into(),
+            display_name: Some("Llama 3".into()),
+            context_window: Some(8192),
+            supports_thinking: Some(true),
+        }]);
+        let picker = picker_for(&models);
+        assert_eq!(picker.title(), "model");
+        let lines = picker.lines(10);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let all = texts.join("\n");
+        assert!(all.contains("meta/Llama-3-70B"), "{all}");
+        assert!(all.contains("Llama 3"), "{all}");
+        assert!(all.contains("ctx 8192"), "{all}");
+        assert!(all.contains("thinking"), "{all}");
+
+        assert_eq!(picker_for(&PickerKind::Providers).title(), "provider");
+        let providers = picker_for(&PickerKind::Providers)
+            .lines(10)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<Vec<String>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(providers.contains("deepinfra"), "{providers}");
+
+        assert_eq!(picker_for(&PickerKind::Thinking).title(), "thinking");
+        let thinking = picker_for(&PickerKind::Thinking)
+            .lines(10)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<Vec<String>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(thinking.contains("off"), "{thinking}");
+        assert!(thinking.contains("4096"), "{thinking}");
+
+        let templates = palette_kind(vec![Template {
+            name: "review".into(),
+            content: "Review this code\n\nvery carefully".into(),
+        }]);
+        let picker = picker_for(&templates);
+        assert_eq!(picker.title(), "commands");
+        let lines = picker.lines(10);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let all = texts.join("\n");
+        assert!(all.contains("/model"), "{all}");
+        assert!(all.contains("/resume"), "{all}");
+        assert!(all.contains("/review"), "{all}");
+        assert!(all.contains("Review this code"), "{all}");
+    }
+
+    #[test]
+    fn model_detail_combines_fields() {
+        assert_eq!(
+            model_detail(&ModelInfo {
+                id: "m".into(),
+                display_name: None,
+                context_window: None,
+                supports_thinking: None,
+            }),
+            ""
+        );
+        assert_eq!(
+            model_detail(&ModelInfo {
+                id: "m".into(),
+                display_name: Some("Model".into()),
+                context_window: Some(4096),
+                supports_thinking: Some(true),
+            }),
+            "Model · ctx 4096 · thinking"
+        );
+    }
+
+    #[test]
+    fn set_provider_validates_and_resets_model() {
+        let mut launch = launch();
+        launch.model = Some("old/model".into());
+        let message = set_provider(&mut launch, "deepinfra").unwrap();
+        assert_eq!(launch.provider, "deepinfra");
+        assert_eq!(
+            launch.model.as_deref(),
+            Some("deepseek-ai/DeepSeek-V4-Flash-0731")
+        );
+        assert!(message.contains("deepinfra"), "{message}");
+
+        let err = set_provider(&mut launch, "nonexistent").unwrap_err();
+        assert!(err.contains("unknown provider `nonexistent`"), "{err}");
+        assert_eq!(launch.provider, "deepinfra", "failed switch is a no-op");
+    }
+
+    #[test]
+    fn sampling_edits_apply_and_validate() {
+        let mut cfg = launch();
+        let mut app = app::App::new();
+
+        apply_sampling(&mut cfg, &SamplingEdit::Show, &mut app);
+        assert!(cfg.sampling.is_none());
+        assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
+
+        apply_sampling(
+            &mut cfg,
+            &SamplingEdit::Set(vec![("temperature".into(), "0.7".into())]),
+            &mut app,
+        );
+        assert_eq!(
+            cfg.sampling.as_ref().unwrap().get("temperature"),
+            Some(&"0.7".to_string())
+        );
+        apply_sampling(
+            &mut cfg,
+            &SamplingEdit::Set(vec![("top_p".into(), "0.9".into())]),
+            &mut app,
+        );
+        assert_eq!(cfg.sampling.as_ref().unwrap().len(), 2, "set merges");
+
+        apply_sampling(
+            &mut cfg,
+            &SamplingEdit::Set(vec![("temperature".into(), "hot".into())]),
+            &mut app,
+        );
+        assert!(matches!(app.entries.last(), Some(app::Entry::Error(_))));
+        assert_eq!(
+            cfg.sampling.as_ref().unwrap().get("temperature"),
+            Some(&"0.7".to_string()),
+            "rejected edit leaves the old value"
+        );
+
+        apply_sampling(
+            &mut cfg,
+            &SamplingEdit::Unset(vec!["temperature".into(), "missing".into()]),
+            &mut app,
+        );
+        assert_eq!(
+            cfg.sampling.as_ref().unwrap().get("temperature"),
+            None,
+            "unset removes known keys and ignores unknown ones"
+        );
+        assert_eq!(
+            cfg.sampling.as_ref().unwrap().get("top_p"),
+            Some(&"0.9".to_string())
+        );
+
+        apply_sampling(&mut cfg, &SamplingEdit::Clear, &mut app);
+        assert!(cfg.sampling.is_none());
+    }
+
+    #[test]
+    fn thinking_commands_set_and_clear() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(cfg.clone());
+        let mut app = app::App::new();
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+
+        let action = handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            Command::Thinking(Some("2048".into())),
+            &tx,
+        );
+        assert!(matches!(action, Action::None));
+        assert_eq!(cfg.thinking.as_deref(), Some("2048"));
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            Command::Thinking(Some("off".into())),
+            &tx,
+        );
+        assert_eq!(cfg.thinking, None, "off clears thinking");
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            Command::Thinking(Some("lots".into())),
+            &tx,
+        );
+        assert!(matches!(app.entries.last(), Some(app::Entry::Error(_))));
+        assert_eq!(cfg.thinking, None, "rejected value is not applied");
+    }
+
+    #[test]
+    fn model_and_provider_commands_reconfigure_the_launch() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(cfg.clone());
+        let mut app = app::App::new();
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            Command::Model(Some("other/model".into())),
+            &tx,
+        );
+        assert_eq!(cfg.model.as_deref(), Some("other/model"));
+        assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            Command::Provider(Some("nonexistent".into())),
+            &tx,
+        );
+        assert!(matches!(app.entries.last(), Some(app::Entry::Error(_))));
+        assert_eq!(cfg.provider, "deepinfra", "failed switch is a no-op");
+    }
+
+    #[test]
+    fn template_commands_fill_the_input_line() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(cfg.clone());
+        let mut app = app::App::new();
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let template = Template {
+            name: "review".into(),
+            content: "Review this code".into(),
+        };
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            Command::Template {
+                template: template.clone(),
+                extra: None,
+            },
+            &tx,
+        );
+        assert_eq!(app.input, "Review this code");
+        assert_eq!(app.cursor, app.input.len());
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            Command::Template {
+                template,
+                extra: Some("  the auth module ".into()),
+            },
+            &tx,
+        );
+        assert_eq!(app.input, "Review this code\n\nthe auth module");
+    }
+
+    #[test]
+    fn first_line_truncates() {
+        assert_eq!(first_line("\n\n  hi  \nnext"), "hi");
+        let long = "x".repeat(80);
+        let shown = first_line(&long);
+        assert_eq!(shown.chars().count(), 61, "60 chars + ellipsis");
+        assert!(shown.ends_with('…'));
     }
 }

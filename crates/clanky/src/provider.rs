@@ -12,6 +12,12 @@ use crate::error::{Error, Result};
 /// Default provider when neither settings nor CLI name one.
 pub const DEFAULT_PROVIDER: &str = "deepinfra";
 
+/// Providers this build knows (in-process until M8's plugin discovery).
+/// The `/provider` picker and `/provider <name>` validate against this list.
+pub fn available() -> &'static [&'static str] {
+    &["deepinfra"]
+}
+
 /// Instantiate the named provider in-process.
 pub fn create(name: &str) -> Result<Box<dyn Handler>> {
     match name {

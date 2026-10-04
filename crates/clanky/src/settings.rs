@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config;
 use crate::error::{Error, Result};
 
 /// Sampling parameters as `key -> raw value` strings
@@ -37,11 +38,10 @@ pub struct Settings {
 impl Settings {
     /// Load user- and project-scope settings and merge them.
     pub fn load_layered() -> Result<Settings> {
-        let home = dirs::home_dir().ok_or(Error::NoHomeDir)?;
-        let paths = [
-            home.join(".clanky").join("settings.toml"),
-            PathBuf::from(".clanky").join("settings.toml"),
-        ];
+        let paths: Vec<PathBuf> = config::scopes()
+            .into_iter()
+            .map(|scope| scope.join(config::SETTINGS_FILE))
+            .collect();
         Self::load_from_paths(&paths)
     }
 

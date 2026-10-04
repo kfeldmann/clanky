@@ -69,13 +69,13 @@ Architectural decisions already made:
 - `/name`, `/resume` (picker), autosave
 - Done when: kill the TUI mid-session, resume, full context restored.
 
-## ☐ M5 — Slash commands + pickers
+## ✔ M5 — Slash commands + pickers
 - `/model`, `/provider`, `/thinking`, `/sampling`, prompt templates `/\<name\>`
 - Unknown command → error, not sent to the model
 - Picker component (reused for `/resume`)
 - Done when: all pickers work; unknown `/foo` errors cleanly.
 
-## ☐ M6 — Context & config completion
+## ✔ M6 — Context & config completion
 - Full `~/.clanky/` and `./.clanky/` layout: `AGENTS.md`, `SYSTEM.md`, `skills/`, `prompts/`, `plugins/`
 - Layering rules user < project; doc the precedence
 - Done when: skills/prompts load from both scopes.

@@ -1,33 +1,49 @@
-//! Context assembly stub (M1): read `SYSTEM.md` / `AGENTS.md` when present.
+//! Context assembly (M6): system prompt and agent instructions from both
+//! scopes, plus skills.
 //!
 //! Scope and order (later messages take precedence in most backends):
-//! 1. user scope:   `$HOME/.clanky/SYSTEM.md`, `$HOME/.clanky/AGENTS.md`
-//! 2. project root: `./SYSTEM.md`, `./AGENTS.md`
+//! 1. user scope:    `$HOME/.clanky/SYSTEM.md`, `$HOME/.clanky/AGENTS.md`
+//! 2. project scope: `./.clanky/SYSTEM.md`, `./.clanky/AGENTS.md`
+//! 3. project root:  `./AGENTS.md` (the ecosystem convention, kept from M1)
+//! 4. skills:        `skills/` under each scope, user first (see
+//!    [`crate::skills`]), injected under a `# Skill: <name>` heading
 //!
-//! M6 completes the layout (skills/, prompts/, `./.clanky/` scope); this
-//! stub exists so `-p` turns already pick up the common convention of a
-//! project-root `AGENTS.md`.
+//! Everything is best-effort: missing, empty, or unreadable files are
+//! skipped silently.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clanky_protocol::ChatMessage;
 
+use crate::config;
+use crate::skills::{self, Skill};
+
 /// Assemble system messages from the real locations (cwd as project root).
 pub fn system_messages() -> Vec<ChatMessage> {
-    let user_dir = dirs::home_dir().map(|home| home.join(".clanky"));
-    system_messages_in(Path::new("."), user_dir.as_deref())
+    system_messages_in(&config::scopes(), Path::new("."))
 }
 
-/// Pure form of [`system_messages`] for testing: scan explicit locations.
-pub fn system_messages_in(project_root: &Path, user_dir: Option<&Path>) -> Vec<ChatMessage> {
+/// Pure form of [`system_messages`] for testing: scan explicit scope
+/// directories (layering order: user first, project last) and a project
+/// root for the `AGENTS.md` convention file.
+pub fn system_messages_in(scopes: &[PathBuf], project_root: &Path) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
-    if let Some(user) = user_dir {
-        push_file(&mut messages, user, "SYSTEM.md");
-        push_file(&mut messages, user, "AGENTS.md");
+    for scope in scopes {
+        push_file(&mut messages, scope, config::SYSTEM_FILE);
+        push_file(&mut messages, scope, config::AGENTS_FILE);
     }
-    push_file(&mut messages, project_root, "SYSTEM.md");
-    push_file(&mut messages, project_root, "AGENTS.md");
+    // Ecosystem convention from M1: a project-root AGENTS.md still counts.
+    push_file(&mut messages, project_root, config::AGENTS_FILE);
+
+    for skill in skills::skills_in(scopes) {
+        messages.push(ChatMessage::system(wrap_skill(&skill)));
+    }
     messages
+}
+
+/// Wrap a skill body in a system message with a heading.
+fn wrap_skill(skill: &Skill) -> String {
+    format!("# Skill: {}\n\n{}", skill.name, skill.content)
 }
 
 /// Append a file as a system message; missing or empty files are skipped
@@ -55,11 +71,18 @@ mod tests {
         dir
     }
 
+    fn scope_dir(base: &Path, kind: &str) -> PathBuf {
+        let dir = base.join(kind).join(config::project_dir());
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn missing_files_yield_no_context() {
         let project = temp_dir("empty-project");
         let user = temp_dir("empty-user");
-        assert!(system_messages_in(&project, Some(&user)).is_empty());
+        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
+        assert!(system_messages_in(&scopes, Path::new(".")).is_empty());
         fs::remove_dir_all(project).ok();
         fs::remove_dir_all(user).ok();
     }
@@ -68,8 +91,9 @@ mod tests {
     fn project_agents_md_becomes_system_message() {
         let project = temp_dir("with-agents");
         let user = temp_dir("with-agents-user");
-        fs::write(project.join("AGENTS.md"), "Be terse.\n").unwrap();
-        let msgs = system_messages_in(&project, Some(&user));
+        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
+        fs::write(scopes[1].join(config::AGENTS_FILE), "Be terse.\n").unwrap();
+        let msgs = system_messages_in(&scopes, Path::new("."));
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content(), "Be terse.");
 
@@ -81,12 +105,13 @@ mod tests {
     fn project_overrides_user_by_order() {
         let project = temp_dir("order-project");
         let user = temp_dir("order-user");
-        fs::write(user.join("SYSTEM.md"), "user system").unwrap();
-        fs::write(user.join("AGENTS.md"), "user agents").unwrap();
-        fs::write(project.join("SYSTEM.md"), "project system").unwrap();
-        fs::write(project.join("AGENTS.md"), "project agents").unwrap();
+        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
+        fs::write(scopes[0].join(config::SYSTEM_FILE), "user system").unwrap();
+        fs::write(scopes[0].join(config::AGENTS_FILE), "user agents").unwrap();
+        fs::write(scopes[1].join(config::SYSTEM_FILE), "project system").unwrap();
+        fs::write(scopes[1].join(config::AGENTS_FILE), "project agents").unwrap();
 
-        let msgs = system_messages_in(&project, Some(&user));
+        let msgs = system_messages_in(&scopes, Path::new("."));
         let contents: Vec<&str> = msgs.iter().map(|m| m.content()).collect();
         assert_eq!(
             contents,
@@ -105,8 +130,59 @@ mod tests {
     #[test]
     fn whitespace_only_files_are_skipped() {
         let project = temp_dir("blank-file");
-        fs::write(project.join("AGENTS.md"), "   \n\t\n").unwrap();
-        assert!(system_messages_in(&project, None).is_empty());
+        let scopes = vec![scope_dir(&project, "p")];
+        fs::write(scopes[0].join(config::AGENTS_FILE), "   \n\t\n").unwrap();
+        assert!(system_messages_in(&scopes, Path::new(".")).is_empty());
         fs::remove_dir_all(project).ok();
+    }
+
+    #[test]
+    fn project_root_agents_md_still_counts() {
+        let project = temp_dir("root-agents");
+        let scopes = vec![scope_dir(&project, "p")];
+        fs::write(project.join(config::AGENTS_FILE), "root convention").unwrap();
+        let msgs = system_messages_in(&scopes, &project);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content(), "root convention");
+        fs::remove_dir_all(project).ok();
+    }
+
+    #[test]
+    fn skills_load_from_both_scopes_with_project_shadowing() {
+        let project = temp_dir("skills-project");
+        let user = temp_dir("skills-user");
+        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
+        for scope in &scopes {
+            let skills = scope.join(config::SKILLS_DIR);
+            fs::create_dir_all(&skills).unwrap();
+            fs::write(skills.join("style.md"), "user style").unwrap();
+        }
+        // Project scope wins the shadowing: overwrite the project copy.
+        fs::write(
+            scopes[1].join(config::SKILLS_DIR).join("style.md"),
+            "project style",
+        )
+        .unwrap();
+        let user_skills = scopes[0].join(config::SKILLS_DIR);
+        fs::create_dir_all(&user_skills).unwrap();
+        fs::write(user_skills.join("shared-user-only.md"), "only in user").unwrap();
+        let project_skills = scopes[1].join(config::SKILLS_DIR);
+        fs::create_dir_all(project_skills.join("dirskill")).unwrap();
+        fs::write(project_skills.join("dirskill/SKILL.md"), "directory skill").unwrap();
+
+        let msgs = system_messages_in(&scopes, Path::new("."));
+        let contents: Vec<&str> = msgs.iter().map(|m| m.content()).collect();
+        assert_eq!(
+            contents,
+            [
+                "# Skill: dirskill\n\ndirectory skill",
+                "# Skill: shared-user-only\n\nonly in user",
+                "# Skill: style\n\nproject style",
+            ],
+            "project scope shadows user; sorted by name"
+        );
+
+        fs::remove_dir_all(project).ok();
+        fs::remove_dir_all(user).ok();
     }
 }

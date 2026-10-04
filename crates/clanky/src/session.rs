@@ -33,7 +33,7 @@ pub const FORMAT_VERSION: u32 = 1;
 
 /// Where sessions of the current project live.
 pub fn sessions_dir() -> PathBuf {
-    PathBuf::from(".clanky").join("sessions")
+    crate::config::project_dir().join(crate::config::SESSIONS_DIR)
 }
 
 /// Current wall-clock time as epoch milliseconds.

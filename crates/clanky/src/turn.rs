@@ -239,7 +239,7 @@ fn tool_names(tools: &ToolSet) -> String {
 
 /// Convert settings sampling parameters (string key/value pairs) into
 /// protocol sampling. Unknown keys are rejected so typos surface loudly.
-fn sampling_from(params: &Option<SamplingParams>) -> Result<Option<Sampling>> {
+pub(crate) fn sampling_from(params: &Option<SamplingParams>) -> Result<Option<Sampling>> {
     let Some(params) = params else {
         return Ok(None);
     };
@@ -273,15 +273,21 @@ fn parse_f64(raw: &str, key: &str) -> Result<f64> {
 /// integer is a token budget. Named levels map onto budgets in the provider
 /// adapter (M1 keeps the protocol shaped by budget).
 fn thinking_from(value: &Option<String>) -> Result<Option<Thinking>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match value.trim() {
+    match value.as_deref() {
+        Some(raw) => parse_thinking(raw),
+        None => Ok(None),
+    }
+}
+
+/// Validate one thinking value: `off`/empty disables thinking, otherwise a
+/// non-negative integer token budget. Shared by `--thinking` and `/thinking`.
+pub fn parse_thinking(raw: &str) -> Result<Option<Thinking>> {
+    match raw.trim() {
         "" | "off" => Ok(None),
-        raw => {
-            let budget: u32 = raw
+        other => {
+            let budget: u32 = other
                 .parse()
-                .map_err(|_| Error::InvalidThinking(raw.into()))?;
+                .map_err(|_| Error::InvalidThinking(other.into()))?;
             Ok(Some(Thinking {
                 budget_tokens: Some(budget),
             }))

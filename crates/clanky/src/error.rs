@@ -9,9 +9,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("cannot locate home directory; set $HOME")]
-    NoHomeDir,
-
     #[error("failed to read settings file {}: {source}", path.display())]
     ReadSettings {
         path: PathBuf,
