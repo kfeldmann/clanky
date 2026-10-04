@@ -1,9 +1,12 @@
 //! TUI application state (M3): transcript entries, input line, scrolling.
 
+use std::path::PathBuf;
+
 use clanky_protocol::{ChatMessage, Usage};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::completion;
 use super::markdown;
 use crate::error::Result;
 use crate::session::Record;
@@ -33,6 +36,52 @@ pub enum Entry {
     Info(String),
 }
 
+/// Active Tab-completion cycle state (M7): Tab first inserts the longest
+/// common prefix of the candidates (shown in a popup above the input);
+/// further Tabs cycle through the individual candidates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletionState {
+    /// Input text before the completed token.
+    prefix: String,
+    /// Input text after the completed token.
+    suffix: String,
+    /// Full replacement texts for the token, sorted.
+    candidates: Vec<String>,
+    /// Index into `candidates` currently inserted; `None` while the
+    /// longest common prefix is shown.
+    index: Option<usize>,
+}
+
+impl CompletionState {
+    /// Build from the input split around the completed token.
+    pub(crate) fn new(prefix: String, suffix: String, candidates: Vec<String>) -> Self {
+        Self {
+            prefix,
+            suffix,
+            candidates,
+            index: None,
+        }
+    }
+
+    /// Candidate texts, in cycle order.
+    pub fn candidates(&self) -> &[String] {
+        &self.candidates
+    }
+
+    /// Currently selected candidate, if cycling has started.
+    pub fn selected(&self) -> Option<usize> {
+        self.index
+    }
+
+    /// Advance to the next candidate, wrapping around.
+    pub(crate) fn advance(&mut self) {
+        self.index = match self.index {
+            None => Some(0),
+            Some(i) => Some((i + 1) % self.candidates.len()),
+        };
+    }
+}
+
 /// Which transcript entry streaming deltas currently append to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum OpenKind {
@@ -58,6 +107,8 @@ pub struct App {
     /// The complete conversation (system context first): what is passed
     /// to the next turn. Updated after each turn, restored on resume (M4).
     pub history: Vec<ChatMessage>,
+    /// Active Tab-completion cycle (M7); cleared on any non-Tab key.
+    pub completion: Option<CompletionState>,
     open: Option<OpenKind>,
 }
 
@@ -78,6 +129,7 @@ impl App {
             scroll_from_bottom: 0,
             last_usage: None,
             history: Vec::new(),
+            completion: None,
             open: None,
         }
     }
@@ -190,6 +242,7 @@ impl App {
         }
         self.input.clear();
         self.cursor = 0;
+        self.completion = None;
         Some(text)
     }
 
@@ -245,6 +298,58 @@ impl App {
             .char_indices()
             .next_back()
             .map(|(i, _)| i)
+    }
+
+    // --- tab completion (M7) ------------------------------------------------
+
+    /// Complete the file path at the caret. First press inserts the longest
+    /// common prefix and opens the candidate popup; further presses cycle
+    /// through the candidates. Any other key clears the state.
+    pub fn tab_complete(&mut self) {
+        if self.completion.is_some() {
+            self.cycle_completion();
+            return;
+        }
+        let (start, end) = completion::token_range(&self.input, self.cursor);
+        let token = self.input[start..end].to_string();
+        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let candidates = completion::candidates(&base, &token);
+        match candidates.as_slice() {
+            [] => {
+                let note = Entry::Info("no completions".into());
+                if self.entries.last() != Some(&note) {
+                    self.entries.push(note);
+                }
+            }
+            [only] => self.replace_token(start, end, only),
+            many => {
+                let prefix = self.input[..start].to_string();
+                let suffix = self.input[end..].to_string();
+                let lcp = completion::common_prefix(many);
+                self.replace_token(start, end, &lcp);
+                self.completion = Some(CompletionState::new(prefix, suffix, candidates));
+            }
+        }
+    }
+
+    /// Cycle to the next candidate of the active completion.
+    fn cycle_completion(&mut self) {
+        let Some(mut state) = self.completion.take() else {
+            return;
+        };
+        state.advance();
+        let text = state.candidates[state.index.expect("advance sets an index")].clone();
+        self.input = format!("{}{}{}", state.prefix, text, state.suffix);
+        self.cursor = state.prefix.len() + text.len();
+        self.completion = Some(state);
+    }
+
+    /// Substitute the token at `start..end` with `text`; the caret moves to
+    /// the end of the inserted text.
+    fn replace_token(&mut self, start: usize, end: usize, text: &str) {
+        let suffix = self.input[end..].to_string();
+        self.input = format!("{}{}{}", &self.input[..start], text, suffix);
+        self.cursor = start + text.len();
     }
 
     // --- scrolling ----------------------------------------------------------
@@ -620,5 +725,55 @@ mod tests {
                 .collect::<String>()
                 .contains("· renamed")
         }));
+    }
+
+    #[test]
+    fn completion_cycles_through_candidates() {
+        let mut app = App::new();
+        app.completion = Some(CompletionState::new(
+            "cat ".into(),
+            String::new(),
+            vec!["alpha.md ".into(), "alpha.txt ".into()],
+        ));
+
+        // First Tab applies the first candidate (the LCP was shown before).
+        app.tab_complete();
+        assert_eq!(app.input, "cat alpha.md ");
+        assert_eq!(app.cursor, "cat alpha.md ".len());
+
+        // Subsequent Tabs cycle, wrapping around at the end.
+        app.tab_complete();
+        assert_eq!(app.input, "cat alpha.txt ");
+        app.tab_complete();
+        assert_eq!(app.input, "cat alpha.md ");
+    }
+
+    #[test]
+    fn completion_cycle_keeps_prefix_and_suffix() {
+        let mut app = App::new();
+        app.completion = Some(CompletionState::new(
+            "read ".into(),
+            " now".into(),
+            vec!["beta/".into(), "src/".into()],
+        ));
+        app.tab_complete();
+        assert_eq!(app.input, "read beta/ now");
+        assert_eq!(app.cursor, "read beta/".len(), "caret after the token");
+        app.tab_complete();
+        assert_eq!(app.input, "read src/ now");
+    }
+
+    #[test]
+    fn take_input_clears_completion_state() {
+        let mut app = App::new();
+        app.completion = Some(CompletionState::new(
+            String::new(),
+            String::new(),
+            vec!["x ".into()],
+        ));
+        app.input = "hi".into();
+        app.cursor = 2;
+        app.take_input();
+        assert!(app.completion.is_none());
     }
 }

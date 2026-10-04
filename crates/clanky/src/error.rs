@@ -77,6 +77,12 @@ pub enum Error {
 
     #[error("cannot use --resume in non-interactive mode")]
     ResumeNonInteractive,
+
+    #[error("$EDITOR is not set; set it to edit the prompt buffer (ctrl+e)")]
+    NoEditor,
+
+    #[error("editor failed: {0}")]
+    EditorFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

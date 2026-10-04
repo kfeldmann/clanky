@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget as _};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
-use super::app::App;
+use super::app::{App, CompletionState};
 use super::picker::Picker;
 
 /// Prompt symbol for the input line.
@@ -27,13 +27,16 @@ pub struct Status<'a> {
 
 /// Draw one frame. `transcript` must be the app's transcript pre-wrapped to
 /// the terminal width; `scroll_from_top` is the clamped scroll offset. When
-/// `picker` is open it is drawn as a centered overlay on top.
+/// `picker` is open it is drawn as a centered overlay on top; when Tab
+/// completion is active (M7) its candidate popup is drawn above the input
+/// line.
 pub fn draw(
     frame: &mut Frame,
     app: &App,
     transcript: Vec<Line<'static>>,
     scroll_from_top: usize,
     status: &Status<'_>,
+    completion: Option<&CompletionState>,
     picker: Option<&Picker>,
 ) {
     let area = frame.area();
@@ -52,6 +55,9 @@ pub fn draw(
 
     draw_status(frame, status_area, app, status);
     draw_input(frame, input_area, app);
+    if let Some(completion) = completion {
+        draw_completion(frame, input_area, completion);
+    }
     if let Some(picker) = picker {
         draw_picker(frame, area, picker);
     }
@@ -135,6 +141,74 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, status: &Status<'_>) {
         spans.extend(truncate_spans(right, width));
     }
     frame.render_widget(ratatui::widgets::Paragraph::new(Line::from(spans)), area);
+}
+
+/// Completion candidate popup (M7): a small bordered box anchored to the
+/// left edge of the input line, overlaying the transcript. The selected
+/// candidate (while cycling) is highlighted.
+fn draw_completion(frame: &mut Frame, input_area: Rect, completion: &CompletionState) {
+    const MAX_VISIBLE: usize = 8;
+    let candidates = completion.candidates();
+    if candidates.is_empty() {
+        return;
+    }
+    // Border + rows must fit between the top of the screen and the input.
+    let visible = candidates
+        .len()
+        .min(MAX_VISIBLE)
+        .min(input_area.y.saturating_sub(2) as usize);
+    if visible == 0 {
+        return;
+    }
+    let title = match completion.selected() {
+        Some(i) => format!(" complete {}/{} ", i + 1, candidates.len()),
+        None => " complete ".to_string(),
+    };
+    let width = candidates
+        .iter()
+        .map(|c| c.width())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(4)
+        .max(title.width() + 2)
+        .clamp(12, input_area.width as usize) as u16;
+    let height = visible as u16 + 2;
+    let box_area = Rect {
+        x: input_area.x,
+        y: input_area.y - height,
+        width,
+        height,
+    };
+    Clear.render(box_area, frame.buffer_mut());
+    let block = Block::bordered().title(Span::styled(
+        title,
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(box_area);
+    block.render(box_area, frame.buffer_mut());
+
+    // Sliding window around the selected candidate.
+    let selected = completion.selected();
+    let start = selected.map_or(0, |i| i.saturating_sub(visible.saturating_sub(1)));
+    let lines: Vec<Line<'static>> = candidates[start..start + visible]
+        .iter()
+        .enumerate()
+        .map(|(row, text)| {
+            let is_selected = selected == Some(start + row);
+            let style = if is_selected {
+                Style::new()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            Line::from(vec![
+                Span::styled(format!(" {} ", if is_selected { '▸' } else { ' ' }), style),
+                Span::styled(text.clone(), style),
+            ])
+        })
+        .collect();
+    Paragraph::new(lines).render(inner, frame.buffer_mut());
 }
 
 fn draw_input(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -243,6 +317,7 @@ fn truncate_spans(spans: Vec<Span<'_>>, width: usize) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod tests {
+    use super::CompletionState;
     use super::*;
     use crate::tui::app::Entry;
     use clanky_protocol::Usage;
@@ -263,6 +338,7 @@ mod tests {
                         model: Some("mock/model"),
                         session: None,
                     },
+                    app.completion.as_ref(),
                     None,
                 )
             })
@@ -363,6 +439,7 @@ mod tests {
                         session: None,
                     },
                     None,
+                    None,
                 )
             })
             .unwrap();
@@ -400,6 +477,7 @@ mod tests {
                         session: Some("my-session"),
                     },
                     None,
+                    None,
                 )
             })
             .unwrap();
@@ -431,6 +509,7 @@ mod tests {
                         model: None,
                         session: None,
                     },
+                    None,
                     Some(&picker),
                 )
             })
@@ -438,5 +517,59 @@ mod tests {
         let screen = screen_text(terminal.backend().buffer(), 60, 10);
         assert!(screen.contains("session-a"), "{screen}");
         assert!(screen.contains("search:"), "{screen}");
+    }
+
+    #[test]
+    fn completion_popup_renders_above_the_input() {
+        let mut app = App::new();
+        app.input = "cat alpha".into();
+        app.cursor = app.input.len();
+        app.completion = Some(CompletionState::new(
+            "cat ".into(),
+            String::new(),
+            vec!["alpha.md ".into(), "alpha.txt ".into()],
+        ));
+
+        let buffer = draw_app(&app, 60, 10);
+        let screen = screen_text(&buffer, 60, 10);
+        assert!(screen.contains("complete"), "{screen}");
+        assert!(screen.contains("alpha.md"), "{screen}");
+        assert!(screen.contains("alpha.txt"), "{screen}");
+        assert!(screen.contains("❯ cat alpha"), "{screen}");
+    }
+
+    #[test]
+    fn completion_popup_marks_the_selected_candidate() {
+        let mut app = App::new();
+        app.completion = Some(CompletionState::new(
+            String::new(),
+            String::new(),
+            vec!["one ".into(), "two ".into(), "three ".into()],
+        ));
+        // Simulate cycling to the second candidate.
+        {
+            let state = app.completion.as_mut().unwrap();
+            state.advance();
+            state.advance();
+        }
+        let buffer = draw_app(&app, 60, 10);
+        let screen = screen_text(&buffer, 60, 10);
+        assert!(screen.contains("complete 2/3"), "{screen}");
+        assert!(screen.contains("▸ two"), "{screen}");
+        assert!(!screen.contains("▸ one"), "{screen}");
+    }
+
+    #[test]
+    fn completion_popup_skips_when_the_terminal_is_tiny() {
+        let mut app = App::new();
+        app.completion = Some(CompletionState::new(
+            String::new(),
+            String::new(),
+            vec!["a ".into(), "b ".into()],
+        ));
+        // 3 rows: chat 1, status 1, input 1 — no room above the input.
+        let buffer = draw_app(&app, 40, 3);
+        let screen = screen_text(&buffer, 40, 3);
+        assert!(!screen.contains("complete"), "{screen}");
     }
 }

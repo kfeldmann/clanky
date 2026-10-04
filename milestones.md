@@ -80,7 +80,7 @@ Architectural decisions already made:
 - Layering rules user < project; doc the precedence
 - Done when: skills/prompts load from both scopes.
 
-## ☐ M7 — Input ergonomics
+## ✔ M7 — Input ergonomics
 - Tab completion of file paths
 - `$EDITOR` launch key (suspend TUI, edit, resume)
 - Done when: both work in TUI without breaking rendering.

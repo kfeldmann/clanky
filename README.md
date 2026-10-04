@@ -43,3 +43,18 @@ addition to `./.clanky/AGENTS.md`, and comes after both scopes.
 
 Sessions always live in the **project scope** (`./.clanky/sessions/`);
 there is no user-scope session store.
+
+## TUI keys
+
+| Key | Action |
+| --- | --- |
+| `Enter` | submit (queued while a turn is streaming) |
+| `Tab` | complete the file path at the caret: longest common prefix first, further `Tab` presses cycle candidates |
+| `ctrl+e` | edit the prompt buffer in `$EDITOR` (the TUI suspends; an emptied buffer clears the input) |
+| `ctrl+c` / `ctrl+d` / `Esc` | quit |
+| `ctrl+l` | clear the transcript |
+| `PgUp`/`PgDn`, `↑`/`↓`, mouse wheel | scroll |
+| `/` (empty input) | command palette |
+
+The TUI only starts when stdin *and* stdout are terminals; piped input
+falls back to plain one-shot mode.

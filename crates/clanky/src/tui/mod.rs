@@ -17,6 +17,12 @@
 //! commands and `/<model id>` open pickers; unknown commands error
 //! cleanly and are never sent to the model.
 //!
+//! Input ergonomics (M7): Tab completes the file path at the caret (longest
+//! common prefix first, further Tabs cycle candidates, shown in a popup
+//! above the input line); ctrl+e opens `$EDITOR` with the prompt buffer —
+//! the TUI suspends, the editor owns the terminal, and the TUI resumes
+//! with the edited text.
+//!
 //! Layout (see `ui.rs`):
 //! ┌────────────────────────────────┐
 //! │ transcript (markdown, scroll)  │
@@ -26,6 +32,8 @@
 
 mod app;
 mod commands;
+mod completion;
+mod editor;
 mod markdown;
 mod picker;
 mod ui;
@@ -203,6 +211,8 @@ enum Action {
     Submit(String),
     /// Open a picker; the kind carries the data it selects from.
     OpenPicker(PickerKind),
+    /// Suspend the TUI and edit the prompt buffer in `$EDITOR` (M7).
+    OpenEditor,
 }
 
 /// What an open picker selects (M5): the payload decides what Enter does.
@@ -503,6 +513,7 @@ fn event_loop(
                 transcript,
                 scroll_from_top,
                 &status,
+                app.completion.as_ref(),
                 picker_ref,
             );
         })?;
@@ -511,6 +522,8 @@ fn event_loop(
             match event::read()? {
                 Event::Key(key) => {
                     if let Some(key) = pressed(key) {
+                        let tab = key.code == KeyCode::Tab
+                            && !key.modifiers.contains(KeyModifiers::CONTROL);
                         if picker.is_some() {
                             match picker_key(&mut picker, key, &mut app, &mut state, launch, &tx) {
                                 PickerOutcome::Quit => break,
@@ -526,6 +539,11 @@ fn event_loop(
                                 Action::Clear => app.clear(),
                                 Action::OpenPicker(kind) => {
                                     picker = Some((picker_for(&kind), kind));
+                                }
+                                Action::OpenEditor => {
+                                    if let Err(err) = run_editor(&mut app, terminal) {
+                                        app.entries.push(app::Entry::Error(err.to_string()));
+                                    }
                                 }
                                 Action::Submit(prompt) => {
                                     app.push_user(&prompt);
@@ -544,6 +562,11 @@ fn event_loop(
                                 }
                                 Action::None => {}
                             }
+                        }
+                        // The completion popup lives on between Tab presses
+                        // only; any other key dismisses it.
+                        if !tab {
+                            app.completion = None;
                         }
                     }
                 }
@@ -596,6 +619,31 @@ fn event_loop(
             app.busy = true;
             spawn_turn(app.history.clone(), launch, prompt, tx.clone());
         }
+    }
+    Ok(())
+}
+
+/// ctrl+e (M7): suspend the TUI, edit the prompt buffer in `$EDITOR`,
+/// resume with the edited text. An empty buffer clears the input; a
+/// failing editor leaves the input untouched and reports the error.
+fn run_editor(app: &mut app::App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    let editor = editor::editor_command()?;
+    let initial = app.input.clone();
+    restore(terminal)?;
+    let outcome = editor::edit_with(&initial, &editor);
+    // Re-establish the TUI no matter how the editor behaved.
+    *terminal = setup()?;
+    app.completion = None;
+    match outcome {
+        Ok(Some(text)) => {
+            app.input = text;
+            app.cursor = app.input.len();
+        }
+        Ok(None) => {
+            app.input.clear();
+            app.cursor = 0;
+        }
+        Err(err) => return Err(err),
     }
     Ok(())
 }
@@ -969,6 +1017,7 @@ fn apply_template(app: &mut app::App, template: &Template, extra: Option<&str>) 
     }
     app.input = text;
     app.cursor = app.input.len();
+    app.completion = None;
     app.entries.push(app::Entry::Info(format!(
         "inserted template `/{}` — edit and press Enter",
         template.name
@@ -1025,6 +1074,12 @@ fn handle_key(
         (true, KeyCode::Char('c')) | (true, KeyCode::Char('q')) => Action::Quit,
         (true, KeyCode::Char('d')) if app.input.is_empty() => Action::Quit,
         (true, KeyCode::Char('l')) => Action::Clear,
+        (true, KeyCode::Char('e')) => Action::OpenEditor,
+
+        (false, KeyCode::Tab) => {
+            app.tab_complete();
+            Action::None
+        }
 
         (false, KeyCode::Enter) => match app.take_input() {
             Some(prompt) => {
