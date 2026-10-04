@@ -209,9 +209,14 @@ mod tests {
             .map(|entries| {
                 entries
                     .flatten()
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| n.starts_with(".clanky"))
-                    .map(|n| format!("~/{n}"))
+                    .filter_map(|e| {
+                        let name = e.file_name().into_string().ok()?;
+                        if !name.starts_with(".clanky") {
+                            return None;
+                        }
+                        let terminator = if e.path().is_dir() { "/" } else { " " };
+                        Some(format!("~/{name}{terminator}"))
+                    })
                     .collect()
             })
             .unwrap_or_default();
