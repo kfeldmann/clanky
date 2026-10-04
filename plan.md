@@ -1,0 +1,37 @@
+An AI coding agent/harness for the terminal, written in Rust.
+
+Goals:
+- Simple, light, fast
+- TUI, 256 colors - ratatui? (default mode if terminal available and stdin and stdout are not redirected)
+- Command-line mode (no interface)
+- No trust system. Sandbox it instead
+- Tools: bash (maybe add more in the future)
+- Written in Rust
+- Extensible
+    - Ship with extensions for providers (first one: deepinfra)
+- Store session files
+- Tab completion of filepaths in TUI
+- Key to launch $EDITOR for prompt editing
+- Command line options
+    - -p (print mode / non-interactive / command-line mode)
+    - --provider
+    - --model
+    - --thinking
+    - --sampling
+- Command line arg
+    - "Prompt on the command line..." (also support prompt read from stdin)
+- Slash commands
+    - Sessions: /name, /resume (use picker to choose previous session)
+    - Prompts: /\<name\>
+    - Model picker: /model
+    - Provider picker: /provider
+    - Thinking picker: /thinking
+    - Sampling parameters: /sampling
+    - Unknown slash command should print an error. Do not add to context (do not send to chat)
+- Context and configuration
+    - ~/.clanky/ (user), ./.clanky/ (project)
+    - settings file (what should be the format? What is common in Rust? Toml? Yaml?)
+    - AGENTS.md, SYSTEM.md, skills/ prompts/ extensions/ (user and project scope)
+- Authentication methods
+    - Environment variable containing token/key (maybe a distinct var for each provider, so it's easy to switch between providers during a session)
+    - In the future, OICD flow for Anthropic
