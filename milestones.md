@@ -59,7 +59,7 @@ Architectural decisions already made:
 - Turns run on a worker thread; events stream to the render loop over a channel
 - Fallback to command-line mode when stdin/stdout redirected (also `clanky` with
   a piped stdin and no `-p`)
-- Keys: Enter submit (queued while streaming), Ctrl+C/Ctrl+D/Esc quit, Ctrl+L clear,
+- Keys: Enter submit (queued while streaming), Ctrl+C/Ctrl+D quit, Ctrl+L clear,
   PgUp/PgDn/↑/↓ + mouse wheel scroll, basic line editing (Home/End/Backspace/Delete)
 - Status line: provider · model, streaming/queued state, last-turn token usage
 - Done when: interactive chat works with streaming, `|` pipe still prints plain.

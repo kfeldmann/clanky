@@ -257,15 +257,19 @@ mod tests {
         let contents: Vec<&str> = msgs.iter().map(|m| m.content()).collect();
         assert_eq!(
             contents,
-            [
-                format!(
-                    "## Skills\n\n{SKILL_HINT}\n\n- dirskill: {} ({})\n- shared-user-only ({})\n- style: project style ({})\n",
-                    "directory skill description",
-                    project_skills.join("dirskill/SKILL.md").display(),
-                    scopes[0].join(config::SKILLS_DIR).join("shared-user-only.md").display(),
-                    scopes[1].join(config::SKILLS_DIR).join("style.md").display(),
-                )
-            ],
+            [format!(
+                "## Skills\n\n{SKILL_HINT}\n\n- dirskill: {} ({})\n- shared-user-only ({})\n- style: project style ({})\n",
+                "directory skill description",
+                project_skills.join("dirskill/SKILL.md").display(),
+                scopes[0]
+                    .join(config::SKILLS_DIR)
+                    .join("shared-user-only.md")
+                    .display(),
+                scopes[1]
+                    .join(config::SKILLS_DIR)
+                    .join("style.md")
+                    .display(),
+            )],
             "one listing part; project scope shadows user; sorted by name"
         );
 

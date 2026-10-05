@@ -40,7 +40,10 @@ pub fn render(text: &str, base: Style) -> Vec<Line<'static>> {
 }
 
 /// Word-wrap styled lines to `width` display columns, preserving styles.
-/// Blank lines are preserved.
+/// Blank lines are preserved. Embedded newlines split the text into
+/// separate source lines before wrapping (raw `\n` characters must never
+/// reach the terminal buffer: the cursor moves down without returning to
+/// column 0, producing a staircase of increasingly indented lines).
 pub fn wrap(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
     let width = width.max(1) as usize;
     let mut out = Vec::new();
@@ -53,15 +56,52 @@ pub fn wrap(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
                 span.content.chars().map(move |c| (c, style))
             })
             .collect();
-        if chars.is_empty() {
-            out.push(Line::default());
-            continue;
-        }
-        for piece in wrap_chars(&chars, width) {
-            out.push(char_vec_to_line(piece));
+        for segment in split_newlines(&chars) {
+            if segment.is_empty() {
+                out.push(Line::default());
+                continue;
+            }
+            for piece in wrap_chars(&segment, width) {
+                out.push(char_vec_to_line(piece));
+            }
         }
     }
     out
+}
+
+/// Split styled chars at newlines into segments. `"a\n\nb"` becomes
+/// `["a", "", "b"]` (the blank line is kept); a trailing newline does not
+/// add an empty final segment.
+fn split_newlines(chars: &[(char, Style)]) -> Vec<Vec<(char, Style)>> {
+    let mut segments: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut current: Vec<(char, Style)> = Vec::new();
+    for &(c, style) in chars {
+        if c == '\n' {
+            segments.push(std::mem::take(&mut current));
+        } else {
+            current.push((c, style));
+        }
+    }
+    if !current.is_empty() || segments.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Style each source line of raw `text` and word-wrap to `width`. Use
+/// this for strings that may contain newlines: `Line::raw` strips embedded
+/// newline characters, so the text must be split into one `Line` per
+/// source line first (see the `wrap_splits_embedded_newlines` test).
+/// Internal blank lines are preserved; a trailing newline adds nothing.
+pub fn wrap_text(text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
+    let lines: Vec<Line<'static>> = text
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), style)))
+        .collect();
+    if lines.is_empty() {
+        return vec![Line::default()];
+    }
+    wrap(&lines, width)
 }
 
 fn render_block_line(raw: &str, base: Style) -> Vec<Line<'static>> {
@@ -256,10 +296,11 @@ fn wrap_chars(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> 
     for token in tokenize(chars) {
         match token {
             Token::Space(spaces) => {
-                if !current.is_empty() {
-                    current_width += display_width(&spaces);
-                    current.extend(spaces);
-                }
+                // Leading spaces are preserved too: the indentation of code
+                // blocks, tool-output continuation lines, and multi-line
+                // user input must survive wrapping.
+                current_width += display_width(&spaces);
+                current.extend(spaces);
             }
             Token::Word(word) => {
                 let word_width = display_width(&word);
@@ -268,7 +309,12 @@ fn wrap_chars(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> 
                     while current.last().is_some_and(|&(c, _)| c == ' ') {
                         current.pop();
                     }
-                    out.push(std::mem::take(&mut current));
+                    // With leading spaces preserved, the remainder can be
+                    // empty (only spaces preceded an oversized word); an
+                    // empty row would shift everything below.
+                    if !current.is_empty() {
+                        out.push(std::mem::take(&mut current));
+                    }
                     current_width = 0;
                 }
                 if word_width > width && current.is_empty() {
@@ -439,6 +485,54 @@ mod tests {
     fn wrap_preserves_blank_lines() {
         let lines = vec![Line::raw("a"), Line::raw(""), Line::raw("b")];
         assert_eq!(wrap(&lines, 10).len(), 3);
+    }
+
+    /// Regression test: leading spaces used to be dropped, which would
+    /// eat the indentation of code blocks and tool-output continuation
+    /// lines once they flow through `wrap`.
+    #[test]
+    fn wrap_preserves_leading_spaces() {
+        let lines = vec![Line::raw("  indent"), Line::raw("    deeper")];
+        let wrapped = wrap(&lines, 20);
+        let texts: Vec<String> = wrapped.iter().map(|l| span_text(&l.spans)).collect();
+        assert_eq!(texts, ["  indent", "    deeper"]);
+    }
+
+    #[test]
+    fn wrap_splits_embedded_newlines() {
+        // app.rs feeds multi-line strings through `lines()` (one `Line` per
+        // source line, since `Line::raw` strips embedded newlines); `wrap`
+        // must keep internal blank lines and not re-join anything.
+        let lines: Vec<Line<'static>> = "aaa bbb\nccc\n\nddd".lines().map(Line::raw).collect();
+        let wrapped = wrap(&lines, 7);
+        let texts: Vec<String> = wrapped.iter().map(|l| span_text(&l.spans)).collect();
+        assert_eq!(texts, ["aaa bbb", "ccc", "", "ddd"]);
+    }
+
+    #[test]
+    fn wrap_text_handles_multiline_and_styles_each_line() {
+        let style = Style::new().fg(Color::Gray);
+        let wrapped = wrap_text("aaa bbbbbbbbbbbb\n\nccc", style, 7);
+        let texts: Vec<String> = wrapped.iter().map(|l| span_text(&l.spans)).collect();
+        assert_eq!(texts, ["aaa", "bbbbbbb", "bbbbb", "", "ccc"]);
+        for line in &wrapped {
+            for span in &line.spans {
+                assert_eq!(span.style, style);
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_text_empty_is_one_blank_line() {
+        assert_eq!(wrap_text("", Style::new(), 10).len(), 1);
+    }
+
+    #[test]
+    fn wrap_trailing_newline_adds_no_blank() {
+        let lines = vec![Line::raw("aaa\n")];
+        let wrapped = wrap(&lines, 10);
+        let texts: Vec<String> = wrapped.iter().map(|l| span_text(&l.spans)).collect();
+        assert_eq!(texts, ["aaa"]);
     }
 
     #[test]

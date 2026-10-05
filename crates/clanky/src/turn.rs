@@ -395,6 +395,9 @@ mod tests {
                 display_name: None,
                 context_window: None,
                 supports_thinking: None,
+                supports_text_generation: None,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
             }])
         }
 

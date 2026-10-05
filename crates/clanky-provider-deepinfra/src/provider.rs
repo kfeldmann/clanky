@@ -282,11 +282,28 @@ fn parse_models(body: &str) -> Result<Vec<ModelInfo>, Error> {
             let context_window = item
                 .pointer("/metadata/context_length")
                 .and_then(Value::as_u64);
+            // DeepInfra tags models in `metadata.tags`; the `chat` tag
+            // marks the ones that can generate text. Absent tags stay
+            // `None` (unknown, not "no").
+            let supports_text_generation = item
+                .pointer("/metadata/tags")
+                .and_then(Value::as_array)
+                .map(|tags| tags.iter().filter_map(Value::as_str).any(|t| t == "chat"));
+            let pricing = item.pointer("/metadata/pricing");
+            let price = |key: &str| {
+                pricing
+                    .and_then(|p| p.get(key))
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+            };
             Some(ModelInfo {
                 id,
                 display_name,
                 context_window,
                 supports_thinking: None,
+                supports_text_generation,
+                input_price_per_mtok: price("input_tokens"),
+                output_price_per_mtok: price("output_tokens"),
             })
         })
         .collect();
@@ -810,7 +827,12 @@ mod tests {
         let catalog = serde_json::json!({
             "object": "list",
             "data": [
-                {"id": "deepseek-ai/DeepSeek-V4", "metadata": {"context_length": 163840}},
+                {"id": "deepseek-ai/DeepSeek-V4", "metadata": {"context_length": 163840,
+                  "tags": ["chat", "reasoning"],
+                  "pricing": {"input_tokens": 0.09, "output_tokens": 0.18}}},
+                {"id": "black-forest-labs/FLUX-1-schnell", "metadata":
+                  {"tags": ["image-gen"]}},
+                {"id": "no-pricing-model"},
                 {"id": "no-metadata-model"},
                 {"broken": true}
             ]
@@ -819,12 +841,20 @@ mod tests {
         let mut provider =
             DeepInfraProvider::new(MockBackend::new(Vec::new(), &catalog), "https://x.invalid");
         let models = provider.list_models().unwrap();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 4);
         assert_eq!(models[0].id, "deepseek-ai/DeepSeek-V4");
         assert_eq!(models[0].context_window, Some(163_840));
         assert_eq!(models[0].display_name.as_deref(), Some("DeepSeek-V4"));
-        assert_eq!(models[1].id, "no-metadata-model");
-        assert_eq!(models[1].context_window, None);
+        assert_eq!(models[0].input_price_per_mtok, Some(0.09));
+        assert_eq!(models[0].output_price_per_mtok, Some(0.18));
+        assert_eq!(models[0].supports_text_generation, Some(true));
+        assert_eq!(models[1].id, "black-forest-labs/FLUX-1-schnell");
+        assert_eq!(models[1].supports_text_generation, Some(false));
+        assert_eq!(models[2].id, "no-pricing-model");
+        assert_eq!(models[2].input_price_per_mtok, None);
+        assert_eq!(models[3].id, "no-metadata-model");
+        assert_eq!(models[3].context_window, None);
+        assert_eq!(models[3].supports_text_generation, None);
 
         // Endpoint: {base}/models
         assert_eq!(

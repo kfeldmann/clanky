@@ -12,8 +12,9 @@
 //! above that region is final: once printed it is never touched again.
 //!
 //! The redraw is cursor-relative. After every render the cursor sits on
-//! the input row; moving up `tail_height` rows reaches the top of the
-//! redrawable region, so no absolute positions are tracked. Finalized
+//! the input row; moving up `tail_height - 1` rows reaches the top of the
+//! redrawable region (the tail spans that many rows above the input row),
+//! so no absolute positions are tracked. Finalized
 //! transcript lines are printed once above the tail and never rewritten
 //! (`App::printed_*` bookkeeping); a streaming entry that outgrows the
 //! screen has its oldest rows committed the same way, keeping the tail
@@ -40,8 +41,14 @@ const INPUT_PROMPT: &str = "❯ ";
 pub struct Status<'a> {
     pub provider: &'a str,
     pub model: Option<&'a str>,
+    /// Active thinking setting, when enabled (token budget, e.g. `4096`;
+    /// `off`/unset is not shown).
+    pub thinking: Option<&'a str>,
     /// Display name of the current session file, when one exists.
     pub session: Option<&'a str>,
+    /// Estimated session cost in dollars (catalog pricing × cumulative
+    /// token totals); `None` when no pricing is known.
+    pub cost: Option<f64>,
 }
 
 /// The terminal, viewed as a linear transcript with a redrawable tail.
@@ -161,8 +168,21 @@ impl<W: Write> Screen<W> {
         // Move to the top of the previous tail, print the new rows (the
         // final row without a trailing newline: the cursor stays on it),
         // and erase whatever is left below when the tail shrank.
+        //
+        // The last render parked the cursor at the input caret, so the
+        // column must be reset to 0 first: MoveUp preserves the column,
+        // and printing from column > 0 would shift the tail right (a
+        // full-width status line would then wrap and scroll the screen).
+        // The tail spans the input row minus (height - 1) rows above it,
+        // so moving up `height - 1` lands on its top row; moving up the
+        // full height would overshoot one row and drift the region
+        // upward with every render.
         if self.tail_height > 0 {
-            execute!(self.out, MoveUp(self.tail_height as u16))?;
+            execute!(
+                self.out,
+                MoveUp(self.tail_height as u16 - 1),
+                MoveToColumn(0)
+            )?;
         }
         let shrink = commit.len() + tail.len() < self.tail_height;
         let mut first = true;
@@ -172,6 +192,10 @@ impl<W: Write> Screen<W> {
             }
             first = false;
             print_line(&mut self.out, line, width)?;
+            // Erase stale characters when the new row is shorter than
+            // what the previous render left on it (e.g. the input
+            // placeholder replaced by shorter typed text).
+            execute!(self.out, Clear(ClearType::UntilNewLine))?;
         }
         if shrink {
             execute!(self.out, Clear(ClearType::FromCursorDown))?;
@@ -280,8 +304,8 @@ fn footer_lines(
     Footer { lines, caret }
 }
 
-/// Status line: provider · model · session on the left; streaming state,
-/// token usage, or a hint on the right.
+/// Status line: provider · model · think · session · cost on the left;
+/// streaming state, token usage, or a hint on the right.
 fn status_line(app: &App, status: &Status<'_>, width: u16) -> Line<'static> {
     let base = Style::new().fg(Color::DarkGray);
     let mut left = vec![Span::styled(
@@ -291,10 +315,24 @@ fn status_line(app: &App, status: &Status<'_>, width: u16) -> Line<'static> {
     if let Some(model) = status.model {
         left.push(Span::styled(" · ".to_string(), base));
         left.push(Span::styled(model.to_string(), base));
+        if let Some(thinking) = status.thinking {
+            left.push(Span::styled(" · think ".to_string(), base));
+            left.push(Span::styled(
+                thinking.to_string(),
+                Style::new().fg(Color::Cyan),
+            ));
+        }
     }
     if let Some(session) = status.session {
         left.push(Span::styled(" · ".to_string(), base));
         left.push(Span::styled(session.to_string(), base));
+    }
+    if let Some(cost) = status.cost {
+        left.push(Span::styled(" · ".to_string(), base));
+        left.push(Span::styled(
+            format_cost(cost),
+            Style::new().fg(Color::Yellow),
+        ));
     }
 
     let mut right = Vec::new();
@@ -331,6 +369,16 @@ fn status_line(app: &App, status: &Status<'_>, width: u16) -> Line<'static> {
     } else {
         // Too tight for both: show only the status, truncated.
         Line::from(truncate_spans(right, width))
+    }
+}
+
+/// Format a session cost for the status line: four decimals while small,
+/// two once it grows past a few dollars.
+fn format_cost(cost: f64) -> String {
+    if cost >= 10.0 {
+        format!("${cost:.2}")
+    } else {
+        format!("${cost:.4}")
     }
 }
 
@@ -600,6 +648,88 @@ mod tests {
         fn count(&self, needle: &str) -> usize {
             self.text().matches(needle).count()
         }
+
+        /// Emulate the recorded stream on a `width`×`height` screen and
+        /// return the final rows, space-padded to `width`. Handles the
+        /// sequences this module emits (CUU `A`, CNL `E`, CHA `G`,
+        /// EL `K`, ED `J`, SGR `m` ignored) plus CR, LF with scroll at
+        /// the bottom edge, and autowrap — enough to catch redraws that
+        /// start at the wrong row or column, or leave stale characters.
+        fn emulated_screen(&self, width: usize, height: usize) -> Vec<String> {
+            let mut rows = vec![vec![' '; width]; height];
+            let (mut row, mut col) = (0usize, 0usize);
+            let mut chars = std::str::from_utf8(&self.0).unwrap().chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\x1b' => {
+                        let mut body = String::new();
+                        let mut final_byte = None;
+                        for c in chars.by_ref() {
+                            if c.is_ascii_alphabetic() {
+                                final_byte = Some(c);
+                                break;
+                            }
+                            body.push(c);
+                        }
+                        let params = body.trim_start_matches('[');
+                        let n = params
+                            .split(';')
+                            .next()
+                            .and_then(|p| p.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        match final_byte {
+                            Some('A') => row = row.saturating_sub(n.max(1)),
+                            Some('E') => {
+                                row = (row + n.max(1)).min(height - 1);
+                                col = 0;
+                            }
+                            Some('G') => col = n.saturating_sub(1).min(width - 1),
+                            Some('K') => {
+                                for cell in &mut rows[row][col..] {
+                                    *cell = ' ';
+                                }
+                            }
+                            Some('J') => {
+                                for cell in &mut rows[row][col..] {
+                                    *cell = ' ';
+                                }
+                                for r in rows.iter_mut().skip(row + 1) {
+                                    *r = vec![' '; width];
+                                }
+                            }
+                            _ => {} // SGR and anything else: styling only
+                        }
+                    }
+                    '\r' => col = 0,
+                    '\n' => {
+                        if row + 1 == height {
+                            rows.remove(0);
+                            rows.push(vec![' '; width]);
+                        } else {
+                            row += 1;
+                        }
+                    }
+                    c => {
+                        let w = c.width().unwrap_or(0);
+                        if w == 0 {
+                            continue;
+                        }
+                        if col + w > width {
+                            col = 0;
+                            if row + 1 == height {
+                                rows.remove(0);
+                                rows.push(vec![' '; width]);
+                            } else {
+                                row += 1;
+                            }
+                        }
+                        rows[row][col] = c;
+                        col += 1;
+                    }
+                }
+            }
+            rows.into_iter().map(|r| r.into_iter().collect()).collect()
+        }
     }
 
     fn screen(buf: Buf, width: u16, height: u16) -> Screen<Buf> {
@@ -618,7 +748,9 @@ mod tests {
         Status {
             provider: "deepinfra",
             model: Some("mock/model"),
+            thinking: None,
             session: None,
+            cost: None,
         }
     }
 
@@ -687,6 +819,72 @@ mod tests {
         assert_eq!(out.matches("line-6").count(), 1);
     }
 
+    /// The tail must be redrawn in place: at column 0, on the same rows
+    /// as the first render, with stale characters from longer previous
+    /// rows erased. Regression test: the old render moved up the full
+    /// tail height (off by one → drift upward) and kept the previous
+    /// caret column (→ drift right) without clearing row remainders.
+    #[test]
+    fn redraw_keeps_the_tail_in_place() {
+        let mut app = App::new();
+        let mut s = Screen::new(Buf::default(), 80, 8);
+        s.render(&mut app, &status(), None, None).unwrap(); // placeholder
+        app.input = "Say hello".into();
+        app.cursor = 9;
+        s.render(&mut app, &status(), None, None).unwrap();
+
+        let rows = s.take_out().emulated_screen(80, 8);
+        assert!(
+            rows[..6].iter().all(|r| r.trim().is_empty()),
+            "history above the tail untouched: {rows:?}"
+        );
+        let status_row = &rows[6];
+        assert!(
+            status_row.starts_with("deepinfra · mock/model"),
+            "{status_row}"
+        );
+        assert!(
+            status_row.ends_with("/ commands · ctrl+c quit"),
+            "{status_row}"
+        );
+        assert_eq!(status_row.chars().count(), 80, "one full-width status row");
+        let input_row = &rows[7];
+        assert_eq!(input_row.trim_end(), "❯ Say hello", "{input_row}");
+        assert_eq!(input_row.chars().count(), 80, "placeholder remnants erased");
+    }
+
+    /// Regression test: multi-line tool output used to reach the
+    /// terminal as raw `\n` characters inside one row; LF moves down
+    /// without returning to column 0, so every output line started right
+    /// below the end of the previous one (a staircase).
+    #[test]
+    fn multi_line_tool_output_prints_at_the_left_edge() {
+        let mut app = App::new();
+        app.on_turn_event(TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: "{}".into(),
+        });
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "aaa\nbbb".into(),
+        });
+        let mut s = Screen::new(Buf::default(), 40, 12);
+        s.render(&mut app, &status(), None, None).unwrap();
+        let rows = s.take_out().emulated_screen(40, 12);
+        let aaa = rows
+            .iter()
+            .find(|r| r.contains("aaa"))
+            .expect("first output line printed");
+        assert!(aaa.trim_end().ends_with("└─ bash: aaa"), "{aaa:?}");
+        let bbb = rows
+            .iter()
+            .find(|r| r.contains("bbb"))
+            .expect("second output line printed");
+        // Column 11 = "  └─ " + "bash" + ": ": aligned under the first
+        // output character, not under the end of the previous line.
+        assert_eq!(bbb.trim_end(), " ".repeat(11) + "bbb", "{bbb:?}");
+    }
+
     #[test]
     fn styled_text_is_printed_with_ansi_and_reset() {
         let mut buf = Buf::default();
@@ -730,6 +928,26 @@ mod tests {
         let line = status_line(&app, &status(), 40);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("○ queued"), "{text}");
+    }
+
+    #[test]
+    fn status_line_shows_thinking_and_cost() {
+        let app = App::new();
+        let status = Status {
+            provider: "deepinfra",
+            model: Some("mock/model"),
+            thinking: Some("4096"),
+            session: Some("s"),
+            cost: Some(0.0123),
+        };
+        let line = status_line(&app, &status, 80);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("mock/model · think 4096"), "{text}");
+        assert!(text.contains("s · $0.0123"), "{text}");
+
+        // Large costs drop to two decimals.
+        assert_eq!(format_cost(12.5), "$12.50");
+        assert_eq!(format_cost(0.000_099), "$0.0001");
     }
 
     #[test]

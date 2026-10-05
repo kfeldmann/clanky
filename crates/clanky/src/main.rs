@@ -118,7 +118,11 @@ fn print_event(event: TurnEvent) {
         }
         TurnEvent::ToolResult { name, output } => {
             let preview = clanky::tools::truncate_for_display(&output, 4_000);
-            eprintln!("  └─ {name}: {preview}");
+            if clanky::tools::is_failed_result(&output) {
+                eprintln!("  ✗ {name}: {preview}");
+            } else {
+                eprintln!("  └─ {name}: {preview}");
+            }
         }
     }
 }

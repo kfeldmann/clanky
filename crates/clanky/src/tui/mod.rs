@@ -39,7 +39,7 @@
 //! Screen layout (`screen.rs`):
 //! │ … printed history (scrollback, final) … │
 //! │ ◆ streaming entry (rewritten as it grows) │
-//! │ provider · model · session      ● │
+//! │ provider · model · think · session · cost      ● │
 //! │ ❯ input line │
 
 mod app;
@@ -123,8 +123,48 @@ enum WorkerEvent {
     Turn(TurnEvent),
     /// Terminal status of the turn.
     Done(crate::error::Result<TurnOutput>),
-    /// Model list for the `/model` picker.
+    /// Model list for the [`Catalog`].
     Models(crate::error::Result<Vec<ModelInfo>>),
+}
+
+/// The provider's model catalog, fetched on a worker thread so the status
+/// line can price the session and `/model` can open instantly.
+struct Catalog {
+    /// Provider the catalog was fetched for (stale after a switch).
+    provider: String,
+    models: Vec<ModelInfo>,
+    /// A listing was requested for the `/model` picker: open it when the
+    /// fetch completes.
+    for_picker: bool,
+}
+
+impl Catalog {
+    /// An empty catalog for `provider` (nothing fetched yet).
+    fn new(provider: String) -> Self {
+        Self {
+            provider,
+            models: Vec::new(),
+            for_picker: false,
+        }
+    }
+
+    /// Fetch the catalog for `provider` on a worker thread; `for_picker`
+    /// opens the `/model` picker when the fetch completes.
+    fn request(&mut self, provider: String, tx: &Sender<WorkerEvent>, for_picker: bool) {
+        self.provider = provider;
+        self.for_picker = for_picker;
+        spawn_models(self.provider.clone(), tx.clone());
+    }
+
+    /// Pricing of `model` (dollars per million tokens: input, output)
+    /// when the catalog matches the active provider and carries prices.
+    fn pricing_for(&self, provider: &str, model: Option<&str>) -> Option<(f64, f64)> {
+        if self.provider != provider {
+            return None;
+        }
+        let info = self.models.iter().find(|m| Some(m.id.as_str()) == model)?;
+        Some((info.input_price_per_mtok?, info.output_price_per_mtok?))
+    }
 }
 
 /// Run the interactive session until the user quits.
@@ -185,7 +225,7 @@ fn spawn_turn(history: Vec<ChatMessage>, launch: &Launch, prompt: String, tx: Se
 }
 
 /// Fetch the provider's model list on a worker thread (network I/O must
-/// not block the render loop); the result opens the `/model` picker.
+/// not block the render loop); the result feeds [`Catalog`].
 fn spawn_models(provider_name: String, tx: Sender<WorkerEvent>) {
     std::thread::Builder::new()
         .name("clanky-models".into())
@@ -462,6 +502,10 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     // (resumed sessions rebuild it inside `load_session`).
     app.history = crate::context::system_messages();
     let mut state = SessionState::new(launch.clone());
+    // Prefetch the provider's model catalog in the background: it prices
+    // the session-cost display and makes `/model` instant.
+    let mut catalog = Catalog::new(launch.provider.clone());
+    catalog.request(launch.provider.clone(), &tx, false);
     // Open picker with the payload it selects from, when active.
     let mut picker: Option<(picker::Picker, PickerKind)> = None;
     // Something changed since the last render (transcript, input, popup).
@@ -503,7 +547,15 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                         let tab = key.code == KeyCode::Tab
                             && !key.modifiers.contains(KeyModifiers::CONTROL);
                         if picker.is_some() {
-                            match picker_key(&mut picker, key, &mut app, &mut state, launch, &tx) {
+                            match picker_key(
+                                &mut picker,
+                                key,
+                                &mut app,
+                                &mut state,
+                                launch,
+                                &mut catalog,
+                                &tx,
+                            ) {
                                 PickerOutcome::Quit => break,
                                 PickerOutcome::Cancel => picker = None,
                                 PickerOutcome::Selected => {
@@ -512,7 +564,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                                 PickerOutcome::None => {}
                             }
                         } else {
-                            match handle_key(&mut app, &mut state, launch, &tx, key) {
+                            match handle_key(&mut app, &mut state, launch, &mut catalog, &tx, key) {
                                 Action::Quit => break,
                                 Action::Clear => {
                                     app.clear();
@@ -579,17 +631,23 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                     turn_finished = true;
                 }
                 WorkerEvent::Models(result) => match result {
-                    Ok(models) if models.is_empty() => {
-                        app.entries.push(app::Entry::Info(format!(
-                            "`{}` lists no models",
-                            launch.provider
-                        )));
+                    Ok(fetched) => {
+                        let empty = fetched.is_empty();
+                        catalog.models = fetched;
+                        if catalog.for_picker {
+                            catalog.for_picker = false;
+                            if empty {
+                                app.entries.push(app::Entry::Info(format!(
+                                    "`{}` lists no models",
+                                    launch.provider
+                                )));
+                            } else if picker.is_none() {
+                                let kind =
+                                    PickerKind::Models(text_generation_models(&catalog.models));
+                                picker = Some((picker_for(&kind), kind));
+                            }
+                        }
                     }
-                    Ok(models) if picker.is_none() => {
-                        let kind = PickerKind::Models(models);
-                        picker = Some((picker_for(&kind), kind));
-                    }
-                    Ok(_) => {} // a picker is already open; leave it
                     Err(err) => app.entries.push(app::Entry::Error(err.to_string())),
                 },
             }
@@ -608,10 +666,27 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
 
         if dirty {
             let session_name = state.current_name();
+            // Estimated session cost: catalog pricing (dollars per million
+            // tokens) × cumulative token totals. Prompt tokens are re-billed
+            // every turn, so summing turns is what the provider charges for.
+            let cost = catalog
+                .pricing_for(&launch.provider, launch.model.as_deref())
+                .map(|(input, output)| {
+                    (app.total_prompt_tokens as f64 * input
+                        + app.total_completion_tokens as f64 * output)
+                        / 1_000_000.0
+                });
+            // `off`/empty mean disabled and are not shown.
+            let thinking = launch
+                .thinking
+                .as_deref()
+                .filter(|value| !value.is_empty() && *value != "off");
             let status = screen::Status {
                 provider: &launch.provider,
                 model: launch.model.as_deref(),
+                thinking,
                 session: session_name.as_deref(),
+                cost,
             };
             let picker_ref = picker.as_ref().map(|(p, _)| p);
             let completion = app.completion.clone();
@@ -728,6 +803,7 @@ fn picker_key(
     app: &mut app::App,
     state: &mut SessionState,
     launch: &mut Launch,
+    catalog: &mut Catalog,
     tx: &Sender<WorkerEvent>,
 ) -> PickerOutcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -746,7 +822,7 @@ fn picker_key(
         }
         (_, KeyCode::Esc) => PickerOutcome::Cancel,
         (_, KeyCode::Enter) => {
-            apply_picker_selection(picker, app, state, launch, tx);
+            apply_picker_selection(picker, app, state, launch, catalog, tx);
             PickerOutcome::Selected
         }
         (_, KeyCode::Backspace) => {
@@ -769,6 +845,7 @@ fn apply_picker_selection(
     app: &mut app::App,
     state: &mut SessionState,
     launch: &mut Launch,
+    catalog: &mut Catalog,
     tx: &Sender<WorkerEvent>,
 ) {
     let Some(index) = picker
@@ -828,7 +905,7 @@ fn apply_picker_selection(
                 *picker = None;
                 match text.as_str() {
                     "/model" => {
-                        handle_command(app, state, launch, Command::Model(None), tx);
+                        handle_command(app, state, launch, catalog, Command::Model(None), tx);
                     }
                     "/provider" => {
                         *picker = Some((picker_for(&PickerKind::Providers), PickerKind::Providers));
@@ -839,7 +916,7 @@ fn apply_picker_selection(
                     "/resume" => {
                         // Re-run the command; apply the picker it asks for.
                         if let Action::OpenPicker(kind) =
-                            handle_command(app, state, launch, Command::Resume, tx)
+                            handle_command(app, state, launch, catalog, Command::Resume, tx)
                         {
                             *picker = Some((picker_for(&kind), kind));
                         }
@@ -863,6 +940,7 @@ fn handle_command(
     app: &mut app::App,
     state: &mut SessionState,
     launch: &mut Launch,
+    catalog: &mut Catalog,
     command: Command,
     tx: &Sender<WorkerEvent>,
 ) -> Action {
@@ -893,16 +971,25 @@ fn handle_command(
             Action::None
         }
         Command::Model(None) => {
-            app.entries.push(app::Entry::Info(format!(
-                "loading models from {}…",
-                launch.provider
-            )));
-            spawn_models(launch.provider.clone(), tx.clone());
-            Action::None
+            // An already-fetched catalog opens the picker instantly.
+            if !catalog.models.is_empty() && catalog.provider == launch.provider {
+                Action::OpenPicker(PickerKind::Models(text_generation_models(&catalog.models)))
+            } else {
+                app.entries.push(app::Entry::Info(format!(
+                    "loading models from {}…",
+                    launch.provider
+                )));
+                catalog.request(launch.provider.clone(), tx, true);
+                Action::None
+            }
         }
         Command::Provider(Some(name)) => {
             match set_provider(launch, &name) {
-                Ok(message) => app.entries.push(app::Entry::Info(message)),
+                Ok(message) => {
+                    // Refresh the catalog so pricing follows the provider.
+                    catalog.request(name.clone(), tx, false);
+                    app.entries.push(app::Entry::Info(message));
+                }
                 Err(message) => app.entries.push(app::Entry::Error(message)),
             }
             Action::None
@@ -927,31 +1014,41 @@ fn handle_command(
             Action::None
         }
         Command::System => {
-            let parts = crate::context::system_parts();
-            let total: usize = parts
-                .iter()
-                .map(|(_, content)| content.chars().count())
-                .sum();
-            if parts.is_empty() {
-                app.entries.push(app::Entry::Info(
-                    "no system context: no AGENTS.md, SYSTEM.md, or skills found".into(),
-                ));
-            } else {
-                app.entries.push(app::Entry::Info(format!(
-                    "system prompt: {} part(s), {} chars — sent before the first user message",
-                    parts.len(),
-                    total
-                )));
-                for (label, content) in parts {
-                    app.entries.push(app::Entry::SystemPart { label, content });
-                }
-            }
+            push_system_report(app, &crate::context::system_parts());
             Action::None
         }
         Command::Palette => Action::OpenPicker(palette_kind(prompts::templates())),
         Command::Template { template, extra } => {
             apply_template(app, &template, extra.as_deref());
             Action::None
+        }
+    }
+}
+
+/// Push the `/system` report to the transcript: a summary `Info` line,
+/// then one labelled `SystemPart` entry per part (or a single `Info`
+/// explaining there is no context). Pure apart from `app`, so it can be
+/// tested with synthetic parts.
+fn push_system_report(app: &mut app::App, parts: &[(String, String)]) {
+    let total: usize = parts
+        .iter()
+        .map(|(_, content)| content.chars().count())
+        .sum();
+    if parts.is_empty() {
+        app.entries.push(app::Entry::Info(
+            "no system context: no AGENTS.md, SYSTEM.md, or skills found".into(),
+        ));
+    } else {
+        app.entries.push(app::Entry::Info(format!(
+            "system prompt: {} part(s), {} chars — sent before the first user message",
+            parts.len(),
+            total
+        )));
+        for (label, content) in parts {
+            app.entries.push(app::Entry::SystemPart {
+                label: label.clone(),
+                content: content.clone(),
+            });
         }
     }
 }
@@ -1048,6 +1145,26 @@ fn apply_template(app: &mut app::App, template: &Template, extra: Option<&str>) 
     )));
 }
 
+/// Models usable as a chat brain: text-generation capable, per the
+/// provider's catalog. Unknown capability stays — can't confirm it can't.
+fn text_generation_models(models: &[ModelInfo]) -> Vec<ModelInfo> {
+    models
+        .iter()
+        .filter(|m| m.supports_text_generation != Some(false))
+        .cloned()
+        .collect()
+}
+
+/// Format a per-Mtok price for a picker detail line: exactly two decimal
+/// places, but round numbers drop their trailing zeros (`2.0` → `2`).
+fn format_price(price: f64) -> String {
+    let s = format!("{price:.2}");
+    match s.strip_suffix(".00") {
+        Some(int) => int.to_string(),
+        None => s,
+    }
+}
+
 /// Detail line for a model in the `/model` picker.
 fn model_detail(model: &ModelInfo) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -1059,6 +1176,13 @@ fn model_detail(model: &ModelInfo) -> String {
     }
     if model.supports_thinking == Some(true) {
         parts.push("thinking".into());
+    }
+    if let (Some(input), Some(output)) = (model.input_price_per_mtok, model.output_price_per_mtok) {
+        parts.push(format!(
+            "${} · ${} /Mtok",
+            format_price(input),
+            format_price(output)
+        ));
     }
     parts.join(" · ")
 }
@@ -1090,6 +1214,7 @@ fn handle_key(
     app: &mut app::App,
     state: &mut SessionState,
     launch: &mut Launch,
+    catalog: &mut Catalog,
     tx: &Sender<WorkerEvent>,
     key: KeyEvent,
 ) -> Action {
@@ -1109,7 +1234,7 @@ fn handle_key(
             Some(prompt) => {
                 if let Some(parsed) = commands::parse_command(&prompt, &prompts::templates()) {
                     match parsed {
-                        Ok(command) => handle_command(app, state, launch, command, tx),
+                        Ok(command) => handle_command(app, state, launch, catalog, command, tx),
                         Err(message) => {
                             app.entries.push(app::Entry::Error(message));
                             Action::None
@@ -1121,7 +1246,6 @@ fn handle_key(
             }
             None => Action::None,
         },
-        (false, KeyCode::Esc) => Action::Quit,
         (false, KeyCode::Backspace) => {
             app.backspace();
             Action::None
@@ -1209,6 +1333,9 @@ mod tests {
             display_name: Some("Llama 3".into()),
             context_window: Some(8192),
             supports_thinking: Some(true),
+            supports_text_generation: Some(true),
+            input_price_per_mtok: Some(0.4),
+            output_price_per_mtok: Some(1.2),
         }]);
         let picker = picker_for(&models);
         assert_eq!(picker.title(), "model");
@@ -1222,6 +1349,7 @@ mod tests {
         assert!(all.contains("Llama 3"), "{all}");
         assert!(all.contains("ctx 8192"), "{all}");
         assert!(all.contains("thinking"), "{all}");
+        assert!(all.contains("$0.40 · $1.20 /Mtok"), "{all}");
 
         assert_eq!(picker_for(&PickerKind::Providers).title(), "provider");
         let providers = picker_for(&PickerKind::Providers)
@@ -1280,6 +1408,9 @@ mod tests {
                 display_name: None,
                 context_window: None,
                 supports_thinking: None,
+                supports_text_generation: None,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
             }),
             ""
         );
@@ -1289,9 +1420,45 @@ mod tests {
                 display_name: Some("Model".into()),
                 context_window: Some(4096),
                 supports_thinking: Some(true),
+                supports_text_generation: Some(true),
+                input_price_per_mtok: Some(0.09),
+                output_price_per_mtok: Some(0.18),
             }),
-            "Model · ctx 4096 · thinking"
+            "Model · ctx 4096 · thinking · $0.09 · $0.18 /Mtok"
         );
+        // Exactly two decimals, except round numbers lose them entirely.
+        assert_eq!(
+            model_detail(&ModelInfo {
+                id: "m".into(),
+                display_name: None,
+                context_window: None,
+                supports_thinking: None,
+                supports_text_generation: None,
+                input_price_per_mtok: Some(2.0),
+                output_price_per_mtok: Some(1.5),
+            }),
+            "$2 · $1.50 /Mtok"
+        );
+    }
+
+    #[test]
+    fn model_picker_filters_out_non_text_generation_models() {
+        let model = |id: &str, text: Option<bool>| ModelInfo {
+            id: id.into(),
+            display_name: None,
+            context_window: None,
+            supports_thinking: None,
+            supports_text_generation: text,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+        };
+        let filtered = text_generation_models(&[
+            model("chat/model", Some(true)),
+            model("embed/model", Some(false)),
+            model("unknown/model", None),
+        ]);
+        let ids: Vec<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["chat/model", "unknown/model"]);
     }
 
     #[test]
@@ -1373,11 +1540,13 @@ mod tests {
         let mut state = SessionState::new(cfg.clone());
         let mut app = app::App::new();
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
 
         let action = handle_command(
             &mut app,
             &mut state,
             &mut cfg,
+            &mut catalog,
             Command::Thinking(Some("2048".into())),
             &tx,
         );
@@ -1388,6 +1557,7 @@ mod tests {
             &mut app,
             &mut state,
             &mut cfg,
+            &mut catalog,
             Command::Thinking(Some("off".into())),
             &tx,
         );
@@ -1397,6 +1567,7 @@ mod tests {
             &mut app,
             &mut state,
             &mut cfg,
+            &mut catalog,
             Command::Thinking(Some("lots".into())),
             &tx,
         );
@@ -1410,11 +1581,13 @@ mod tests {
         let mut state = SessionState::new(cfg.clone());
         let mut app = app::App::new();
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
 
         handle_command(
             &mut app,
             &mut state,
             &mut cfg,
+            &mut catalog,
             Command::Model(Some("other/model".into())),
             &tx,
         );
@@ -1425,6 +1598,7 @@ mod tests {
             &mut app,
             &mut state,
             &mut cfg,
+            &mut catalog,
             Command::Provider(Some("nonexistent".into())),
             &tx,
         );
@@ -1438,6 +1612,7 @@ mod tests {
         let mut state = SessionState::new(cfg.clone());
         let mut app = app::App::new();
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
         let template = Template {
             name: "review".into(),
             content: "Review this code".into(),
@@ -1447,6 +1622,7 @@ mod tests {
             &mut app,
             &mut state,
             &mut cfg,
+            &mut catalog,
             Command::Template {
                 template: template.clone(),
                 extra: None,
@@ -1460,6 +1636,7 @@ mod tests {
             &mut app,
             &mut state,
             &mut cfg,
+            &mut catalog,
             Command::Template {
                 template,
                 extra: Some("  the auth module ".into()),
@@ -1480,15 +1657,30 @@ mod tests {
 
     #[test]
     fn system_command_pushes_labelled_parts() {
-        let mut cfg = launch();
-        let mut state = SessionState::new(cfg.clone());
         let mut app = app::App::new();
-        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let parts = vec![
+            ("~/.clanky/SYSTEM.md".to_string(), "be terse".to_string()),
+            ("AGENTS.md".to_string(), "be helpful".to_string()),
+        ];
+        push_system_report(&mut app, &parts);
+        assert_eq!(app.entries.len(), 3, "summary + one entry per part");
+        assert!(matches!(app.entries[0], app::Entry::Info(_)));
+        let app::Entry::SystemPart { label, content } = &app.entries[1] else {
+            panic!("expected a SystemPart, got {:?}", app.entries[1]);
+        };
+        assert_eq!(label, "~/.clanky/SYSTEM.md");
+        assert_eq!(content, "be terse");
+        let app::Entry::SystemPart { label, .. } = &app.entries[2] else {
+            panic!("expected a SystemPart, got {:?}", app.entries[2]);
+        };
+        assert_eq!(label, "AGENTS.md");
+    }
 
-        handle_command(&mut app, &mut state, &mut cfg, Command::System, &tx);
-        // Either context files were found (labelled parts) or the report
-        // says there were none; either way nothing is sent to the model.
-        assert!(!app.entries.is_empty());
-        assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
+    #[test]
+    fn system_command_without_context_pushes_a_note() {
+        let mut app = app::App::new();
+        push_system_report(&mut app, &[]);
+        assert_eq!(app.entries.len(), 1);
+        assert!(matches!(app.entries[0], app::Entry::Info(_)));
     }
 }

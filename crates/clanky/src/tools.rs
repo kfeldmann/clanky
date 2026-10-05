@@ -216,6 +216,14 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Whether a tool result reports a failure. Bash embeds an exit-status
+/// marker on a non-zero status (see `BashTool::format`), and the agentic
+/// loop prefixes `ERROR:` when the call itself fails (unknown tool,
+/// malformed arguments, timeout, interruption).
+pub fn is_failed_result(output: &str) -> bool {
+    output.starts_with("ERROR:") || output.contains("[exit status: ")
+}
+
 /// Shorten a tool result for activity display (stderr); the full result is
 /// always what the model receives.
 pub fn truncate_for_display(text: &str, max_chars: usize) -> String {
@@ -242,6 +250,15 @@ mod tests {
         BashTool::default()
             .execute(&json!({"command": command}))
             .unwrap_err()
+    }
+
+    #[test]
+    fn failure_detection_covers_exit_status_and_errors() {
+        assert!(!is_failed_result("out\nstderr: warn"));
+        assert!(!is_failed_result("(no output)"));
+        assert!(is_failed_result("out\n[exit status: 1]"));
+        assert!(is_failed_result("[exit status: 143]"));
+        assert!(is_failed_result("ERROR: unknown tool: nope"));
     }
 
     #[test]

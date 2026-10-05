@@ -76,11 +76,17 @@ Plugin → client:
  "models": [{"id": "deepseek-ai/DeepSeek-V3",
              "displayName": "DeepSeek V3",
              "contextWindow": 128000,
-             "supportsThinking": true}]}
+             "supportsThinking": true,
+             "inputPricePerMtok": 0.27,
+             "outputPricePerMtok": 1.1}]}
 ```
 
 All model fields except `id` are optional hints for pickers and UI display.
-Only sent when `capabilities.listModels` is true.
+Only sent when `capabilities.listModels` is true. `inputPricePerMtok` /
+`outputPricePerMtok` are catalog prices in dollars per million tokens (the
+`metadata.pricing.{input,output}_tokens` fields on DeepInfra); clients use
+them for a session-cost estimate — prompt tokens are re-billed every turn,
+so cost accumulates over the sum of per-turn usage.
 
 ## 5. Chat request
 

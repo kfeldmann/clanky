@@ -114,7 +114,13 @@ fn split_front_matter(text: &str) -> (String, String) {
     let description = front
         .iter()
         .find_map(|line| line.trim().strip_prefix("description:"))
-        .map(|value| value.trim().trim_matches('"').trim_matches('\'').to_string())
+        .map(|value| {
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string()
+        })
         .unwrap_or_default();
     (description, body)
 }

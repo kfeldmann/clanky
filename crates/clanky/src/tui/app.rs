@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clanky_protocol::{ChatMessage, Usage};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr as _;
 
 use super::completion;
 use super::markdown;
@@ -113,6 +114,11 @@ pub struct App {
     pub pending: Option<String>,
     /// Usage of the most recently completed turn, for the status line.
     pub last_usage: Option<Usage>,
+    /// Session totals across all completed turns (prompt tokens are
+    /// re-billed every turn, so the cumulative sum is what the cost display
+    /// needs). Restored from a resumed session's usage records.
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
     /// The complete conversation (system context first): what is passed
     /// to the next turn. Updated after each turn, restored on resume (M4).
     pub history: Vec<ChatMessage>,
@@ -149,6 +155,8 @@ impl App {
             busy: false,
             pending: None,
             last_usage: None,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
             history: Vec::new(),
             completion: None,
             printed_entries: 0,
@@ -191,7 +199,13 @@ impl App {
         self.busy = false;
         self.open = None;
         match result {
-            Ok(output) => self.last_usage = output.usage,
+            Ok(output) => {
+                self.last_usage = output.usage;
+                if let Some(usage) = output.usage {
+                    self.total_prompt_tokens += usage.prompt_tokens.unwrap_or(0);
+                    self.total_completion_tokens += usage.completion_tokens.unwrap_or(0);
+                }
+            }
             Err(err) => self.entries.push(Entry::Error(err.to_string())),
         }
     }
@@ -226,6 +240,8 @@ impl App {
         self.printed_entries = 0;
         self.printed.clear();
         self.last_usage = None;
+        self.total_prompt_tokens = 0;
+        self.total_completion_tokens = 0;
         self.open = None;
         for record in records {
             match record {
@@ -255,7 +271,9 @@ impl App {
                     self.last_usage = Some(Usage {
                         prompt_tokens: *prompt_tokens,
                         completion_tokens: *completion_tokens,
-                    })
+                    });
+                    self.total_prompt_tokens += prompt_tokens.unwrap_or(0);
+                    self.total_completion_tokens += completion_tokens.unwrap_or(0);
                 }
             }
         }
@@ -478,13 +496,23 @@ impl App {
         match &self.entries[index] {
             Entry::User(text) => {
                 let prompt = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
-                lines.extend(markdown::wrap(
-                    &[Line::from(vec![
-                        Span::styled("❯ ", prompt),
-                        Span::styled(text.clone(), Style::new()),
-                    ])],
-                    width,
-                ));
+                // Multi-line input must be split per source line; feeding
+                // it to `Line::raw` as one string would lose the newlines.
+                let mut src: Vec<Line<'static>> = Vec::new();
+                for (i, l) in text.lines().enumerate() {
+                    if i == 0 {
+                        src.push(Line::from(vec![
+                            Span::styled("❯ ", prompt),
+                            Span::styled(l.to_string(), Style::new()),
+                        ]));
+                    } else {
+                        src.push(Line::from(Span::styled(format!("  {l}"), Style::new())));
+                    }
+                }
+                if src.is_empty() {
+                    src.push(Line::from(Span::styled("❯ ", prompt)));
+                }
+                lines.extend(markdown::wrap(&src, width));
             }
             Entry::Assistant(text) => {
                 lines.extend(markdown::wrap(&markdown::render(text, Style::new()), width));
@@ -498,31 +526,82 @@ impl App {
                 lines.push(Line::default());
             }
             Entry::ToolCall { name, arguments } => {
-                lines.push(Line::from(vec![
-                    Span::styled("● ", Style::new().fg(Color::Blue)),
+                // Arguments may contain newlines (pretty-printed JSON):
+                // emit one source Line per argument line. Raw `\n`
+                // characters must never reach the terminal: LF moves the
+                // cursor down without returning to column 0, so every
+                // line would start below the end of the previous one.
+                let mut body = arguments.lines();
+                let mut src = vec![Line::from(vec![
+                    Span::styled("● ".to_string(), Style::new().fg(Color::Blue)),
                     Span::styled(name.clone(), Style::new().add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" {arguments}"), Style::new().fg(Color::DarkGray)),
-                ]));
+                ])];
+                if let Some(first) = body.next() {
+                    src[0].spans.push(Span::styled(
+                        format!(" {first}"),
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
+                for l in body {
+                    src.push(Line::from(Span::styled(
+                        format!("   {l}"),
+                        Style::new().fg(Color::DarkGray),
+                    )));
+                }
+                lines.extend(markdown::wrap(&src, width));
             }
             Entry::ToolResult { name, output } => {
-                lines.push(Line::from(vec![
-                    Span::styled("  └─ ", Style::new().fg(Color::DarkGray)),
-                    Span::styled(name.clone(), Style::new().fg(Color::DarkGray)),
-                    Span::styled(": ", Style::new().fg(Color::DarkGray)),
-                    Span::styled(preview(output), Style::new().fg(Color::Gray)),
-                ]));
+                let failed = crate::tools::is_failed_result(output);
+                let style = if failed {
+                    Style::new().fg(Color::Red)
+                } else {
+                    Style::new().fg(Color::DarkGray)
+                };
+                let preview_style = if failed {
+                    Style::new().fg(Color::Red)
+                } else {
+                    Style::new().fg(Color::Gray)
+                };
+                // The preview spans multiple lines: emit one source Line
+                // per output line (continuations aligned under the first
+                // output character) and wrap each to `width`. Raw `\n`
+                // characters must never reach the terminal: LF moves the
+                // cursor down without returning to column 0, so every
+                // line would start below the end of the previous one
+                // instead of at the left edge.
+                let preview = preview(output);
+                let mut body = preview.lines();
+                let mut src = vec![Line::from(vec![
+                    Span::styled("  └─ ".to_string(), style),
+                    Span::styled(name.clone(), style),
+                    Span::styled(": ".to_string(), style),
+                    Span::styled(body.next().unwrap_or("").to_string(), preview_style),
+                ])];
+                let indent = " ".repeat("  └─ ".width() + name.width() + 2);
+                for l in body {
+                    src.push(Line::from(Span::styled(
+                        format!("{indent}{l}"),
+                        preview_style,
+                    )));
+                }
+                lines.extend(markdown::wrap(&src, width));
             }
+            // Error/info text may contain newlines; route it through
+            // `wrap_text` so they split into separate rows (see the
+            // `Entry::ToolResult` note on raw LF reaching the terminal).
             Entry::Error(message) => {
-                lines.push(Line::from(Span::styled(
-                    format!("✗ {message}"),
+                lines.extend(markdown::wrap_text(
+                    &format!("✗ {message}"),
                     Style::new().fg(Color::Red),
-                )));
+                    width,
+                ));
             }
             Entry::Info(message) => {
-                lines.push(Line::from(Span::styled(
-                    format!("· {message}"),
+                lines.extend(markdown::wrap_text(
+                    &format!("· {message}"),
                     Style::new().fg(Color::DarkGray),
-                )));
+                    width,
+                ));
             }
             Entry::SystemPart { label, content } => {
                 lines.push(Line::from(vec![
@@ -533,10 +612,7 @@ impl App {
                     ),
                 ]));
                 let dimmed = Style::new().fg(Color::Gray);
-                lines.extend(markdown::wrap(
-                    &[Line::from(Span::styled(content.clone(), dimmed))],
-                    width,
-                ));
+                lines.extend(markdown::wrap_text(content, dimmed, width));
                 lines.push(Line::default());
             }
         }
@@ -653,11 +729,98 @@ mod tests {
         }));
         assert_eq!(app.last_usage, usage);
         assert!(!app.busy);
+        assert_eq!(app.total_prompt_tokens, 10);
+        assert_eq!(app.total_completion_tokens, 3);
+
+        app.busy = true;
+        app.on_turn_done(&Ok(TurnOutput {
+            text: "hi".into(),
+            finish_reason: clanky_protocol::FinishReason::Stop,
+            usage,
+            history: Vec::new(),
+        }));
+        assert_eq!(app.total_prompt_tokens, 20, "usage accumulates per turn");
+        assert_eq!(app.total_completion_tokens, 6);
 
         app.busy = true;
         app.on_turn_done(&Err(crate::error::Error::NoModel));
         assert!(!app.busy);
         assert!(matches!(app.entries.last(), Some(Entry::Error(_))));
+    }
+
+    #[test]
+    fn failed_tool_results_render_in_red() {
+        let mut app = App::new();
+        app.on_turn_event(TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: r#"{"command":"false"}"#.into(),
+        });
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "out\n[exit status: 1]".into(),
+        });
+        let lines = app.entry_lines(1, 80);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|s| s.style.fg == Some(Color::Red))
+        );
+
+        // Successful results keep their muted colors. The header spans
+        // share one style and merge under wrapping, so the preview text
+        // is the last span of the row.
+        app.entries.push(Entry::ToolResult {
+            name: "bash".into(),
+            output: "ok".into(),
+        });
+        let lines = app.entry_lines(2, 80);
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::DarkGray));
+        let last = lines[0].spans.last().unwrap();
+        assert_eq!(last.style.fg, Some(Color::Gray));
+        assert_eq!(last.content, "ok");
+
+        // Tool-call failures (ERROR: prefix) are failures too.
+        app.entries.push(Entry::ToolResult {
+            name: "nope".into(),
+            output: "ERROR: unknown tool: nope".into(),
+        });
+        let lines = app.entry_lines(3, 80);
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+    }
+
+    /// Regression test: multi-line tool output used to be embedded as
+    /// raw `\n` characters inside one `Line`; the terminal's LF moves
+    /// down without returning to column 0, so every output line started
+    /// right below the end of the previous one (a staircase) and the
+    /// renderer's row-count math broke. Each output line must be its own
+    /// wrapped row, aligned under the first output character.
+    #[test]
+    fn tool_result_output_lines_start_at_the_left_edge() {
+        let mut app = App::new();
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "one\ntwo\nthree".into(),
+        });
+        let lines = app.entry_lines(0, 80);
+        for line in &lines {
+            for span in &line.spans {
+                assert!(
+                    !span.content.contains('\n'),
+                    "raw newline reached a display line: {:?}",
+                    span.content
+                );
+            }
+        }
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        // "  └─ " + "bash" + ": " = 11 columns before the first output
+        // character; continuation rows align under it.
+        assert!(texts[0].ends_with("└─ bash: one"), "{texts:?}");
+        assert_eq!(texts[1], " ".repeat(11) + "two", "{texts:?}");
+        assert_eq!(texts[2], " ".repeat(11) + "three", "{texts:?}");
     }
 
     #[test]
@@ -768,6 +931,7 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
+        eprintln!("TEXTS: {texts:?}");
         assert!(
             texts
                 .iter()

@@ -89,7 +89,7 @@ erases the visible screen (scrollback is kept).
 | `↑`/`↓` | recall previously submitted prompts (the first `↑` saves the current input as a draft; `↓` past the newest entry restores it) |
 | `Tab` | complete the file path at the caret: longest common prefix first, further `Tab` presses cycle candidates |
 | `ctrl+e` | edit the prompt buffer in `$EDITOR` (the TUI suspends; an emptied buffer clears the input) |
-| `ctrl+c` / `ctrl+d` / `Esc` | quit |
+| `ctrl+c` / `ctrl+d` | quit |
 | `ctrl+l` | clear the visible screen |
 | mouse wheel, scrollbar | scroll (native terminal scrolling) |
 | text selection | copy/paste (native terminal selection) |

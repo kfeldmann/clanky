@@ -111,6 +111,18 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_thinking: Option<bool>,
+    /// Whether the model can generate text (chat/LLM). Providers that
+    /// classify their models set this; `None` means unknown, and callers
+    /// should treat unknown as usable rather than filter it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_text_generation: Option<bool>,
+    /// Catalog pricing in dollars per million tokens, when the provider
+    /// exposes it (`metadata.pricing` on DeepInfra). Optional hints for a
+    /// session-cost display; absent on most other providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_price_per_mtok: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_price_per_mtok: Option<f64>,
 }
 
 /// One conversation message. `content` is always a plain string in v1.
