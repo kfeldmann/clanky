@@ -80,12 +80,15 @@ there is no user-scope session store.
 | Key | Action |
 | --- | --- |
 | `Enter` | submit (queued while a turn is streaming) |
+| `↑`/`↓` | recall previously submitted prompts (the first `↑` saves the current input as a draft; `↓` past the newest entry restores it) |
 | `Tab` | complete the file path at the caret: longest common prefix first, further `Tab` presses cycle candidates |
 | `ctrl+e` | edit the prompt buffer in `$EDITOR` (the TUI suspends; an emptied buffer clears the input) |
 | `ctrl+c` / `ctrl+d` / `Esc` | quit |
 | `ctrl+l` | clear the transcript |
-| `PgUp`/`PgDn`, `↑`/`↓`, mouse wheel | scroll |
+| `PgUp`/`PgDn`, mouse wheel | scroll |
+| left-button drag | select transcript text (highlighted); release copies it to the clipboard via OSC 52 — terminals that support it also let you hold `Shift` for the native selection |
 | `/` (empty input) | command palette |
+| `/system` | show the assembled system prompt (context files and skills, as sent to the model) |
 
 The TUI only starts when stdin *and* stdout are terminals; piped input
 falls back to plain one-shot mode.

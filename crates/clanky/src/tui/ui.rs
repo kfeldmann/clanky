@@ -13,6 +13,7 @@ use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use super::app::{App, CompletionState};
 use super::picker::Picker;
+use super::selection::{self, Selection};
 
 /// Prompt symbol for the input line.
 const INPUT_PROMPT: &str = "❯ ";
@@ -25,16 +26,23 @@ pub struct Status<'a> {
     pub session: Option<&'a str>,
 }
 
-/// Draw one frame. `transcript` must be the app's transcript pre-wrapped to
-/// the terminal width; `scroll_from_top` is the clamped scroll offset. When
-/// `picker` is open it is drawn as a centered overlay on top; when Tab
+/// Per-frame transcript context: pre-wrapped lines, the clamped scroll
+/// offset, and the active mouse selection.
+pub struct Transcript<'a> {
+    pub lines: Vec<Line<'static>>,
+    pub scroll_from_top: usize,
+    pub selection: Option<&'a Selection>,
+}
+
+/// Draw one frame. `view.lines` must be the app's transcript pre-wrapped to
+/// the terminal width; `view.scroll_from_top` is the clamped scroll offset.
+/// When `picker` is open it is drawn as a centered overlay on top; when Tab
 /// completion is active (M7) its candidate popup is drawn above the input
-/// line.
+/// line; an active mouse selection is highlighted in the transcript.
 pub fn draw(
     frame: &mut Frame,
     app: &App,
-    transcript: Vec<Line<'static>>,
-    scroll_from_top: usize,
+    view: Transcript<'_>,
     status: &Status<'_>,
     completion: Option<&CompletionState>,
     picker: Option<&Picker>,
@@ -48,7 +56,12 @@ pub fn draw(
     .split(area);
     let (chat_area, status_area, input_area) = (layout[0], layout[1], layout[2]);
 
-    let scroll = scroll_from_top.min(u16::MAX as usize) as u16;
+    let mut transcript = view.lines;
+    if let Some(sel) = view.selection {
+        apply_selection(&mut transcript, sel);
+    }
+
+    let scroll = view.scroll_from_top.min(u16::MAX as usize) as u16;
     Paragraph::new(transcript)
         .scroll((scroll, 0))
         .render(chat_area, frame.buffer_mut());
@@ -60,6 +73,31 @@ pub fn draw(
     }
     if let Some(picker) = picker {
         draw_picker(frame, area, picker);
+    }
+}
+
+/// Highlight the transcript lines covered by the selection. Coordinates
+/// are indices into the pre-wrapped transcript; the Paragraph only renders
+/// the viewport, so out-of-view lines can be styled without harm.
+fn apply_selection(transcript: &mut [Line<'static>], sel: &Selection) {
+    let ((start_line, start_col), (end_line, end_col)) = sel.range();
+    if start_line >= transcript.len() {
+        return;
+    }
+    let end_line = end_line.min(transcript.len() - 1);
+    for (index, line) in transcript
+        .iter_mut()
+        .enumerate()
+        .take(end_line + 1)
+        .skip(start_line)
+    {
+        let (start, end) = match (index == start_line, index == end_line) {
+            (true, true) => (start_col, end_col),
+            (true, false) => (start_col, usize::MAX),
+            (false, true) => (0, end_col),
+            (false, false) => (0, usize::MAX),
+        };
+        *line = selection::highlight(std::mem::take(line), start, end);
     }
 }
 
@@ -331,8 +369,11 @@ mod tests {
                 draw(
                     f,
                     app,
-                    transcript,
-                    0,
+                    Transcript {
+                        lines: transcript,
+                        scroll_from_top: 0,
+                        selection: app.selection.as_ref(),
+                    },
                     &Status {
                         provider: "deepinfra",
                         model: Some("mock/model"),
@@ -431,8 +472,11 @@ mod tests {
                 draw(
                     f,
                     &app,
-                    Vec::new(),
-                    0,
+                    Transcript {
+                        lines: Vec::new(),
+                        scroll_from_top: 0,
+                        selection: None,
+                    },
                     &Status {
                         provider: "an-very-long-provider-name",
                         model: Some("model"),
@@ -469,8 +513,11 @@ mod tests {
                 draw(
                     f,
                     &app,
-                    Vec::new(),
-                    0,
+                    Transcript {
+                        lines: Vec::new(),
+                        scroll_from_top: 0,
+                        selection: None,
+                    },
                     &Status {
                         provider: "deepinfra",
                         model: Some("mock/model"),
@@ -502,8 +549,11 @@ mod tests {
                 draw(
                     f,
                     &app,
-                    app.transcript_lines(60),
-                    0,
+                    Transcript {
+                        lines: app.transcript_lines(60),
+                        scroll_from_top: 0,
+                        selection: None,
+                    },
                     &Status {
                         provider: "deepinfra",
                         model: None,
@@ -571,5 +621,49 @@ mod tests {
         let buffer = draw_app(&app, 40, 3);
         let screen = screen_text(&buffer, 40, 3);
         assert!(!screen.contains("complete"), "{screen}");
+    }
+
+    #[test]
+    fn selection_is_highlighted_in_the_transcript() {
+        let mut app = App::new();
+        app.push_user("hello world");
+        app.selection_start(0, 8);
+        app.selection_extend(0, 13);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        terminal
+            .draw(|f| {
+                draw(
+                    f,
+                    &app,
+                    Transcript {
+                        lines: app.transcript_lines(40),
+                        scroll_from_top: 0,
+                        selection: app.selection.as_ref(),
+                    },
+                    &Status {
+                        provider: "deepinfra",
+                        model: None,
+                        session: None,
+                    },
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        // `world` sits at row 0, columns 8..13: reversed, `hello` is not.
+        assert!(
+            buffer[(10, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buffer[(3, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 }

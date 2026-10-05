@@ -23,22 +23,36 @@ pub fn system_messages() -> Vec<ChatMessage> {
     system_messages_in(&config::scopes(), Path::new("."))
 }
 
+/// Assemble the system prompt with one labelled part per source, for
+/// `/system` display: `(source label, content)` pairs in send order.
+pub fn system_parts() -> Vec<(String, String)> {
+    system_parts_in(&config::scopes(), Path::new("."))
+}
+
+/// Pure form of [`system_parts`] for testing.
+pub fn system_parts_in(scopes: &[PathBuf], project_root: &Path) -> Vec<(String, String)> {
+    let mut parts = Vec::new();
+    for scope in scopes {
+        push_part(&mut parts, scope, config::SYSTEM_FILE);
+        push_part(&mut parts, scope, config::AGENTS_FILE);
+    }
+    // Ecosystem convention from M1: a project-root AGENTS.md still counts.
+    push_part(&mut parts, project_root, config::AGENTS_FILE);
+
+    for skill in skills::skills_in(scopes) {
+        parts.push((format!("skill {}", skill.name), wrap_skill(&skill)));
+    }
+    parts
+}
+
 /// Pure form of [`system_messages`] for testing: scan explicit scope
 /// directories (layering order: user first, project last) and a project
 /// root for the `AGENTS.md` convention file.
 pub fn system_messages_in(scopes: &[PathBuf], project_root: &Path) -> Vec<ChatMessage> {
-    let mut messages = Vec::new();
-    for scope in scopes {
-        push_file(&mut messages, scope, config::SYSTEM_FILE);
-        push_file(&mut messages, scope, config::AGENTS_FILE);
-    }
-    // Ecosystem convention from M1: a project-root AGENTS.md still counts.
-    push_file(&mut messages, project_root, config::AGENTS_FILE);
-
-    for skill in skills::skills_in(scopes) {
-        messages.push(ChatMessage::system(wrap_skill(&skill)));
-    }
-    messages
+    system_parts_in(scopes, project_root)
+        .into_iter()
+        .map(|(_, content)| ChatMessage::system(content))
+        .collect()
 }
 
 /// Wrap a skill body in a system message with a heading.
@@ -46,15 +60,15 @@ fn wrap_skill(skill: &Skill) -> String {
     format!("# Skill: {}\n\n{}", skill.name, skill.content)
 }
 
-/// Append a file as a system message; missing or empty files are skipped
-/// silently (context is best-effort).
-fn push_file(messages: &mut Vec<ChatMessage>, dir: &Path, name: &str) {
+/// Append a file as a labelled part; missing or empty files are skipped
+/// silently (context is best-effort). The label is the file path.
+fn push_part(parts: &mut Vec<(String, String)>, dir: &Path, name: &str) {
     let Ok(text) = std::fs::read_to_string(dir.join(name)) else {
         return;
     };
     let trimmed = text.trim();
     if !trimmed.is_empty() {
-        messages.push(ChatMessage::system(trimmed));
+        parts.push((dir.join(name).display().to_string(), trimmed.to_string()));
     }
 }
 
@@ -75,6 +89,32 @@ mod tests {
         let dir = base.join(kind).join(config::project_dir());
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn system_parts_label_every_source() {
+        let project = temp_dir("parts-project");
+        let user = temp_dir("parts-user");
+        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
+        fs::write(scopes[0].join(config::SYSTEM_FILE), "user system").unwrap();
+        fs::write(scopes[1].join(config::AGENTS_FILE), "Be terse.\n").unwrap();
+        let skills = scopes[1].join(config::SKILLS_DIR);
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(skills.join("style.md"), "project style").unwrap();
+
+        let parts = system_parts_in(&scopes, Path::new("."));
+        let labels: Vec<&str> = parts.iter().map(|(label, _)| label.as_str()).collect();
+        assert!(
+            labels[0].contains(".clanky") && labels[0].ends_with("SYSTEM.md"),
+            "{labels:?}"
+        );
+        assert!(labels[1].ends_with("AGENTS.md"), "{labels:?}");
+        assert_eq!(labels[2], "skill style");
+        assert_eq!(parts[1].1, "Be terse.");
+        assert_eq!(parts[2].1, "# Skill: style\n\nproject style");
+
+        fs::remove_dir_all(project).ok();
+        fs::remove_dir_all(user).ok();
     }
 
     #[test]

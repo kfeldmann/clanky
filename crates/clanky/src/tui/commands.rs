@@ -20,6 +20,8 @@ pub enum Command {
     Thinking(Option<String>),
     /// `/sampling [edits]`.
     Sampling(SamplingEdit),
+    /// `/system`: show the assembled system prompt in the transcript.
+    System,
     /// `/` with no command word: open the command palette (commands and
     /// templates).
     Palette,
@@ -66,6 +68,7 @@ pub fn parse_command(
         "provider" => Ok(Command::Provider(optional_arg())),
         "thinking" => Ok(Command::Thinking(optional_arg())),
         "sampling" => parse_sampling(arg).map(Command::Sampling),
+        "system" => Ok(Command::System),
         _ if let Some(template) = templates.iter().find(|t| t.name == word) => {
             Ok(Command::Template {
                 template: template.clone(),
@@ -169,6 +172,7 @@ mod tests {
             Some(Err("`/resume` takes no arguments".into()))
         );
         assert_eq!(parse_command("/", &[]), Some(Ok(Command::Palette)));
+        assert_eq!(parse_command("/system", &[]), Some(Ok(Command::System)));
     }
 
     #[test]

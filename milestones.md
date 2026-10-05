@@ -107,6 +107,9 @@ Architectural decisions already made:
 ## ☐ M10 — Polish & release
 - Error messages, logging, docs, packaging (crates.io / release binaries)
 - Example provider plugin in the repo (hello-world, Python)
+- TUI quality-of-life: mouse drag selection + OSC 52 clipboard copy,
+  `↑`/`↓` prompt recall, `/system` (view the assembled system prompt);
+  fix: fresh TUI sessions now seed the system context like pipe mode
 - Done when: a stranger can `cargo install` and use it.
 
 ## Open Questions

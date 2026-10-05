@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 
 use super::completion;
 use super::markdown;
+use super::selection::{self, Selection};
 use crate::error::Result;
 use crate::session::Record;
 use crate::turn::{TurnEvent, TurnOutput};
@@ -34,6 +35,12 @@ pub enum Entry {
     /// A UI-only note (command feedback, etc.); not sent to the model
     /// and not recorded in the session file.
     Info(String),
+    /// One labelled part of the assembled system prompt, shown by
+    /// `/system` (UI-only): not sent, not recorded.
+    SystemPart {
+        label: String,
+        content: String,
+    },
 }
 
 /// Active Tab-completion cycle state (M7): Tab first inserts the longest
@@ -109,6 +116,15 @@ pub struct App {
     pub history: Vec<ChatMessage>,
     /// Active Tab-completion cycle (M7); cleared on any non-Tab key.
     pub completion: Option<CompletionState>,
+    /// Active mouse selection over the transcript, in transcript
+    /// coordinates; cleared by any key press and consumed on release.
+    pub selection: Option<Selection>,
+    /// Previously submitted prompts (most recent last), for ↑/↓ recall.
+    input_history: Vec<String>,
+    /// Index into `input_history` while recalling; `None` = live input.
+    input_index: Option<usize>,
+    /// The live input saved when ↑ first recalled a prompt.
+    draft: String,
     open: Option<OpenKind>,
 }
 
@@ -130,6 +146,10 @@ impl App {
             last_usage: None,
             history: Vec::new(),
             completion: None,
+            selection: None,
+            input_history: Vec::new(),
+            input_index: None,
+            draft: String::new(),
             open: None,
         }
     }
@@ -202,7 +222,10 @@ impl App {
         self.open = None;
         for record in records {
             match record {
-                Record::User { text } => self.entries.push(Entry::User(text.clone())),
+                Record::User { text } => {
+                    self.entries.push(Entry::User(text.clone()));
+                    self.input_history.push(text.clone());
+                }
                 Record::Thinking { text } => self.entries.push(Entry::Thinking(text.clone())),
                 Record::Assistant { text, calls } => {
                     self.entries.push(Entry::Assistant(text.clone()));
@@ -234,7 +257,8 @@ impl App {
 
     // --- input --------------------------------------------------------------
 
-    /// Take the current input as a prompt (if non-blank), clearing the line.
+    /// Take the current input as a prompt (if non-blank), clearing the
+    /// line and recording the prompt for ↑/↓ recall.
     pub fn take_input(&mut self) -> Option<String> {
         let text = self.input.trim().to_string();
         if text.is_empty() {
@@ -243,7 +267,99 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.completion = None;
+        self.input_index = None;
+        self.draft.clear();
+        self.input_history.push(text.clone());
         Some(text)
+    }
+
+    /// ↑: step back through previously submitted prompts. The first
+    /// press saves the current input as a draft to restore later.
+    pub fn history_up(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        self.input_index = Some(match self.input_index {
+            None => {
+                self.draft = std::mem::take(&mut self.input);
+                self.input_history.len() - 1
+            }
+            Some(index) => index.saturating_sub(1),
+        });
+        self.recall();
+    }
+
+    /// ↓: step forward through the history; past the newest entry the
+    /// saved draft comes back and live editing resumes.
+    pub fn history_down(&mut self) {
+        let Some(index) = self.input_index else {
+            return;
+        };
+        if index + 1 < self.input_history.len() {
+            self.input_index = Some(index + 1);
+            self.recall();
+        } else {
+            // Past the newest entry: back to live editing with the draft.
+            self.input_index = None;
+            self.input = std::mem::take(&mut self.draft);
+            self.cursor = self.input.len();
+            self.completion = None;
+        }
+    }
+
+    /// Put the currently recalled entry into the input, caret at the end.
+    fn recall(&mut self) {
+        let index = self.input_index.expect("recall only while navigating");
+        self.input = self.input_history[index].clone();
+        self.cursor = self.input.len();
+        self.completion = None;
+    }
+
+    // --- mouse selection ----------------------------------------------------
+
+    /// Start selecting at a transcript point (mouse press).
+    pub fn selection_start(&mut self, line: usize, col: usize) {
+        self.selection = Some(Selection::new(line, col));
+    }
+
+    /// Drag the free end of the selection.
+    pub fn selection_extend(&mut self, line: usize, col: usize) {
+        if let Some(sel) = &mut self.selection {
+            sel.extend(line, col);
+        }
+    }
+
+    /// Finish selecting (mouse release): extract the selected text from
+    /// the transcript wrapped at `width` and clear the state. `None` when
+    /// the selection is empty or the anchor fell past the transcript.
+    pub fn selection_take(&mut self, width: u16) -> Option<String> {
+        let sel = self.selection.take()?;
+        let lines = self.transcript_lines(width);
+        let ((start_line, start_col), (end_line, end_col)) = sel.range();
+        if start_line >= lines.len() {
+            return None;
+        }
+        let end_line = end_line.min(lines.len() - 1);
+        let mut text = String::new();
+        for (index, line) in lines
+            .iter()
+            .enumerate()
+            .skip(start_line)
+            .take(end_line - start_line + 1)
+        {
+            let (start, end) = match (index == start_line, index == end_line) {
+                (true, true) => (start_col, end_col),
+                (true, false) => (start_col, usize::MAX),
+                (false, true) => (0, end_col),
+                (false, false) => (0, usize::MAX),
+            };
+            if index > start_line {
+                text.push('\n');
+            }
+            text.push_str(&selection::text_in_columns(line, start, end));
+        }
+        let text = text.trim_end().to_string();
+        (!text.is_empty()).then_some(text)
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -422,6 +538,21 @@ impl App {
                         format!("· {message}"),
                         Style::new().fg(Color::DarkGray),
                     )));
+                }
+                Entry::SystemPart { label, content } => {
+                    lines.push(Line::from(vec![
+                        Span::styled("◆ ", Style::new().fg(Color::Cyan)),
+                        Span::styled(
+                            label.clone(),
+                            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    let dimmed = Style::new().fg(Color::Gray);
+                    lines.extend(markdown::wrap(
+                        &[Line::from(Span::styled(content.clone(), dimmed))],
+                        width,
+                    ));
+                    lines.push(Line::default());
                 }
             }
         }
@@ -775,5 +906,115 @@ mod tests {
         app.cursor = 2;
         app.take_input();
         assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn submitted_prompts_are_recallable_with_up_down() {
+        let mut app = App::new();
+        app.input = "first".into();
+        app.cursor = 5;
+        app.take_input();
+        app.input = "second".into();
+        app.cursor = 6;
+        app.take_input();
+
+        // The first ↑ saves the live input as a draft, then recalls the
+        // newest prompt; further ↑s walk back, clamped at the oldest.
+        app.input = "half-typed".into();
+        app.cursor = 4;
+        app.history_up();
+        assert_eq!(app.input, "second");
+        assert_eq!(app.draft, "half-typed");
+        app.history_up();
+        assert_eq!(app.input, "first");
+        app.history_up(); // clamped at the oldest
+        assert_eq!(app.input, "first");
+
+        // ↓ comes back, and past the newest restores the saved draft.
+        app.history_down();
+        assert_eq!(app.input, "second");
+        app.history_down(); // past the end: draft returns
+        assert_eq!(app.input, "half-typed");
+        assert_eq!(app.cursor, app.input.len(), "caret at the end");
+        app.history_down(); // live again: no-op
+        assert_eq!(app.input, "half-typed");
+    }
+
+    #[test]
+    fn history_up_with_no_history_is_a_no_op() {
+        let mut app = App::new();
+        app.input = "hi".into();
+        app.history_up();
+        assert_eq!(app.input, "hi");
+        app.history_down();
+        assert_eq!(app.input, "hi");
+    }
+
+    #[test]
+    fn restore_rebuilds_the_input_history() {
+        let records = vec![
+            Record::User { text: "one".into() },
+            Record::Assistant {
+                text: "hi".into(),
+                calls: vec![],
+            },
+            Record::User { text: "two".into() },
+        ];
+        let mut app = App::new();
+        app.restore(&records);
+        app.history_up();
+        assert_eq!(app.input, "two");
+        app.history_up();
+        assert_eq!(app.input, "one");
+    }
+
+    #[test]
+    fn selection_take_extracts_the_selected_text() {
+        let mut app = App::new();
+        app.push_user("hello world");
+        app.entries.push(Entry::Assistant("alpha beta".into()));
+
+        // Transcript lines: 0 = "❯ hello world", 1 = "alpha beta",
+        // 2 = blank (assistant entries end with a blank line).
+
+        // Single line, middle columns: `world` spans columns 8..13.
+        app.selection_start(0, 8);
+        app.selection_extend(0, 13);
+        assert_eq!(app.selection_take(80).as_deref(), Some("world"));
+
+        // Backwards drag across two lines: end of line 0 down to `alpha`.
+        app.selection_start(1, 5);
+        app.selection_extend(0, 8);
+        assert_eq!(app.selection_take(80).as_deref(), Some("world\nalpha"));
+
+        // A click without a drag selects nothing.
+        app.selection_start(0, 3);
+        app.selection_extend(0, 3);
+        assert_eq!(app.selection_take(80), None);
+
+        // An anchor past the transcript selects nothing.
+        app.selection_start(50, 0);
+        app.selection_extend(50, 5);
+        assert_eq!(app.selection_take(80), None);
+    }
+
+    #[test]
+    fn system_parts_render_with_label_and_content() {
+        let mut app = App::new();
+        app.entries.push(Entry::Info("2 part(s)".into()));
+        app.entries.push(Entry::SystemPart {
+            label: "skill review".into(),
+            content: "Check the diffs.".into(),
+        });
+        let lines = app.transcript_lines(80);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("◆ skill review")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("Check the diffs.")));
     }
 }

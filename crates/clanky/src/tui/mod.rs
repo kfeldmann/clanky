@@ -12,16 +12,24 @@
 //! restores the transcript and the full conversation history.
 //!
 //! Slash commands (M5): `/model`, `/provider`, `/thinking`, `/sampling`
-//! reconfigure the session for subsequent turns; `/<template>` inserts a
-//! prompt template from `.clanky/prompts/` into the input. Configuration
-//! commands and `/<model id>` open pickers; unknown commands error
-//! cleanly and are never sent to the model.
+//! reconfigure the session for subsequent turns; `/system` prints the
+//! assembled system prompt (context files and skills, exactly as sent);
+//! `/<template>` inserts a prompt template from `.clanky/prompts/` into
+//! the input. Configuration commands and `/<model id>` open pickers;
+//! unknown commands error cleanly and are never sent to the model.
 //!
 //! Input ergonomics (M7): Tab completes the file path at the caret (longest
 //! common prefix first, further Tabs cycle candidates, shown in a popup
 //! above the input line); ctrl+e opens `$EDITOR` with the prompt buffer —
 //! the TUI suspends, the editor owns the terminal, and the TUI resumes
-//! with the edited text.
+//! with the edited text. `↑`/`↓` recall previously submitted prompts
+//! (the first `↑` saves the current input as a draft).
+//!
+//! Mouse (M3+): the wheel scrolls; dragging the left button selects
+//! transcript text (highlighted while dragging) and releasing copies it
+//! to the clipboard via OSC 52 — no external clipboard tool needed.
+//! Terminals that support it also allow the native shift+drag selection
+//! to bypass the captured mouse.
 //!
 //! Layout (see `ui.rs`):
 //! ┌────────────────────────────────┐
@@ -36,6 +44,7 @@ mod completion;
 mod editor;
 mod markdown;
 mod picker;
+mod selection;
 mod ui;
 
 use std::io::{IsTerminal as _, Stdout};
@@ -46,7 +55,7 @@ use std::time::Duration;
 use clanky_protocol::{ChatMessage, ModelInfo};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -245,6 +254,7 @@ const PALETTE_BUILTINS: &[(&str, &str)] = &[
     ("/provider", "pick a provider"),
     ("/thinking", "thinking presets"),
     ("/sampling ", "edit sampling parameters"),
+    ("/system", "show the assembled system prompt"),
     ("/name ", "rename the session"),
     ("/resume", "load a saved session"),
 ];
@@ -460,6 +470,9 @@ fn event_loop(
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
     let mut app = app::App::new();
+    // Fresh session: seed the system context so the first turn sends it
+    // (resumed sessions rebuild it inside `load_session`).
+    app.history = crate::context::system_messages();
     let mut state = SessionState::new(launch.clone());
     // Open picker with the payload it selects from, when active.
     let mut picker: Option<(picker::Picker, PickerKind)> = None;
@@ -496,6 +509,7 @@ fn event_loop(
         let (width, height) = (size.width, size.height);
         let chat_height = height.saturating_sub(2) as usize;
         let transcript = app.transcript_lines(width);
+        let transcript_len = transcript.len();
         let max_scroll = transcript.len().saturating_sub(chat_height);
         let scroll_from_top = max_scroll.saturating_sub(app.scroll_from_bottom);
 
@@ -510,8 +524,11 @@ fn event_loop(
             ui::draw(
                 frame,
                 &app,
-                transcript,
-                scroll_from_top,
+                ui::Transcript {
+                    lines: transcript,
+                    scroll_from_top,
+                    selection: app.selection.as_ref(),
+                },
                 &status,
                 app.completion.as_ref(),
                 picker_ref,
@@ -564,15 +581,45 @@ fn event_loop(
                             }
                         }
                         // The completion popup lives on between Tab presses
-                        // only; any other key dismisses it.
+                        // only; any other key dismisses it. A key press also
+                        // cancels an active mouse selection.
                         if !tab {
                             app.completion = None;
                         }
+                        app.selection = None;
                     }
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => app.scroll_up(3),
                     MouseEventKind::ScrollDown => app.scroll_down(3),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(point) =
+                            mouse_point(&mouse, scroll_from_top, chat_height, transcript_len)
+                        {
+                            app.selection_start(point.0, point.1);
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if app.selection.is_some()
+                            && let Some(point) =
+                                mouse_point(&mouse, scroll_from_top, chat_height, transcript_len)
+                        {
+                            app.selection_extend(point.0, point.1);
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let Some(text) = app.selection_take(width) {
+                            match copy_to_clipboard(&text) {
+                                Ok(()) => app.entries.push(app::Entry::Info(format!(
+                                    "copied {} chars to the clipboard (OSC 52)",
+                                    text.chars().count()
+                                ))),
+                                Err(err) => app
+                                    .entries
+                                    .push(app::Entry::Error(format!("copy failed: {err}"))),
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -924,6 +971,28 @@ fn handle_command(
             apply_sampling(launch, &edit, app);
             Action::None
         }
+        Command::System => {
+            let parts = crate::context::system_parts();
+            let total: usize = parts
+                .iter()
+                .map(|(_, content)| content.chars().count())
+                .sum();
+            if parts.is_empty() {
+                app.entries.push(app::Entry::Info(
+                    "no system context: no AGENTS.md, SYSTEM.md, or skills found".into(),
+                ));
+            } else {
+                app.entries.push(app::Entry::Info(format!(
+                    "system prompt: {} part(s), {} chars — sent before the first user message",
+                    parts.len(),
+                    total
+                )));
+                for (label, content) in parts {
+                    app.entries.push(app::Entry::SystemPart { label, content });
+                }
+            }
+            Action::None
+        }
         Command::Palette => Action::OpenPicker(palette_kind(prompts::templates())),
         Command::Template { template, extra } => {
             apply_template(app, &template, extra.as_deref());
@@ -1053,6 +1122,33 @@ fn first_line(text: &str) -> String {
     out
 }
 
+/// Map a left-button press/drag onto a transcript point: `None` when the
+/// event lands on the status/input rows. The chat area starts at row 0,
+/// column 0, so `line = scroll_from_top + row`.
+fn mouse_point(
+    mouse: &ratatui::crossterm::event::MouseEvent,
+    scroll_from_top: usize,
+    chat_height: usize,
+    transcript_len: usize,
+) -> Option<(usize, usize)> {
+    let row = mouse.row as usize;
+    if row >= chat_height || transcript_len == 0 {
+        return None;
+    }
+    let line = (scroll_from_top + row).min(transcript_len - 1);
+    Some((line, mouse.column as usize))
+}
+
+/// Copy text to the clipboard via OSC 52 — an escape sequence, so it
+/// works without external tools and across ssh, wherever the terminal
+/// supports it (most modern ones, tmux included).
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    write!(stdout, "{}", selection::osc52(text))?;
+    stdout.flush()
+}
+
 /// Only act on press events (release events come from Windows terminals).
 fn pressed(key: KeyEvent) -> Option<KeyEvent> {
     if key.kind == KeyEventKind::Press {
@@ -1131,11 +1227,11 @@ fn handle_key(
             Action::None
         }
         (false, KeyCode::Up) => {
-            app.scroll_up(1);
+            app.history_up();
             Action::None
         }
         (false, KeyCode::Down) => {
-            app.scroll_down(1);
+            app.history_down();
             Action::None
         }
         (false, KeyCode::Char(c)) => {
@@ -1460,5 +1556,38 @@ mod tests {
         let shown = first_line(&long);
         assert_eq!(shown.chars().count(), 61, "60 chars + ellipsis");
         assert!(shown.ends_with('…'));
+    }
+
+    #[test]
+    fn mouse_points_map_to_transcript_coordinates() {
+        use ratatui::crossterm::event::MouseEvent;
+        let mouse = |row: u16, col: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        // Chat rows map onto transcript lines; the status/input rows are
+        // not part of the transcript.
+        assert_eq!(mouse_point(&mouse(0, 4), 0, 3, 10), Some((0, 4)));
+        assert_eq!(mouse_point(&mouse(2, 0), 5, 3, 10), Some((7, 0)));
+        assert_eq!(mouse_point(&mouse(3, 0), 0, 3, 10), None, "status row");
+        // An anchor past the transcript clamps to the last line.
+        assert_eq!(mouse_point(&mouse(2, 1), 8, 3, 10), Some((9, 1)));
+        assert_eq!(mouse_point(&mouse(0, 0), 0, 3, 0), None, "empty transcript");
+    }
+
+    #[test]
+    fn system_command_pushes_labelled_parts() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(cfg.clone());
+        let mut app = app::App::new();
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+
+        handle_command(&mut app, &mut state, &mut cfg, Command::System, &tx);
+        // Either context files were found (labelled parts) or the report
+        // says there were none; either way nothing is sent to the model.
+        assert!(!app.entries.is_empty());
+        assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
     }
 }
