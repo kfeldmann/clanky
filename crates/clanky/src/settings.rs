@@ -31,6 +31,9 @@ pub struct Settings {
     pub thinking: Option<String>,
     /// Sampling parameters.
     pub sampling: Option<SamplingParams>,
+    /// Tool-loop round cap for one turn (`0` = unlimited). Unset means the
+    /// built-in default.
+    pub max_tool_rounds: Option<usize>,
     /// Prompt, when supplied on the command line.
     pub prompt: Option<String>,
 }
@@ -90,6 +93,9 @@ impl Settings {
         }
         if over.sampling.is_some() {
             self.sampling = over.sampling;
+        }
+        if over.max_tool_rounds.is_some() {
+            self.max_tool_rounds = over.max_tool_rounds;
         }
         if over.prompt.is_some() {
             self.prompt = over.prompt;

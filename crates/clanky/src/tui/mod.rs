@@ -39,8 +39,8 @@
 //! Screen layout (`screen.rs`):
 //! │ … printed history (scrollback, final) … │
 //! │ ◆ streaming entry (rewritten as it grows) │
-//! │ provider · model · think · session · cost      ● │
-//! │ ❯ input line │
+//! │ provider · model · think · session · cost      ↑↓ tok │
+//! │ ●❯ input line │
 
 mod app;
 mod commands;
@@ -88,6 +88,8 @@ pub struct Launch {
     pub model: Option<String>,
     pub sampling: Option<SamplingParams>,
     pub thinking: Option<String>,
+    /// Tool-loop round cap (`None` = default, `Some(0)` = unlimited).
+    pub max_tool_rounds: Option<usize>,
     /// Prompt from the command line, sent as the first chat message.
     pub initial_prompt: Option<String>,
     /// `--resume NAME` loads that session; `--resume` (empty string) opens
@@ -107,6 +109,7 @@ impl Launch {
                 .or_else(|| crate::provider::default_model(provider).map(str::to_string)),
             sampling: settings.sampling.clone(),
             thinking: settings.thinking.clone(),
+            max_tool_rounds: settings.max_tool_rounds,
             initial_prompt: settings
                 .prompt
                 .as_deref()
@@ -119,10 +122,19 @@ impl Launch {
 }
 
 /// What the worker threads report back to the UI loop.
+/// Terminal status of one turn: the outcome plus the conversation as the
+/// turn left it. The history comes back even on error, so an aborted turn
+/// (e.g. the tool-loop limit) keeps its partial context and the session
+/// stays continuable.
+struct TurnEnd {
+    result: crate::error::Result<TurnOutput>,
+    history: Vec<ChatMessage>,
+}
+
 enum WorkerEvent {
     Turn(TurnEvent),
     /// Terminal status of the turn.
-    Done(crate::error::Result<TurnOutput>),
+    Done(TurnEnd),
     /// Model list for the [`Catalog`].
     Models(crate::error::Result<Vec<ModelInfo>>),
 }
@@ -154,6 +166,18 @@ impl Catalog {
         self.provider = provider;
         self.for_picker = for_picker;
         spawn_models(self.provider.clone(), tx.clone());
+    }
+
+    /// Context window of `model`, when the catalog matches the active
+    /// provider and the model declares one.
+    fn context_window_for(&self, provider: &str, model: Option<&str>) -> Option<u64> {
+        if self.provider != provider {
+            return None;
+        }
+        self.models
+            .iter()
+            .find(|m| Some(m.id.as_str()) == model)?
+            .context_window
     }
 
     /// Pricing of `model` (dollars per million tokens: input, output)
@@ -202,24 +226,30 @@ fn spawn_turn(history: Vec<ChatMessage>, launch: &Launch, prompt: String, tx: Se
     std::thread::Builder::new()
         .name("clanky-turn".into())
         .spawn(move || {
-            let outcome: crate::error::Result<TurnOutput> = (|| {
+            let outcome = (|| {
                 let handler = crate::provider::create(&launch.provider)?;
                 let config = TurnConfig {
                     model: launch.model.clone(),
                     sampling: launch.sampling.clone(),
                     thinking: launch.thinking.clone(),
+                    max_tool_rounds: launch.max_tool_rounds,
                 };
                 crate::turn::run_turn(
                     handler,
                     &crate::tools::default_tools(),
-                    messages,
+                    &mut messages,
                     &config,
                     &mut |event: TurnEvent| {
                         let _ = tx.send(WorkerEvent::Turn(event));
                     },
                 )
             })();
-            let _ = tx.send(WorkerEvent::Done(outcome));
+            // Hand the conversation back in every case, not just on
+            // success: an aborted turn still leaves valid context behind.
+            let _ = tx.send(WorkerEvent::Done(TurnEnd {
+                result: outcome,
+                history: messages,
+            }));
         })
         .expect("failed to spawn turn worker thread");
 }
@@ -625,9 +655,9 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                     app.on_turn_event(turn_event.clone());
                     record_turn_event(&mut state, &mut app, &turn_event);
                 }
-                WorkerEvent::Done(result) => {
-                    record_done(&mut state, &mut app, &result);
-                    app.on_turn_done(&result);
+                WorkerEvent::Done(done) => {
+                    record_done(&mut state, &mut app, &done);
+                    app.on_turn_done(&done.result);
                     turn_finished = true;
                 }
                 WorkerEvent::Models(result) => match result {
@@ -687,6 +717,8 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                 thinking,
                 session: session_name.as_deref(),
                 cost,
+                context_window: catalog
+                    .context_window_for(&launch.provider, launch.model.as_deref()),
             };
             let picker_ref = picker.as_ref().map(|(p, _)| p);
             let completion = app.completion.clone();
@@ -765,18 +797,15 @@ fn record_turn_event(state: &mut SessionState, app: &mut app::App, event: &TurnE
 }
 
 /// Map a finished turn onto session records (usage or error) and update
-/// the conversation history from the turn output.
-fn record_done(
-    state: &mut SessionState,
-    app: &mut app::App,
-    result: &crate::error::Result<TurnOutput>,
-) {
-    match result {
+/// the conversation history. The history is adopted even when the turn
+/// failed, so the model sees the partial context (its prompt, rounds and
+/// tool results) on the next turn.
+fn record_done(state: &mut SessionState, app: &mut app::App, done: &TurnEnd) {
+    match &done.result {
         Ok(output) => {
             if let Some(usage) = output.usage {
                 state.record(app, session::usage_record(usage));
             }
-            app.history = output.history.clone();
         }
         Err(err) => {
             state.record(
@@ -787,6 +816,7 @@ fn record_done(
             );
         }
     }
+    app.history = done.history.clone();
 }
 
 /// What a picker key press produced.

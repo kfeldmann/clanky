@@ -11,6 +11,12 @@
 //!    line per skill. Bodies are never included; the agent reads the
 //!    file when a task matches.
 //!
+//! Every file part is sent with a one-line provenance heading
+//! (`# Context — <path>`) so the model can tell where each part ends and
+//! which scope (user or project) authored it; project scope is the
+//! override when instructions conflict. The skills part keeps its own
+//! `## Skills` heading.
+//!
 //! Everything is best-effort: missing, empty, or unreadable files are
 //! skipped silently.
 
@@ -86,14 +92,20 @@ fn skill_list(skills: &[Skill]) -> String {
 }
 
 /// Append a file as a labelled part; missing or empty files are skipped
-/// silently (context is best-effort). The label is the file path.
+/// silently (context is best-effort). The label is the file path, and the
+/// content is prefixed with a provenance heading (`# Context — <path>`)
+/// so the model can tell parts apart and which scope authored each.
 fn push_part(parts: &mut Vec<(String, String)>, dir: &Path, name: &str) {
     let Ok(text) = std::fs::read_to_string(dir.join(name)) else {
         return;
     };
     let trimmed = text.trim();
     if !trimmed.is_empty() {
-        parts.push((dir.join(name).display().to_string(), trimmed.to_string()));
+        let path = dir.join(name);
+        parts.push((
+            path.display().to_string(),
+            format!("# Context — {}\n\n{}", path.display(), trimmed),
+        ));
     }
 }
 
@@ -139,7 +151,10 @@ mod tests {
         );
         assert!(labels[1].ends_with("AGENTS.md"), "{labels:?}");
         assert_eq!(labels[2], "skills");
-        assert_eq!(parts[1].1, "Be terse.");
+        assert_eq!(
+            parts[1].1,
+            format!("# Context — {}\n\nBe terse.", labels[1])
+        );
         assert_eq!(
             parts[2].1,
             format!(
@@ -170,7 +185,10 @@ mod tests {
         fs::write(scopes[1].join(config::AGENTS_FILE), "Be terse.\n").unwrap();
         let msgs = system_messages_in(&scopes, Path::new("."));
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content(), "Be terse.");
+        assert_eq!(
+            msgs[0].content(),
+            format!("# Context — {}/AGENTS.md\n\nBe terse.", scopes[1].display())
+        );
 
         fs::remove_dir_all(project).ok();
         fs::remove_dir_all(user).ok();
@@ -187,7 +205,19 @@ mod tests {
         fs::write(scopes[1].join(config::AGENTS_FILE), "project agents").unwrap();
 
         let msgs = system_messages_in(&scopes, Path::new("."));
-        let contents: Vec<&str> = msgs.iter().map(|m| m.content()).collect();
+        let contents: Vec<String> = msgs
+            .iter()
+            .zip(["SYSTEM.md", "AGENTS.md", "SYSTEM.md", "AGENTS.md"])
+            .zip([&scopes[0], &scopes[0], &scopes[1], &scopes[1]])
+            .map(|((_, name), scope)| format!("# Context — {}/{}\n\n", scope.display(), name))
+            .zip(msgs.iter().map(|m| m.content()))
+            .map(|(head, content)| {
+                assert!(content.starts_with(&head), "{head:?} vs {content:?}");
+                content[head.len()..].trim().to_string()
+            })
+            .collect();
+        // The heading carries the scope; the body is unchanged and the
+        // layering order (user first, project last) is untouched.
         assert_eq!(
             contents,
             [
@@ -218,7 +248,13 @@ mod tests {
         fs::write(project.join(config::AGENTS_FILE), "root convention").unwrap();
         let msgs = system_messages_in(&scopes, &project);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content(), "root convention");
+        assert_eq!(
+            msgs[0].content(),
+            format!(
+                "# Context — {}/AGENTS.md\n\nroot convention",
+                project.display()
+            )
+        );
         fs::remove_dir_all(project).ok();
     }
 

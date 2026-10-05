@@ -84,7 +84,7 @@ fn run_pipe(settings: &mut Settings) -> Result<()> {
     let output = turn::run_turn(
         handler,
         &tools::default_tools(),
-        messages,
+        &mut messages,
         &config,
         &mut print_event,
     )?;

@@ -16,9 +16,12 @@ use crate::error::{Error, Result};
 use crate::settings::SamplingParams;
 use crate::tools::ToolSet;
 
-/// Maximum number of chat rounds (tool calls included) in one turn, so a
-/// model stuck in a tool-calling cycle cannot run forever.
-pub const MAX_TOOL_ROUNDS: usize = 25;
+/// Default maximum number of chat rounds (tool calls included) in one
+/// turn, so a model stuck in a tool-calling cycle cannot run forever.
+/// Users can override this with the `max_tool_rounds` setting (or the
+/// `--max-tool-rounds` flag); `0` disables the limit entirely and lets
+/// the user judge when to stop a runaway turn.
+pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 25;
 
 /// Per-turn configuration taken from settings/CLI.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -26,6 +29,9 @@ pub struct TurnConfig {
     pub model: Option<String>,
     pub sampling: Option<SamplingParams>,
     pub thinking: Option<String>,
+    /// Cap on chat rounds per turn; `None` uses [`DEFAULT_MAX_TOOL_ROUNDS`],
+    /// `Some(0)` means unlimited.
+    pub max_tool_rounds: Option<usize>,
 }
 
 impl TurnConfig {
@@ -40,6 +46,7 @@ impl TurnConfig {
                 .or_else(|| crate::provider::default_model(provider).map(str::to_string)),
             sampling: settings.sampling.clone(),
             thinking: settings.thinking.clone(),
+            max_tool_rounds: settings.max_tool_rounds,
         }
     }
 }
@@ -72,22 +79,19 @@ pub struct TurnOutput {
     pub text: String,
     pub finish_reason: clanky_protocol::FinishReason,
     pub usage: Option<clanky_protocol::Usage>,
-    /// The complete message list after the turn: system context, the
-    /// user prompt, every assistant round, and tool results. The TUI
-    /// keeps this as the conversation so subsequent turns (and resumed
-    /// sessions) restore the full context (M4).
-    pub history: Vec<ChatMessage>,
 }
 
 /// Run one full agentic turn against `handler` (in-process until M8).
 ///
 /// `messages` is the complete conversation so far, ending with the new
-/// user prompt (system context first). The returned [`TurnOutput::history`]
-/// is this list with the turn's assistant rounds and tool results appended.
+/// user prompt (system context first). It is mutated in place: the turn's
+/// assistant rounds and tool results are appended even when the turn ends
+/// with an error (e.g. the tool-loop limit), so the caller keeps the
+/// partial context and the conversation stays continuable.
 pub fn run_turn(
     handler: Box<dyn Handler>,
     tools: &ToolSet,
-    messages: Vec<ChatMessage>,
+    messages: &mut Vec<ChatMessage>,
     config: &TurnConfig,
     on_event: &mut dyn FnMut(TurnEvent),
 ) -> Result<TurnOutput> {
@@ -105,15 +109,17 @@ pub fn run_turn(
     let sampling = sampling_from(&config.sampling)?;
     let thinking = thinking_from(&config.thinking)?;
 
-    // The caller passes the complete conversation (system context + the
-    // new user prompt); this local copy accumulates the turn's additions.
-    let mut messages = messages;
-
     let mut text = String::new();
     let mut usage_total = Usage::default();
     let mut usage_seen = false;
 
-    for _round in 0..MAX_TOOL_ROUNDS {
+    let max_rounds = config.max_tool_rounds.unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
+    let mut round: usize = 0;
+    loop {
+        if max_rounds > 0 && round >= max_rounds {
+            return Err(Error::ToolLoopLimit(max_rounds));
+        }
+        round += 1;
         let mut assembler = StreamAssembler::default();
         let done = {
             let mut on_chunk = |payload: &ChunkPayload| {
@@ -171,7 +177,6 @@ pub fn run_turn(
                 text,
                 finish_reason: done.finish_reason,
                 usage: usage_seen.then_some(usage_total),
-                history: messages,
             });
         }
 
@@ -185,8 +190,6 @@ pub fn run_turn(
             messages.push(ChatMessage::tool(call.id.clone(), output));
         }
     }
-
-    Err(Error::ToolLoopLimit(MAX_TOOL_ROUNDS))
 }
 
 /// Execute one parsed tool call and return the content for the `tool`
@@ -308,6 +311,9 @@ mod tests {
         requests: RefCell<Vec<ChatRequest>>,
         script: RefCell<VecDeque<ScriptedTurn>>,
         fail_with: Option<clanky_protocol::Error>,
+        /// Returned instead of panicking once the script runs dry; lets
+        /// tests probe behaviour beyond the last scripted round.
+        exhausted: Option<clanky_protocol::Error>,
         caps: Capabilities,
     }
 
@@ -355,6 +361,7 @@ mod tests {
                 requests: RefCell::new(Vec::new()),
                 script: RefCell::new(turns.into()),
                 fail_with: None,
+                exhausted: None,
                 caps: Capabilities {
                     list_models: true,
                     thinking: false,
@@ -367,11 +374,22 @@ mod tests {
             Self::scripted(vec![text_turn("echo")])
         }
 
+        /// Scripted turns, then `err` when the script runs dry.
+        fn scripted_then_exhausted(
+            turns: Vec<ScriptedTurn>,
+            err: clanky_protocol::Error,
+        ) -> Self {
+            let mut handler = Self::scripted(turns);
+            handler.exhausted = Some(err);
+            handler
+        }
+
         fn failing(err: clanky_protocol::Error) -> Self {
             Self {
                 requests: RefCell::new(Vec::new()),
                 script: RefCell::new(VecDeque::new()),
                 fail_with: Some(err),
+                exhausted: None,
                 caps: Capabilities {
                     list_models: true,
                     thinking: false,
@@ -410,11 +428,15 @@ mod tests {
                 return Err(err);
             }
             self.requests.borrow_mut().push(request.clone());
-            let turn = self
-                .script
-                .borrow_mut()
-                .pop_front()
-                .expect("mock script exhausted");
+            let turn = match self.script.borrow_mut().pop_front() {
+                Some(turn) => turn,
+                None => {
+                    return Err(self
+                        .exhausted
+                        .take()
+                        .expect("mock script exhausted"))
+                }
+            };
             for chunk in turn.chunks {
                 sink(chunk);
             }
@@ -464,6 +486,7 @@ mod tests {
             model: Some(model.into()),
             sampling: None,
             thinking: None,
+            max_tool_rounds: None,
         }
     }
 
@@ -479,7 +502,7 @@ mod tests {
         let mut on_event = |event: TurnEvent| sink.borrow_mut().push(event);
         let mut messages = context;
         messages.push(ChatMessage::user(prompt));
-        let output = run_turn(handler, tools, messages, config, &mut on_event);
+        let output = run_turn(handler, tools, &mut messages, config, &mut on_event);
         (output, sink)
     }
 
@@ -644,7 +667,7 @@ mod tests {
     fn endless_tool_loop_hits_the_limit() {
         let handler = Box::new(MockHandler::scripted(
             std::iter::repeat_with(|| tool_turn("echo_tool", r#"{}"#))
-                .take(MAX_TOOL_ROUNDS + 2)
+                .take(DEFAULT_MAX_TOOL_ROUNDS + 2)
                 .collect(),
         ));
         let (output, _) = run(
@@ -656,9 +679,77 @@ mod tests {
         );
         let err = output.unwrap_err();
         assert!(
-            matches!(err, Error::ToolLoopLimit(MAX_TOOL_ROUNDS)),
+            matches!(err, Error::ToolLoopLimit(DEFAULT_MAX_TOOL_ROUNDS)),
             "{err}"
         );
+    }
+
+    #[test]
+    fn tool_loop_limit_keeps_the_partial_conversation() {
+        // Hitting the cap must not discard what the turn did so far: the
+        // caller keeps the prompt, the assistant rounds and the tool
+        // results, so the session stays continuable.
+        let handler = Box::new(MockHandler::scripted(
+            std::iter::repeat_with(|| tool_turn("echo_tool", r#"{}"#))
+                .take(2)
+                .collect(),
+        ));
+        let mut messages = vec![ChatMessage::system("Be terse."), ChatMessage::user("loop")];
+        let cfg = TurnConfig {
+            max_tool_rounds: Some(1),
+            ..config("mock/model")
+        };
+        let output = run_turn(handler, &toolset(), &mut messages, &cfg, &mut |_| {});
+        assert!(matches!(output.unwrap_err(), Error::ToolLoopLimit(1)));
+        assert_eq!(messages.len(), 4, "system, user, assistant, tool");
+        assert!(matches!(
+            &messages[2],
+            ChatMessage::Assistant { tool_calls: Some(_), .. }
+        ));
+        assert!(matches!(messages[3], ChatMessage::Tool { .. }));
+    }
+
+    #[test]
+    fn custom_max_tool_rounds_from_config_is_respected() {
+        let handler = Box::new(MockHandler::scripted(
+            std::iter::repeat_with(|| tool_turn("echo_tool", r#"\"{}\"#))
+                .take(5)
+                .collect(),
+        ));
+        let cfg = TurnConfig {
+            max_tool_rounds: Some(3),
+            ..config("mock/model")
+        };
+        let (output, _) = run(handler, &toolset(), vec![], "loop forever", &cfg);
+        let err = output.unwrap_err();
+        assert!(matches!(err, Error::ToolLoopLimit(3)), "{err}");
+    }
+
+    #[test]
+    fn max_tool_rounds_zero_runs_past_the_default_cap() {
+        // 26 tool rounds would trip the default cap of 25; `0` disables it,
+        // so the loop only stops when the mock runs out of script.
+        let handler = Box::new(MockHandler::scripted_then_exhausted(
+            std::iter::repeat_with(|| tool_turn("echo_tool", r#"\"{}\"#))
+                .take(26)
+                .collect(),
+            clanky_protocol::Error::Provider {
+                code: ErrorCode::Internal,
+                message: "script exhausted".into(),
+                retryable: false,
+            },
+        ));
+        let cfg = TurnConfig {
+            max_tool_rounds: Some(0),
+            ..config("mock/model")
+        };
+        let (output, _) = run(handler, &toolset(), vec![], "keep looping", &cfg);
+        let err = output.unwrap_err();
+        let msg = match &err {
+            Error::Provider(clanky_protocol::Error::Provider { message, .. }) => message.clone(),
+            other => panic!("unexpected error: {other}"),
+        };
+        assert_eq!(msg, "script exhausted", "{err}");
     }
 
     #[test]
@@ -724,24 +815,25 @@ mod tests {
             tool_turn("echo_tool", r#"{"input": "x"}"#),
             text_turn("done"),
         ]));
-        let (output, _) = run(
+        let mut messages = vec![ChatMessage::system("Be terse."), ChatMessage::user("hi")];
+        let output = run_turn(
             handler,
             &toolset(),
-            vec![ChatMessage::system("Be terse.")],
-            "hi",
+            &mut messages,
             &config("mock/model"),
+            &mut |_| {},
         );
-        let history = output.unwrap().history;
-        assert_eq!(history.len(), 5, "system, user, assistant, tool, assistant");
-        assert!(matches!(history[0], ChatMessage::System { .. }));
-        assert!(matches!(history[1], ChatMessage::User { .. }));
+        output.unwrap();
+        assert_eq!(messages.len(), 5, "system, user, assistant, tool, assistant");
+        assert!(matches!(messages[0], ChatMessage::System { .. }));
+        assert!(matches!(messages[1], ChatMessage::User { .. }));
         assert!(matches!(
-            &history[2],
+            &messages[2],
             ChatMessage::Assistant { tool_calls: Some(calls), .. } if calls.len() == 1
         ));
-        assert!(matches!(history[3], ChatMessage::Tool { .. }));
+        assert!(matches!(messages[3], ChatMessage::Tool { .. }));
         assert!(matches!(
-            &history[4],
+            &messages[4],
             ChatMessage::Assistant {
                 tool_calls: None,
                 ..

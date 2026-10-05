@@ -99,6 +99,7 @@ fn config() -> TurnConfig {
         model: Some("mock/model".into()),
         sampling: None,
         thinking: None,
+        max_tool_rounds: None,
     }
 }
 
@@ -221,7 +222,7 @@ fn killed_session_resumes_with_full_context() {
         ])),
     };
     let tools: clanky::tools::ToolSet = vec![Box::new(EchoTool)];
-    let messages = vec![
+    let mut messages = vec![
         ChatMessage::system("Be terse."),
         ChatMessage::user("run it"),
     ];
@@ -237,7 +238,7 @@ fn killed_session_resumes_with_full_context() {
     let output1 = run_turn(
         Box::new(provider),
         &tools,
-        messages.clone(),
+        &mut messages,
         &config(),
         &mut |event| recorder.on_turn_event(&event),
     )
@@ -252,7 +253,7 @@ fn killed_session_resumes_with_full_context() {
 
     // Rebuilt conversation == what the live turn produced (minus the
     // system message, which is re-assembled fresh on resume).
-    let expected_conversation: Vec<ChatMessage> = output1.history[1..].to_vec();
+    let expected_conversation: Vec<ChatMessage> = messages[1..].to_vec();
     assert_eq!(rebuilt_conversation, expected_conversation);
 
     // --- continue the conversation on a fresh process ---
@@ -260,7 +261,7 @@ fn killed_session_resumes_with_full_context() {
         .into_iter()
         .chain(rebuilt_conversation)
         .collect::<Vec<_>>();
-    assert_eq!(resumed_messages, output1.history, "full context restored");
+    assert_eq!(resumed_messages, messages, "full context restored");
 
     let provider2_requests = std::rc::Rc::new(RefCell::new(Vec::new()));
     let provider2 = ScriptedProvider {
@@ -272,7 +273,7 @@ fn killed_session_resumes_with_full_context() {
     let output2 = run_turn(
         Box::new(provider2),
         &tools,
-        messages2,
+        &mut messages2,
         &config(),
         &mut |_| {},
     )

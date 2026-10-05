@@ -157,14 +157,14 @@ impl App {
             last_usage: None,
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
-            history: Vec::new(),
             completion: None,
             printed_entries: 0,
             printed: Vec::new(),
-            input_history: Vec::new(),
             input_index: None,
             draft: String::new(),
             open: None,
+            history: Vec::new(),
+            input_history: Vec::new(),
         }
     }
 
@@ -725,7 +725,6 @@ mod tests {
             text: "hi".into(),
             finish_reason: clanky_protocol::FinishReason::Stop,
             usage,
-            history: Vec::new(),
         }));
         assert_eq!(app.last_usage, usage);
         assert!(!app.busy);
@@ -737,7 +736,6 @@ mod tests {
             text: "hi".into(),
             finish_reason: clanky_protocol::FinishReason::Stop,
             usage,
-            history: Vec::new(),
         }));
         assert_eq!(app.total_prompt_tokens, 20, "usage accumulates per turn");
         assert_eq!(app.total_completion_tokens, 6);

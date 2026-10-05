@@ -49,6 +49,9 @@ pub struct Status<'a> {
     /// Estimated session cost in dollars (catalog pricing × cumulative
     /// token totals); `None` when no pricing is known.
     pub cost: Option<f64>,
+    /// Model context window (catalog hint); `None` when unknown, in which
+    /// case no context percentage is shown.
+    pub context_window: Option<u64>,
 }
 
 /// The terminal, viewed as a linear transcript with a redrawable tail.
@@ -209,12 +212,24 @@ impl<W: Write> Screen<W> {
 /// Print one styled line as ANSI, truncated to `width` display columns
 /// (truncation keeps the row-count math exact: a wrapped row would shift
 /// everything below).
-fn print_line<W: Write>(out: &mut W, line: &Line<'_>, width: u16) -> io::Result<()> {
+pub fn print_line<W: Write>(out: &mut W, line: &Line<'_>, width: u16) -> io::Result<()> {
     let width = width as usize;
-    out.write_all(b"\x1b[0m")?;
     let mut col = 0usize;
+    // The SGR sequence currently in effect. Every style change must emit
+    // the full new state (reset plus the span's own codes): `sgr` only
+    // produces codes for attributes a style *has*, so switching to a
+    // plain span would otherwise leave the previous span's color and
+    // modifiers active until the next styled span or the end of the line.
+    let mut applied: Option<String> = None;
     for span in &line.spans {
-        out.write_all(sgr(span.style).as_bytes())?;
+        let want = sgr(span.style);
+        if applied.as_deref() != Some(want.as_str()) {
+            out.write_all(b"\x1b[0m")?;
+            if !want.is_empty() {
+                out.write_all(want.as_bytes())?;
+            }
+            applied = Some(want);
+        }
         for c in span.content.chars() {
             let w = c.width().unwrap_or(0);
             if col + w > width {
@@ -305,7 +320,7 @@ fn footer_lines(
 }
 
 /// Status line: provider · model · think · session · cost on the left;
-/// streaming state, token usage, or a hint on the right.
+/// token usage or a hint on the right; streaming shows on the input prompt.
 fn status_line(app: &App, status: &Status<'_>, width: u16) -> Line<'static> {
     let base = Style::new().fg(Color::DarkGray);
     let mut left = vec![Span::styled(
@@ -335,26 +350,32 @@ fn status_line(app: &App, status: &Status<'_>, width: u16) -> Line<'static> {
         ));
     }
 
+    // Streaming is signalled by the input prompt's dot, not here, so the
+    // token counters stay visible while a turn is running.
     let mut right = Vec::new();
-    if app.busy {
-        right.push(Span::styled(
-            "● streaming".to_string(),
-            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ));
-    } else if app.pending.is_some() {
+    if app.pending.is_some() {
         right.push(Span::styled(
             "○ queued".to_string(),
             Style::new().fg(Color::Yellow),
         ));
     } else if let Some(usage) = app.last_usage {
-        right.push(Span::styled(
-            format!(
-                "↑{} ↓{} tok",
-                usage.prompt_tokens.unwrap_or(0),
-                usage.completion_tokens.unwrap_or(0)
-            ),
-            base,
-        ));
+        let prompt = usage.prompt_tokens.unwrap_or(0);
+        let completion = usage.completion_tokens.unwrap_or(0);
+        // With a known context window, the "tok" unit gives way to how much
+        // of it the last turn consumed: the next request re-sends those
+        // prompt tokens, so they are what accumulates toward the limit.
+        match status.context_window {
+            Some(window) if window > 0 => right.push(Span::styled(
+                format!(
+                    "↑{} ↓{} · {}% ctx",
+                    prompt,
+                    completion,
+                    (prompt + completion) * 100 / window
+                ),
+                base,
+            )),
+            _ => right.push(Span::styled(format!("↑{prompt} ↓{completion} tok"), base)),
+        }
     } else {
         right.push(Span::styled("/ commands · ctrl+c quit".to_string(), base));
     }
@@ -385,15 +406,25 @@ fn format_cost(cost: f64) -> String {
 /// The input line and the caret column within it. The text is windowed
 /// horizontally so the caret stays on screen.
 fn input_row(app: &App, width: u16) -> (Line<'static>, u16) {
-    let prompt_width = INPUT_PROMPT.width();
+    // The prompt is always three columns: a streaming dot ("●" while a
+    // turn runs, a blank otherwise) plus "❯ ". The fixed width keeps the
+    // caret column steady whether or not the dot is lit.
+    let prompt_width = INPUT_PROMPT.width() + 1;
     let view_width = (width as usize).saturating_sub(prompt_width);
     if view_width == 0 {
         return (Line::default(), 0);
     }
     let prompt_style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let dot_style = prompt_style;
+    let dot = if app.busy {
+        Span::styled("●", dot_style)
+    } else {
+        Span::raw(" ")
+    };
     if app.input.is_empty() && !app.busy {
         return (
             Line::from(vec![
+                dot,
                 Span::styled(INPUT_PROMPT.to_string(), prompt_style),
                 Span::styled(
                     "type a message…".to_string(),
@@ -404,7 +435,10 @@ fn input_row(app: &App, width: u16) -> (Line<'static>, u16) {
         );
     }
     let (window, caret_col) = input_window(&app.input, app.cursor, view_width);
-    let mut spans = vec![Span::styled(INPUT_PROMPT.to_string(), prompt_style)];
+    let mut spans = vec![
+        dot,
+        Span::styled(INPUT_PROMPT.to_string(), prompt_style),
+    ];
     spans.extend(window);
     (Line::from(spans), (prompt_width + caret_col) as u16)
 }
@@ -607,7 +641,7 @@ fn truncate_spans(spans: Vec<Span<'_>>, width: usize) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turn::TurnEvent;
+    use crate::turn::{TurnEvent, TurnOutput};
 
     /// A writer that records the plain text rows printed by a screen,
     /// keeping escape sequences out of the assertions.
@@ -744,6 +778,91 @@ mod tests {
         }
     }
 
+    /// Analysis harness (temporary): replays the recorded event stream of
+    /// a real session (`target/replay/events.json`) through the screen,
+    /// dumping the raw ANSI stream so an external terminal emulator can
+    /// check for stale remnants.
+    #[test]
+    fn replay_dump_for_terminal_analysis() {
+        let Some(dir) = std::env::var_os("CLANKY_REPLAY_DUMP_DIR") else {
+            return;
+        };
+        let script_path = std::env::var("CLANKY_REPLAY_EVENTS")
+            .unwrap_or_else(|_| "target/replay/events.json".into());
+        let script = std::fs::read_to_string(&script_path)
+            .unwrap_or_else(|e| panic!("replay script {script_path}: {e}"));
+        #[derive(serde::Deserialize)]
+        struct Ev {
+            kind: String,
+            #[serde(default)]
+            text: String,
+            #[serde(default)]
+            name: String,
+        }
+        let events: Vec<Ev> = serde_json::from_str(&script).unwrap();
+        let width: u16 = std::env::var("CLANKY_REPLAY_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let height: u16 = std::env::var("CLANKY_REPLAY_H")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new();
+        let mut s = screen(Buf::default(), width, height);
+        let mut st = status();
+        st.model = Some("zai-org/GLM-5.3-Flash");
+        st.thinking = Some("16384");
+        st.session = Some("20261005-023938-8513");
+
+        macro_rules! render {
+            ($frame:expr) => {{
+                s.render(&mut app, &st, None, None).unwrap();
+                let buf = std::mem::take(&mut s.out);
+                std::fs::write(dir.join(format!("frame-{:04}.bin", $frame)), &buf.0).unwrap();
+                s.out = buf;
+            }};
+        }
+
+        for (frame, ev) in events.iter().enumerate() {
+            match ev.kind.as_str() {
+                "user" => {
+                    app.push_user(&ev.text);
+                    app.busy = true;
+                }
+                "think" => app.on_turn_event(TurnEvent::Thinking {
+                    delta: ev.text.clone(),
+                }),
+                "text" => app.on_turn_event(TurnEvent::Text {
+                    delta: ev.text.clone(),
+                }),
+                "call" => app.on_turn_event(TurnEvent::ToolCall {
+                    name: ev.name.clone(),
+                    arguments: ev.text.clone(),
+                }),
+                "result" => app.on_turn_event(TurnEvent::ToolResult {
+                    name: ev.name.clone(),
+                    output: ev.text.clone(),
+                }),
+                "done" => {
+                    app.on_turn_done(&Ok(TurnOutput {
+                        text: String::new(),
+                        finish_reason: clanky_protocol::FinishReason::Stop,
+                        usage: Some(clanky_protocol::Usage {
+                            prompt_tokens: Some(17255),
+                            completion_tokens: Some(796),
+                        }),
+                    }));
+                }
+                _ => {}
+            }
+            render!(frame);
+        }
+    }
+
     fn status() -> Status<'static> {
         Status {
             provider: "deepinfra",
@@ -751,6 +870,7 @@ mod tests {
             thinking: None,
             session: None,
             cost: None,
+            context_window: Some(10000),
         }
     }
 
@@ -849,7 +969,7 @@ mod tests {
         );
         assert_eq!(status_row.chars().count(), 80, "one full-width status row");
         let input_row = &rows[7];
-        assert_eq!(input_row.trim_end(), "❯ Say hello", "{input_row}");
+        assert_eq!(input_row.trim_end(), " ❯ Say hello", "{input_row}");
         assert_eq!(input_row.chars().count(), 80, "placeholder remnants erased");
     }
 
@@ -900,6 +1020,27 @@ mod tests {
         assert_eq!(buf.0, b"\x1b[0m\x1b[31;1mhi\x1b[0m");
     }
 
+    /// Regression: a plain span after a styled one used to emit no SGR at
+    /// all, so the earlier span's color and modifiers stayed active until
+    /// the next styled span or the end of the line — e.g. `**bold** the
+    /// `/code`` leaked bold past "bold" and cyan over the plain text
+    /// between code spans (see the 20261005-023938 session replay).
+    #[test]
+    fn style_change_resets_the_previous_span_style() {
+        let mut buf = Buf::default();
+        print_line(
+            &mut buf,
+            &Line::from(vec![
+                Span::styled("a".to_string(), Style::new().fg(Color::Cyan)),
+                Span::raw(" b ".to_string()),
+                Span::styled("c".to_string(), Style::new().add_modifier(Modifier::BOLD)),
+            ]),
+            80,
+        )
+        .unwrap();
+        assert_eq!(buf.0, b"\x1b[0m\x1b[36ma\x1b[0m b \x1b[0m\x1b[1mc\x1b[0m");
+    }
+
     #[test]
     fn print_line_truncates_to_the_row_width() {
         let mut buf = Buf::default();
@@ -917,10 +1058,17 @@ mod tests {
     fn status_line_pads_and_shows_state() {
         let mut app = App::new();
         app.busy = true;
+        app.last_usage = Some(clanky_protocol::Usage {
+            prompt_tokens: Some(120),
+            completion_tokens: Some(80),
+        });
         let line = status_line(&app, &status(), 40);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("deepinfra · mock/model"), "{text}");
-        assert!(text.contains("● streaming"), "{text}");
+        // Streaming keeps the counters on the right; the dot moved to the
+        // input prompt instead.
+        assert!(text.contains("↑120 ↓80 · 2% ctx"), "{text}");
+        assert!(!text.contains("streaming"), "{text}");
         assert_eq!(text.chars().count(), 40, "padded to the full width");
 
         app.busy = false;
@@ -939,6 +1087,7 @@ mod tests {
             thinking: Some("4096"),
             session: Some("s"),
             cost: Some(0.0123),
+            context_window: None,
         };
         let line = status_line(&app, &status, 80);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
@@ -951,19 +1100,59 @@ mod tests {
     }
 
     #[test]
+    fn usage_shows_context_percent_when_the_window_is_known() {
+        let mut app = App::new();
+        app.on_turn_done(&Ok(TurnOutput {
+            text: String::new(),
+            finish_reason: clanky_protocol::FinishReason::Stop,
+            usage: Some(clanky_protocol::Usage {
+                prompt_tokens: Some(17255),
+                completion_tokens: Some(796),
+            }),
+        }));
+
+        // Unknown window: the plain token counts keep their unit.
+        let unknown = Status {
+            context_window: None,
+            ..status()
+        };
+        let line = status_line(&app, &unknown, 80);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("↑17255 ↓796 tok"), "{text}");
+
+        // Known window: "tok" gives way to the consumed percentage.
+        let known = Status {
+            context_window: Some(128_000),
+            ..status()
+        };
+        let line = status_line(&app, &known, 80);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("↑17255 ↓796 · 14% ctx"), "{text}");
+
+        // Integer division: 18_051 / 100_000 → 18% (floors, never 19).
+        let known = Status {
+            context_window: Some(100_000),
+            ..status()
+        };
+        let line = status_line(&app, &known, 80);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("· 18% ctx"), "{text}");
+    }
+
+    #[test]
     fn input_row_shows_placeholder_and_windows_long_input() {
         let mut app = App::new();
         let (line, caret) = input_row(&app, 40);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("type a message…"), "{text}");
-        assert_eq!(caret, 2, "caret after the prompt symbol");
+        assert_eq!(caret, 3, "caret after the dot and prompt symbol");
 
         app.input = "hi".into();
         app.cursor = 2;
         let (line, caret) = input_row(&app, 40);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("❯ hi"), "{text}");
-        assert_eq!(caret, 4);
+        assert_eq!(caret, 5);
 
         // Long input: the caret stays visible at the right edge.
         app.input = "x".repeat(100);

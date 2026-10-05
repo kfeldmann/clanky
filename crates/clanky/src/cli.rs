@@ -31,6 +31,11 @@ pub struct Cli {
     #[arg(long, value_parser = parse_sampling)]
     pub sampling: Option<SamplingParams>,
 
+    /// Max chat rounds per turn (tool calls included), overriding the
+    /// settings; 0 means unlimited, letting you stop the turn yourself.
+    #[arg(long)]
+    pub max_tool_rounds: Option<usize>,
+
     /// Resume a saved session (interactive mode only). With a NAME, load
     /// it directly; without, show a picker of saved sessions.
     #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
@@ -56,6 +61,7 @@ impl Cli {
             model: self.model.clone(),
             thinking: self.thinking.clone(),
             sampling: self.sampling.clone(),
+            max_tool_rounds: self.max_tool_rounds,
             prompt,
         }
     }

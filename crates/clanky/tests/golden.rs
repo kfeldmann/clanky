@@ -163,6 +163,7 @@ fn config() -> TurnConfig {
             .collect(),
         ),
         thinking: Some("2048".into()),
+        max_tool_rounds: None,
     }
 }
 
@@ -233,14 +234,15 @@ fn tool_loop_transcript_matches_golden() {
         text_turn("The tool said: fake ran with input=hello"),
     ];
     let (provider, requests) = ScriptedProvider::new(script);
+    let mut messages = [
+        vec![ChatMessage::system("You are a terminal coding agent.")],
+        vec![ChatMessage::user("use the tool on hello")],
+    ]
+    .concat();
     let output = run_turn(
         Box::new(provider),
         &fake_tools(),
-        [
-            vec![ChatMessage::system("You are a terminal coding agent.")],
-            vec![ChatMessage::user("use the tool on hello")],
-        ]
-        .concat(),
+        &mut messages,
         &config(),
         &mut |_| {},
     )
@@ -276,12 +278,13 @@ fn bash_tool_transcript_matches_golden() {
         text_turn("The command printed 42."),
     ];
     let (provider, requests) = ScriptedProvider::new(script);
+    let mut messages = vec![ChatMessage::user(
+        "run `echo 42` and tell me what it printed",
+    )];
     let output = run_turn(
         Box::new(provider),
         &bash_tools(),
-        vec![ChatMessage::user(
-            "run `echo 42` and tell me what it printed",
-        )],
+        &mut messages,
         &config(),
         &mut |_| {},
     )
@@ -324,10 +327,11 @@ fn sampling_and_thinking_are_plumbed_through_every_round() {
         text_turn("done"),
     ];
     let (provider, requests) = ScriptedProvider::new(script);
+    let mut messages = vec![ChatMessage::user("go")];
     run_turn(
         Box::new(provider),
         &fake_tools(),
-        vec![ChatMessage::user("go")],
+        &mut messages,
         &config(),
         &mut |_| {},
     )
