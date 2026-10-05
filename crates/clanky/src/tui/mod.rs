@@ -1,4 +1,11 @@
-//! Interactive TUI (M3): chat view, input line, streaming render.
+//! Interactive TUI (M3): linear terminal output, input line, streaming render.
+//!
+//! The transcript is printed straight to the terminal (see `screen.rs`):
+//! finalized lines flow into the normal buffer and scrollback, so the
+//! native scrollbar, native text selection, and the history left behind
+//! after quitting all work without being emulated. Only a small region at
+//! the bottom of the screen — the streaming entry, an optional popup, the
+//! status line, and the input line — is redrawn in place.
 //!
 //! The agentic turn runs on a worker thread so the UI stays responsive
 //! while the model streams and tools execute; [`TurnEvent`]s cross to the
@@ -21,22 +28,19 @@
 //! Input ergonomics (M7): Tab completes the file path at the caret (longest
 //! common prefix first, further Tabs cycle candidates, shown in a popup
 //! above the input line); ctrl+e opens `$EDITOR` with the prompt buffer —
-//! the TUI suspends, the editor owns the terminal, and the TUI resumes
+//! raw mode is dropped, the editor owns the terminal, and the TUI resumes
 //! with the edited text. `↑`/`↓` recall previously submitted prompts
 //! (the first `↑` saves the current input as a draft).
 //!
-//! Mouse (M3+): the wheel scrolls; dragging the left button selects
-//! transcript text (highlighted while dragging) and releasing copies it
-//! to the clipboard via OSC 52 — no external clipboard tool needed.
-//! Terminals that support it also allow the native shift+drag selection
-//! to bypass the captured mouse.
+//! Scrolling and copying are the terminal's own: the mouse is never
+//! captured and no alternate screen is used, so the wheel, the scrollbar,
+//! and native selection (including shift+drag) work as in any shell.
 //!
-//! Layout (see `ui.rs`):
-//! ┌────────────────────────────────┐
-//! │ transcript (markdown, scroll)  │
-//! │ provider · model · session  ●  │
-//! │ ❯ input line                   │
-//! └────────────────────────────────┘
+//! Screen layout (`screen.rs`):
+//! │ … printed history (scrollback, final) … │
+//! │ ◆ streaming entry (rewritten as it grows) │
+//! │ provider · model · session      ● │
+//! │ ❯ input line │
 
 mod app;
 mod commands;
@@ -44,8 +48,7 @@ mod completion;
 mod editor;
 mod markdown;
 mod picker;
-mod selection;
-mod ui;
+mod screen;
 
 use std::io::{IsTerminal as _, Stdout};
 use std::path::PathBuf;
@@ -53,15 +56,8 @@ use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
 use clanky_protocol::{ChatMessage, ModelInfo};
-use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEventKind,
-};
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 
 use crate::error::Result;
 use crate::prompts::{self, Template};
@@ -69,9 +65,6 @@ use crate::session::{self, SessionInfo, SessionWriter};
 use crate::settings::{SamplingParams, Settings};
 use crate::turn::{TurnConfig, TurnEvent, TurnOutput};
 use commands::{Command, SamplingEdit};
-
-/// Half a screen per PageUp/PageDown press.
-const SCROLL_PAGE: u16 = 16;
 
 /// Presets offered by the bare `/thinking` picker.
 const THINKING_OPTIONS: &[(&str, &str)] = &[
@@ -136,9 +129,11 @@ enum WorkerEvent {
 
 /// Run the interactive session until the user quits.
 pub fn run(mut launch: Launch) -> Result<()> {
-    let mut terminal = setup()?;
-    let result = event_loop(&mut launch, &mut terminal);
-    match restore(&mut terminal) {
+    enable_raw_mode()?;
+    let (width, height) = size()?;
+    let mut screen = screen::Screen::new(std::io::stdout(), width, height);
+    let result = event_loop(&mut launch, &mut screen);
+    match restore(&mut screen) {
         Ok(()) => result,
         Err(restore_err) => {
             // Surface the original error if cleanup also fails.
@@ -147,17 +142,13 @@ pub fn run(mut launch: Launch) -> Result<()> {
     }
 }
 
-fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-    Ok(terminal)
-}
-
-fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+/// Leave the terminal as the user's shell expects it: raw mode off and a
+/// fresh line below the transcript, which stays in the terminal.
+fn restore<W: std::io::Write>(screen: &mut screen::Screen<W>) -> Result<()> {
+    // The newline goes out while raw mode is still on (ONLCR would turn
+    // it into a stray extra carriage return otherwise).
+    screen.finish()?;
     disable_raw_mode()?;
-    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
-    terminal.show_cursor()?;
     Ok(())
 }
 
@@ -464,10 +455,7 @@ fn session_by_name(name: &str) -> Result<SessionInfo> {
     })
 }
 
-fn event_loop(
-    launch: &mut Launch,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> Result<()> {
+fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Result<()> {
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
     let mut app = app::App::new();
     // Fresh session: seed the system context so the first turn sends it
@@ -476,9 +464,12 @@ fn event_loop(
     let mut state = SessionState::new(launch.clone());
     // Open picker with the payload it selects from, when active.
     let mut picker: Option<(picker::Picker, PickerKind)> = None;
+    // Something changed since the last render (transcript, input, popup).
+    let mut dirty = true;
 
-    // `--resume NAME` loads the session before the first frame; plain
-    // `--resume` opens the picker.
+    // `--resume NAME` loads the session before the first render; plain
+    // `--resume` opens the picker. A resumed transcript is committed to
+    // the terminal on the first render.
     match launch.resume.as_deref() {
         Some("") => {
             let kind = PickerKind::Resume(session::list(&state.dir));
@@ -505,36 +496,6 @@ fn event_loop(
     }
 
     loop {
-        let size = terminal.size()?;
-        let (width, height) = (size.width, size.height);
-        let chat_height = height.saturating_sub(2) as usize;
-        let transcript = app.transcript_lines(width);
-        let transcript_len = transcript.len();
-        let max_scroll = transcript.len().saturating_sub(chat_height);
-        let scroll_from_top = max_scroll.saturating_sub(app.scroll_from_bottom);
-
-        let session_name = state.current_name();
-        let status = ui::Status {
-            provider: &launch.provider,
-            model: launch.model.as_deref(),
-            session: session_name.as_deref(),
-        };
-        let picker_ref = picker.as_ref().map(|(p, _)| p);
-        terminal.draw(|frame| {
-            ui::draw(
-                frame,
-                &app,
-                ui::Transcript {
-                    lines: transcript,
-                    scroll_from_top,
-                    selection: app.selection.as_ref(),
-                },
-                &status,
-                app.completion.as_ref(),
-                picker_ref,
-            );
-        })?;
-
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
@@ -553,12 +514,16 @@ fn event_loop(
                         } else {
                             match handle_key(&mut app, &mut state, launch, &tx, key) {
                                 Action::Quit => break,
-                                Action::Clear => app.clear(),
+                                Action::Clear => {
+                                    app.clear();
+                                    screen.clear_screen();
+                                }
                                 Action::OpenPicker(kind) => {
+                                    app.completion = None;
                                     picker = Some((picker_for(&kind), kind));
                                 }
                                 Action::OpenEditor => {
-                                    if let Err(err) = run_editor(&mut app, terminal) {
+                                    if let Err(err) = run_editor(&mut app, screen) {
                                         app.entries.push(app::Entry::Error(err.to_string()));
                                     }
                                 }
@@ -581,47 +546,20 @@ fn event_loop(
                             }
                         }
                         // The completion popup lives on between Tab presses
-                        // only; any other key dismisses it. A key press also
-                        // cancels an active mouse selection.
+                        // only; any other key dismisses it.
                         if !tab {
                             app.completion = None;
                         }
-                        app.selection = None;
+                        dirty = true;
                     }
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.scroll_up(3),
-                    MouseEventKind::ScrollDown => app.scroll_down(3),
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some(point) =
-                            mouse_point(&mouse, scroll_from_top, chat_height, transcript_len)
-                        {
-                            app.selection_start(point.0, point.1);
-                        }
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if app.selection.is_some()
-                            && let Some(point) =
-                                mouse_point(&mouse, scroll_from_top, chat_height, transcript_len)
-                        {
-                            app.selection_extend(point.0, point.1);
-                        }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some(text) = app.selection_take(width) {
-                            match copy_to_clipboard(&text) {
-                                Ok(()) => app.entries.push(app::Entry::Info(format!(
-                                    "copied {} chars to the clipboard (OSC 52)",
-                                    text.chars().count()
-                                ))),
-                                Err(err) => app
-                                    .entries
-                                    .push(app::Entry::Error(format!("copy failed: {err}"))),
-                            }
-                        }
-                    }
-                    _ => {}
-                },
+                // The buffer was reflowed; re-anchor the redrawable region.
+                Event::Resize(width, height) => {
+                    screen.resync(&mut app, width, height);
+                    dirty = true;
+                }
+                // The mouse is never captured: wheel scrolling and native
+                // text selection are the terminal's own.
                 _ => {}
             }
         }
@@ -629,6 +567,7 @@ fn event_loop(
         // Drain everything the worker produced.
         let mut turn_finished = false;
         while let Ok(event) = rx.try_recv() {
+            dirty = true;
             match event {
                 WorkerEvent::Turn(turn_event) => {
                     app.on_turn_event(turn_event.clone());
@@ -666,6 +605,19 @@ fn event_loop(
             app.busy = true;
             spawn_turn(app.history.clone(), launch, prompt, tx.clone());
         }
+
+        if dirty {
+            let session_name = state.current_name();
+            let status = screen::Status {
+                provider: &launch.provider,
+                model: launch.model.as_deref(),
+                session: session_name.as_deref(),
+            };
+            let picker_ref = picker.as_ref().map(|(p, _)| p);
+            let completion = app.completion.clone();
+            screen.render(&mut app, &status, picker_ref, completion.as_ref())?;
+            dirty = false;
+        }
     }
     Ok(())
 }
@@ -673,13 +625,16 @@ fn event_loop(
 /// ctrl+e (M7): suspend the TUI, edit the prompt buffer in `$EDITOR`,
 /// resume with the edited text. An empty buffer clears the input; a
 /// failing editor leaves the input untouched and reports the error.
-fn run_editor(app: &mut app::App, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn run_editor(app: &mut app::App, screen: &mut screen::Screen<Stdout>) -> Result<()> {
     let editor = editor::editor_command()?;
     let initial = app.input.clone();
-    restore(terminal)?;
+    // Hand the terminal to the editor: raw mode off, printed history
+    // stays in place.
+    disable_raw_mode()?;
     let outcome = editor::edit_with(&initial, &editor);
     // Re-establish the TUI no matter how the editor behaved.
-    *terminal = setup()?;
+    enable_raw_mode()?;
+    screen.resync(app, screen.size().0, screen.size().1);
     app.completion = None;
     match outcome {
         Ok(Some(text)) => {
@@ -1122,33 +1077,6 @@ fn first_line(text: &str) -> String {
     out
 }
 
-/// Map a left-button press/drag onto a transcript point: `None` when the
-/// event lands on the status/input rows. The chat area starts at row 0,
-/// column 0, so `line = scroll_from_top + row`.
-fn mouse_point(
-    mouse: &ratatui::crossterm::event::MouseEvent,
-    scroll_from_top: usize,
-    chat_height: usize,
-    transcript_len: usize,
-) -> Option<(usize, usize)> {
-    let row = mouse.row as usize;
-    if row >= chat_height || transcript_len == 0 {
-        return None;
-    }
-    let line = (scroll_from_top + row).min(transcript_len - 1);
-    Some((line, mouse.column as usize))
-}
-
-/// Copy text to the clipboard via OSC 52 — an escape sequence, so it
-/// works without external tools and across ssh, wherever the terminal
-/// supports it (most modern ones, tmux included).
-fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut stdout = std::io::stdout().lock();
-    write!(stdout, "{}", selection::osc52(text))?;
-    stdout.flush()
-}
-
 /// Only act on press events (release events come from Windows terminals).
 fn pressed(key: KeyEvent) -> Option<KeyEvent> {
     if key.kind == KeyEventKind::Press {
@@ -1216,14 +1144,6 @@ fn handle_key(
         }
         (false, KeyCode::End) => {
             app.cursor_end();
-            Action::None
-        }
-        (false, KeyCode::PageUp) => {
-            app.scroll_up(SCROLL_PAGE as usize);
-            Action::None
-        }
-        (false, KeyCode::PageDown) => {
-            app.scroll_down(SCROLL_PAGE as usize);
             Action::None
         }
         (false, KeyCode::Up) => {
@@ -1556,25 +1476,6 @@ mod tests {
         let shown = first_line(&long);
         assert_eq!(shown.chars().count(), 61, "60 chars + ellipsis");
         assert!(shown.ends_with('…'));
-    }
-
-    #[test]
-    fn mouse_points_map_to_transcript_coordinates() {
-        use ratatui::crossterm::event::MouseEvent;
-        let mouse = |row: u16, col: u16| MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: col,
-            row,
-            modifiers: KeyModifiers::empty(),
-        };
-        // Chat rows map onto transcript lines; the status/input rows are
-        // not part of the transcript.
-        assert_eq!(mouse_point(&mouse(0, 4), 0, 3, 10), Some((0, 4)));
-        assert_eq!(mouse_point(&mouse(2, 0), 5, 3, 10), Some((7, 0)));
-        assert_eq!(mouse_point(&mouse(3, 0), 0, 3, 10), None, "status row");
-        // An anchor past the transcript clamps to the last line.
-        assert_eq!(mouse_point(&mouse(2, 1), 8, 3, 10), Some((9, 1)));
-        assert_eq!(mouse_point(&mouse(0, 0), 0, 3, 0), None, "empty transcript");
     }
 
     #[test]

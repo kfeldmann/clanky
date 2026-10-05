@@ -1,4 +1,9 @@
-//! TUI application state (M3): transcript entries, input line, scrolling.
+//! TUI application state (M3): transcript entries and the input line.
+//!
+//! The transcript is printed straight to the terminal (see `super::screen`):
+//! entries become final once they stop changing, and the renderer commits
+//! their lines permanently. These fields track what has been printed so a
+//! re-render only touches the streaming tail.
 
 use std::path::PathBuf;
 
@@ -8,7 +13,6 @@ use ratatui::text::{Line, Span};
 
 use super::completion;
 use super::markdown;
-use super::selection::{self, Selection};
 use crate::error::Result;
 use crate::session::Record;
 use crate::turn::{TurnEvent, TurnOutput};
@@ -107,8 +111,6 @@ pub struct App {
     pub busy: bool,
     /// A prompt typed while busy, sent when the turn finishes.
     pub pending: Option<String>,
-    /// Distance from the bottom of the transcript in lines; 0 = follow.
-    pub scroll_from_bottom: usize,
     /// Usage of the most recently completed turn, for the status line.
     pub last_usage: Option<Usage>,
     /// The complete conversation (system context first): what is passed
@@ -116,9 +118,13 @@ pub struct App {
     pub history: Vec<ChatMessage>,
     /// Active Tab-completion cycle (M7); cleared on any non-Tab key.
     pub completion: Option<CompletionState>,
-    /// Active mouse selection over the transcript, in transcript
-    /// coordinates; cleared by any key press and consumed on release.
-    pub selection: Option<Selection>,
+    /// How many leading entries are fully printed to the terminal; the
+    /// screen renderer commits final entries permanently and only rewrites
+    /// the streaming tail.
+    pub(crate) printed_entries: usize,
+    /// Committed-line count per entry index: the streaming entry may be
+    /// partially committed when it outgrows the screen (see `super::screen`).
+    pub(crate) printed: Vec<usize>,
     /// Previously submitted prompts (most recent last), for ↑/↓ recall.
     input_history: Vec<String>,
     /// Index into `input_history` while recalling; `None` = live input.
@@ -142,11 +148,11 @@ impl App {
             cursor: 0,
             busy: false,
             pending: None,
-            scroll_from_bottom: 0,
             last_usage: None,
             history: Vec::new(),
             completion: None,
-            selection: None,
+            printed_entries: 0,
+            printed: Vec::new(),
             input_history: Vec::new(),
             input_index: None,
             draft: String::new(),
@@ -217,7 +223,8 @@ impl App {
     /// caller prepends fresh system messages).
     pub fn restore(&mut self, records: &[Record]) -> Vec<ChatMessage> {
         self.entries.clear();
-        self.scroll_from_bottom = 0;
+        self.printed_entries = 0;
+        self.printed.clear();
         self.last_usage = None;
         self.open = None;
         for record in records {
@@ -315,51 +322,20 @@ impl App {
         self.completion = None;
     }
 
-    // --- mouse selection ----------------------------------------------------
+    // --- printed-line bookkeeping -------------------------------------------
 
-    /// Start selecting at a transcript point (mouse press).
-    pub fn selection_start(&mut self, line: usize, col: usize) {
-        self.selection = Some(Selection::new(line, col));
+    /// How many leading lines of entry `index` are already printed to the
+    /// terminal permanently (0 when the entry is not tracked yet).
+    pub(crate) fn printed(&self, index: usize) -> usize {
+        self.printed.get(index).copied().unwrap_or(0)
     }
 
-    /// Drag the free end of the selection.
-    pub fn selection_extend(&mut self, line: usize, col: usize) {
-        if let Some(sel) = &mut self.selection {
-            sel.extend(line, col);
+    /// Record that `count` leading lines of entry `index` are printed.
+    pub(crate) fn set_printed(&mut self, index: usize, count: usize) {
+        if self.printed.len() <= index {
+            self.printed.resize(index + 1, 0);
         }
-    }
-
-    /// Finish selecting (mouse release): extract the selected text from
-    /// the transcript wrapped at `width` and clear the state. `None` when
-    /// the selection is empty or the anchor fell past the transcript.
-    pub fn selection_take(&mut self, width: u16) -> Option<String> {
-        let sel = self.selection.take()?;
-        let lines = self.transcript_lines(width);
-        let ((start_line, start_col), (end_line, end_col)) = sel.range();
-        if start_line >= lines.len() {
-            return None;
-        }
-        let end_line = end_line.min(lines.len() - 1);
-        let mut text = String::new();
-        for (index, line) in lines
-            .iter()
-            .enumerate()
-            .skip(start_line)
-            .take(end_line - start_line + 1)
-        {
-            let (start, end) = match (index == start_line, index == end_line) {
-                (true, true) => (start_col, end_col),
-                (true, false) => (start_col, usize::MAX),
-                (false, true) => (0, end_col),
-                (false, false) => (0, usize::MAX),
-            };
-            if index > start_line {
-                text.push('\n');
-            }
-            text.push_str(&selection::text_in_columns(line, start, end));
-        }
-        let text = text.trim_end().to_string();
-        (!text.is_empty()).then_some(text)
+        self.printed[index] = count;
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -468,95 +444,119 @@ impl App {
         self.cursor = start + text.len();
     }
 
-    // --- scrolling ----------------------------------------------------------
+    // --- screen bookkeeping --------------------------------------------------
 
-    /// Clear the transcript (Ctrl+L); scroll position resets.
+    /// Clear the transcript (Ctrl+L): the screen renderer erases the visible
+    /// screen; the session file keeps every record.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.scroll_from_bottom = 0;
-    }
-
-    pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll_from_bottom += lines;
-    }
-
-    pub fn scroll_down(&mut self, lines: usize) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(lines);
+        self.printed_entries = 0;
+        self.printed = Vec::new();
     }
 
     // --- rendering ----------------------------------------------------------
 
-    /// Build the (pre-wrapped) transcript lines for a viewport `width`.
-    pub fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+    /// Index of the first entry whose display lines can still change (the
+    /// one being streamed into); everything before it is final. Equal to
+    /// `entries.len()` when nothing is streaming.
+    pub fn sealed_boundary(&self) -> usize {
+        let streaming_last = matches!(
+            (self.open, self.entries.last()),
+            (Some(OpenKind::Text), Some(Entry::Assistant(_)))
+                | (Some(OpenKind::Thinking), Some(Entry::Thinking(_)))
+        );
+        if streaming_last {
+            self.entries.len() - 1
+        } else {
+            self.entries.len()
+        }
+    }
+
+    /// Wrapped display lines for one transcript entry.
+    pub fn entry_lines(&self, index: usize, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for entry in &self.entries {
-            match entry {
-                Entry::User(text) => {
-                    let prompt = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
-                    lines.extend(markdown::wrap(
-                        &[Line::from(vec![
-                            Span::styled("❯ ", prompt),
-                            Span::styled(text.clone(), Style::new()),
-                        ])],
-                        width,
-                    ));
-                }
-                Entry::Assistant(text) => {
-                    lines.extend(markdown::wrap(&markdown::render(text, Style::new()), width));
-                    lines.push(Line::default());
-                }
-                Entry::Thinking(text) => {
-                    let base = Style::new()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC);
-                    lines.extend(markdown::wrap(&markdown::render(text, base), width));
-                    lines.push(Line::default());
-                }
-                Entry::ToolCall { name, arguments } => {
-                    lines.push(Line::from(vec![
-                        Span::styled("● ", Style::new().fg(Color::Blue)),
-                        Span::styled(name.clone(), Style::new().add_modifier(Modifier::BOLD)),
-                        Span::styled(format!(" {arguments}"), Style::new().fg(Color::DarkGray)),
-                    ]));
-                }
-                Entry::ToolResult { name, output } => {
-                    lines.push(Line::from(vec![
-                        Span::styled("  └─ ", Style::new().fg(Color::DarkGray)),
-                        Span::styled(name.clone(), Style::new().fg(Color::DarkGray)),
-                        Span::styled(": ", Style::new().fg(Color::DarkGray)),
-                        Span::styled(preview(output), Style::new().fg(Color::Gray)),
-                    ]));
-                }
-                Entry::Error(message) => {
-                    lines.push(Line::from(Span::styled(
-                        format!("✗ {message}"),
-                        Style::new().fg(Color::Red),
-                    )));
-                }
-                Entry::Info(message) => {
-                    lines.push(Line::from(Span::styled(
-                        format!("· {message}"),
-                        Style::new().fg(Color::DarkGray),
-                    )));
-                }
-                Entry::SystemPart { label, content } => {
-                    lines.push(Line::from(vec![
-                        Span::styled("◆ ", Style::new().fg(Color::Cyan)),
-                        Span::styled(
-                            label.clone(),
-                            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                    let dimmed = Style::new().fg(Color::Gray);
-                    lines.extend(markdown::wrap(
-                        &[Line::from(Span::styled(content.clone(), dimmed))],
-                        width,
-                    ));
-                    lines.push(Line::default());
-                }
+        match &self.entries[index] {
+            Entry::User(text) => {
+                let prompt = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+                lines.extend(markdown::wrap(
+                    &[Line::from(vec![
+                        Span::styled("❯ ", prompt),
+                        Span::styled(text.clone(), Style::new()),
+                    ])],
+                    width,
+                ));
+            }
+            Entry::Assistant(text) => {
+                lines.extend(markdown::wrap(&markdown::render(text, Style::new()), width));
+                lines.push(Line::default());
+            }
+            Entry::Thinking(text) => {
+                let base = Style::new()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+                lines.extend(markdown::wrap(&markdown::render(text, base), width));
+                lines.push(Line::default());
+            }
+            Entry::ToolCall { name, arguments } => {
+                lines.push(Line::from(vec![
+                    Span::styled("● ", Style::new().fg(Color::Blue)),
+                    Span::styled(name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" {arguments}"), Style::new().fg(Color::DarkGray)),
+                ]));
+            }
+            Entry::ToolResult { name, output } => {
+                lines.push(Line::from(vec![
+                    Span::styled("  └─ ", Style::new().fg(Color::DarkGray)),
+                    Span::styled(name.clone(), Style::new().fg(Color::DarkGray)),
+                    Span::styled(": ", Style::new().fg(Color::DarkGray)),
+                    Span::styled(preview(output), Style::new().fg(Color::Gray)),
+                ]));
+            }
+            Entry::Error(message) => {
+                lines.push(Line::from(Span::styled(
+                    format!("✗ {message}"),
+                    Style::new().fg(Color::Red),
+                )));
+            }
+            Entry::Info(message) => {
+                lines.push(Line::from(Span::styled(
+                    format!("· {message}"),
+                    Style::new().fg(Color::DarkGray),
+                )));
+            }
+            Entry::SystemPart { label, content } => {
+                lines.push(Line::from(vec![
+                    Span::styled("◆ ", Style::new().fg(Color::Cyan)),
+                    Span::styled(
+                        label.clone(),
+                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                let dimmed = Style::new().fg(Color::Gray);
+                lines.extend(markdown::wrap(
+                    &[Line::from(Span::styled(content.clone(), dimmed))],
+                    width,
+                ));
+                lines.push(Line::default());
             }
         }
         lines
+    }
+
+    /// Wrapped display lines for entries `start..`.
+    #[cfg(test)]
+    pub fn lines_from(&self, start: usize, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for index in start..self.entries.len() {
+            lines.extend(self.entry_lines(index, width));
+        }
+        lines
+    }
+
+    /// Build the (pre-wrapped) transcript lines for a viewport `width`.
+    #[cfg(test)]
+    pub fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.lines_from(0, width)
     }
 }
 
@@ -777,24 +777,43 @@ mod tests {
     }
 
     #[test]
-    fn scroll_tracks_distance_from_bottom() {
+    fn clear_empties_the_transcript_and_print_bookkeeping() {
         let mut app = App::new();
-        app.scroll_up(3);
-        assert_eq!(app.scroll_from_bottom, 3);
-        app.scroll_down(1);
-        assert_eq!(app.scroll_from_bottom, 2);
-        app.scroll_down(5);
-        assert_eq!(app.scroll_from_bottom, 0);
+        app.push_user("hi");
+        app.set_printed(0, 3);
+        app.printed_entries = 1;
+        app.clear();
+        assert!(app.entries.is_empty());
+        assert_eq!(app.printed_entries, 0);
+        assert_eq!(app.printed(0), 0);
     }
 
     #[test]
-    fn clear_empties_the_transcript() {
+    fn sealed_boundary_tracks_the_streaming_entry() {
         let mut app = App::new();
+        assert_eq!(app.sealed_boundary(), 0, "empty transcript is all sealed");
+
         app.push_user("hi");
-        app.scroll_up(5);
-        app.clear();
-        assert!(app.entries.is_empty());
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert_eq!(app.sealed_boundary(), 1, "final entries are sealed");
+
+        app.on_turn_event(TurnEvent::Text {
+            delta: "streaming".into(),
+        });
+        assert_eq!(app.sealed_boundary(), 1, "the open entry stays unsealed");
+
+        app.on_turn_event(TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: "{}".into(),
+        });
+        assert_eq!(app.sealed_boundary(), 3, "closing the stream seals it");
+
+        // An info note pushed mid-stream seals the streaming entry too.
+        app.on_turn_event(TurnEvent::Text {
+            delta: "more".into(),
+        });
+        assert_eq!(app.sealed_boundary(), 3);
+        app.entries.push(Entry::Info("note".into()));
+        assert_eq!(app.sealed_boundary(), 5, "everything is final again");
     }
 
     #[test]
@@ -966,36 +985,6 @@ mod tests {
         assert_eq!(app.input, "two");
         app.history_up();
         assert_eq!(app.input, "one");
-    }
-
-    #[test]
-    fn selection_take_extracts_the_selected_text() {
-        let mut app = App::new();
-        app.push_user("hello world");
-        app.entries.push(Entry::Assistant("alpha beta".into()));
-
-        // Transcript lines: 0 = "❯ hello world", 1 = "alpha beta",
-        // 2 = blank (assistant entries end with a blank line).
-
-        // Single line, middle columns: `world` spans columns 8..13.
-        app.selection_start(0, 8);
-        app.selection_extend(0, 13);
-        assert_eq!(app.selection_take(80).as_deref(), Some("world"));
-
-        // Backwards drag across two lines: end of line 0 down to `alpha`.
-        app.selection_start(1, 5);
-        app.selection_extend(0, 8);
-        assert_eq!(app.selection_take(80).as_deref(), Some("world\nalpha"));
-
-        // A click without a drag selects nothing.
-        app.selection_start(0, 3);
-        app.selection_extend(0, 3);
-        assert_eq!(app.selection_take(80), None);
-
-        // An anchor past the transcript selects nothing.
-        app.selection_start(50, 0);
-        app.selection_extend(50, 5);
-        assert_eq!(app.selection_take(80), None);
     }
 
     #[test]

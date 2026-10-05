@@ -1,11 +1,13 @@
-//! Skills (M6): reference material loaded into the conversation context.
+//! Skills (M6): reference material, listed in the system prompt but only
+//! read into the conversation on demand.
 //!
 //! A skill is discovered in a scope's `skills/` directory, either as a
 //! plain markdown file (`skills/<name>.md`) or as a directory with a
 //! `SKILL.md` inside (`skills/<name>/SKILL.md`). The name is the file stem
-//! or directory name; the trimmed body is the content. Skills are injected
-//! as system messages (see [`crate::context`]) under a `# Skill: <name>`
-//! heading.
+//! or directory name; an optional YAML front matter block may carry a
+//! `description:`. Context assembly (see [`crate::context`]) injects a
+//! single listing of `name`, `description`, and `filepath` — never the
+//! body — so the agent can decide which file to read when a task matches.
 //!
 //! Two scopes are read, user first, then project; on a name clash the
 //! project scope shadows the user scope (same precedence as settings:
@@ -13,15 +15,19 @@
 //! deterministic.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config;
 
 /// One skill: `name` is the stem of `skills/<name>.md` (or the directory
-/// name of `skills/<name>/SKILL.md`), `content` the trimmed body.
+/// name of `skills/<name>/SKILL.md`), `description` the front matter
+/// description (empty if none), `path` the skill file, `content` the
+/// trimmed body (front matter stripped).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Skill {
     pub name: String,
+    pub description: String,
+    pub path: PathBuf,
     pub content: String,
 }
 
@@ -76,16 +82,41 @@ fn read_scope(scope: &Path) -> Vec<Skill> {
 }
 
 /// Read one skill file and turn it into a [`Skill`] if usable; empty
-/// bodies are skipped.
+/// files are skipped.
 fn read_file(path: &Path, name: &str) -> Option<Skill> {
     let content = std::fs::read_to_string(path).ok()?.trim().to_string();
     if content.is_empty() {
         return None;
     }
+    let (description, content) = split_front_matter(&content);
     Some(Skill {
         name: name.to_string(),
+        description,
+        path: path.to_path_buf(),
         content,
     })
+}
+
+/// Split an optional YAML front matter block (first line `---`, terminated
+/// by a later `---` line) from the body, extracting the `description:`
+/// value. Without usable front matter the body is returned unchanged with
+/// an empty description.
+fn split_front_matter(text: &str) -> (String, String) {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.first() != Some(&"---") {
+        return (String::new(), text.to_string());
+    }
+    let Some(end) = lines.iter().skip(1).position(|line| line.trim() == "---") else {
+        return (String::new(), text.to_string());
+    };
+    let front: Vec<&str> = lines[1..1 + end].to_vec();
+    let body = lines[1 + end + 1..].join("\n").trim().to_string();
+    let description = front
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("description:"))
+        .map(|value| value.trim().trim_matches('"').trim_matches('\'').to_string())
+        .unwrap_or_default();
+    (description, body)
 }
 
 #[cfg(test)]
@@ -127,9 +158,38 @@ mod tests {
         );
         found.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(found[0].name, "review");
+        assert_eq!(found[0].description, "");
+        assert_eq!(found[0].path, skills.join("review.md"));
         assert_eq!(found[0].content, "Review carefully.");
         assert_eq!(found[1].name, "rust-style");
+        assert_eq!(found[1].path, skills.join("rust-style/SKILL.md"));
         assert_eq!(found[1].content, "Use rustfmt.");
+        fs::remove_dir_all(project).ok();
+    }
+
+    #[test]
+    fn front_matter_description_is_extracted() {
+        let project = temp_dir("frontmatter");
+        let skills = project.join(config::SKILLS_DIR);
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(
+            skills.join("web-search.md"),
+            "---\ndescription: How to search the web.\n---\n\nSteps here.\n",
+        )
+        .unwrap();
+        fs::write(
+            skills.join("broken.md"),
+            "---\ndescription: unterminated block stays in body\n",
+        )
+        .unwrap();
+
+        let found = skills_in(std::slice::from_ref(&project));
+        let search = found.iter().find(|s| s.name == "web-search").unwrap();
+        assert_eq!(search.description, "How to search the web.");
+        assert_eq!(search.content, "Steps here.");
+        let broken = found.iter().find(|s| s.name == "broken").unwrap();
+        assert_eq!(broken.description, "");
+        assert!(broken.content.contains("unterminated"));
         fs::remove_dir_all(project).ok();
     }
 

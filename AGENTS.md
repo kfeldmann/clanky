@@ -1,6 +1,6 @@
 # Clanky - an AI coding agent/harness
 
-- milestones.md - The project plan (882 words)
+- milestones.md - The project plan (985 words)
 - provider-protocol.md - Provider protocol spec (1278 words)
 - plan.md - the original requirements brainstorm (242 words)
 

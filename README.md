@@ -75,6 +75,12 @@ Notes:
 Sessions always live in the **project scope** (`./.clanky/sessions/`);
 there is no user-scope session store.
 
+The transcript is printed straight to the terminal — no alternate
+screen, no mouse capture — so scrolling and copy/paste are your
+terminal's own (native scrollbar or wheel, native text selection), and
+the conversation stays in the terminal after clanky quits. `ctrl+l`
+erases the visible screen (scrollback is kept).
+
 ## TUI keys
 
 | Key | Action |
@@ -84,9 +90,9 @@ there is no user-scope session store.
 | `Tab` | complete the file path at the caret: longest common prefix first, further `Tab` presses cycle candidates |
 | `ctrl+e` | edit the prompt buffer in `$EDITOR` (the TUI suspends; an emptied buffer clears the input) |
 | `ctrl+c` / `ctrl+d` / `Esc` | quit |
-| `ctrl+l` | clear the transcript |
-| `PgUp`/`PgDn`, mouse wheel | scroll |
-| left-button drag | select transcript text (highlighted); release copies it to the clipboard via OSC 52 — terminals that support it also let you hold `Shift` for the native selection |
+| `ctrl+l` | clear the visible screen |
+| mouse wheel, scrollbar | scroll (native terminal scrolling) |
+| text selection | copy/paste (native terminal selection) |
 | `/` (empty input) | command palette |
 | `/system` | show the assembled system prompt (context files and skills, as sent to the model) |
 
