@@ -100,6 +100,8 @@ fn config() -> TurnConfig {
         sampling: None,
         thinking: None,
         max_tool_rounds: None,
+        max_retries: Some(0),
+        retry_sleep: Some(|_| {}),
     }
 }
 

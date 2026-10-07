@@ -1,5 +1,7 @@
 # Clanky - an AI coding agent/harness
 
+The clanky project is in `/work`.
+
 - milestones.md - The project plan (985 words)
 - provider-protocol.md - Provider protocol spec (1278 words)
 - plan.md - the original requirements brainstorm (242 words)

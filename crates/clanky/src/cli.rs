@@ -36,6 +36,12 @@ pub struct Cli {
     #[arg(long)]
     pub max_tool_rounds: Option<usize>,
 
+    /// Retries for a retryable provider error (rate limits, backend
+    /// errors, network timeouts), overriding the settings; 0 disables
+    /// retrying. Retries use exponential backoff (500 ms, 1 s, 2 s, …).
+    #[arg(long)]
+    pub max_retries: Option<u32>,
+
     /// Resume a saved session (interactive mode only). With a NAME, load
     /// it directly; without, show a picker of saved sessions.
     #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
@@ -62,6 +68,7 @@ impl Cli {
             thinking: self.thinking.clone(),
             sampling: self.sampling.clone(),
             max_tool_rounds: self.max_tool_rounds,
+            max_retries: self.max_retries,
             prompt,
         }
     }

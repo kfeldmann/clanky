@@ -49,6 +49,8 @@ All fields are optional; unknown keys are rejected with a parse error.
 | `model`    | string           | Model identifier as known to the provider          |
 | `thinking` | string           | Thinking budget or level (`1024`, `low`, `off`)    |
 | `sampling` | table of strings | Sampling parameters, e.g. `temperature = "0.7"`    |
+| `max_tool_rounds` | integer  | Cap on chat rounds per turn (`0` = unlimited)       |
+| `max_retries` | integer       | Retries for a retryable provider error (`0` = never retry; default `5`) |
 | `prompt`   | string           | Prompt text (mainly useful on the CLI, not in a file) |
 
 Example:
@@ -67,6 +69,13 @@ Notes:
 
 - Sampling values stay strings in the file; the provider validates and
   coerces them, so an invalid value fails at call time, not load time.
+- `max_retries` covers transient provider failures — rate limits (429
+  `Model busy`), backend errors, and network timeouts. Retries use
+  exponential backoff (500 ms, 1 s, 2 s, 4 s, 8 s), honoring a server
+  `Retry-After` when it asks for longer, and are shown in the transcript
+  (TUI) or on stderr (pipe mode). A round that already streamed content is
+  never replayed, so a retry cannot duplicate output. Set it on the CLI
+  with `--max-retries`.
 - Precedence is per field: CLI flag > project file > user file, and a
   scope only overrides fields it actually sets.
 

@@ -246,6 +246,21 @@ impl App {
                 // live values switch to billed-only until new content lands.
                 self.estimate_reset();
             }
+            // The retry notice is informational: it closes the open block
+            // so the replayed round does not append to a half-written
+            // answer, and shows the pause in the transcript.
+            TurnEvent::Retrying {
+                attempt,
+                max_retries,
+                delay,
+                message,
+            } => {
+                self.open = None;
+                self.entries.push(Entry::Info(format!(
+                    "↻ {message} — retrying in {:.1}s ({attempt}/{max_retries})",
+                    delay.as_secs_f64()
+                )));
+            }
         }
     }
 
@@ -805,6 +820,32 @@ mod tests {
                 Entry::Assistant("done".into()),
             ]
         );
+    }
+
+    #[test]
+    fn retry_notice_closes_the_block_and_is_informational() {
+        use std::time::Duration;
+        let mut app = App::new();
+        app.on_turn_event(TurnEvent::Text {
+            delta: "par".into(),
+        });
+        // A retry notice must not append to the half-written block, and it
+        // shows as an info line rather than an error.
+        app.on_turn_event(TurnEvent::Retrying {
+            attempt: 2,
+            max_retries: 5,
+            delay: Duration::from_secs(2),
+            message: "rateLimit: 429: Model busy".into(),
+        });
+        match app.entries.last() {
+            Some(Entry::Info(text)) => {
+                assert!(text.contains("429: Model busy"), "{text}");
+                assert!(text.contains("2/5"), "{text}");
+                assert!(text.contains("2.0s"), "{text}");
+            }
+            other => panic!("expected an info entry, got {other:?}"),
+        }
+        assert!(app.open.is_none());
     }
 
     #[test]

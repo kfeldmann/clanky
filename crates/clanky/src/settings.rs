@@ -34,6 +34,10 @@ pub struct Settings {
     /// Tool-loop round cap for one turn (`0` = unlimited). Unset means the
     /// built-in default.
     pub max_tool_rounds: Option<usize>,
+    /// Retries for a retryable provider error (`rateLimit`, `backend`,
+    /// network timeouts) before a turn gives up (`0` = never retry).
+    /// Unset means the built-in default.
+    pub max_retries: Option<u32>,
     /// Prompt, when supplied on the command line.
     pub prompt: Option<String>,
 }
@@ -96,6 +100,9 @@ impl Settings {
         }
         if over.max_tool_rounds.is_some() {
             self.max_tool_rounds = over.max_tool_rounds;
+        }
+        if over.max_retries.is_some() {
+            self.max_retries = over.max_retries;
         }
         if over.prompt.is_some() {
             self.prompt = over.prompt;

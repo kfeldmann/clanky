@@ -115,6 +115,19 @@ fn print_event(event: TurnEvent) {
         TurnEvent::Round { .. } => {}
         // Pipe mode prints no token counters.
         TurnEvent::Usage { .. } => {}
+        // Retries go to stderr, keeping stdout a clean stream of the
+        // answer; without this the turn would look hung during backoff.
+        TurnEvent::Retrying {
+            attempt,
+            max_retries,
+            delay,
+            message,
+        } => {
+            eprintln!(
+                "  ↻ {message} — retrying in {:.1}s ({attempt}/{max_retries})",
+                delay.as_secs_f64()
+            );
+        }
         TurnEvent::ToolCall { name, arguments } => {
             eprintln!("\n● {name} {arguments}");
         }

@@ -187,7 +187,14 @@ Plugin → client:
 
 - `code` is one of: `auth` | `rateLimit` | `invalidRequest` | `backend` |
   `protocol` | `protocolVersion` | `internal`. `retryable` is a hint;
-  `retryAfterMs` (optional, on `rateLimit`) may refine it.
+  `retryAfterMs` (optional, on `rateLimit`) may refine it. The client acts
+  on the hint: a `retryable` request-scoped error is retried (default 5
+  attempts, exponential backoff, honoring `retryAfterMs`), so providers
+  should set it for transient conditions (`rateLimit`, `backend` — network
+  timeouts included) and leave it `false` for `auth`/`invalidRequest`. A
+  retry replays the whole request, so it is only attempted while the round
+  has streamed nothing yet (otherwise a partial answer would be
+  duplicated).
 - `error` responds to a request (carries its `id`/`requestId`) or aborts an
   in-flight stream (carries `requestId`, terminal — no `done` follows).
 - An `error` with **no** `requestId` is connection-fatal: the plugin is telling

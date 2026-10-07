@@ -90,6 +90,9 @@ pub struct Launch {
     pub thinking: Option<String>,
     /// Tool-loop round cap (`None` = default, `Some(0)` = unlimited).
     pub max_tool_rounds: Option<usize>,
+    /// Retry budget for retryable provider errors (`None` = default,
+    /// `Some(0)` = never retry).
+    pub max_retries: Option<u32>,
     /// Prompt from the command line, sent as the first chat message.
     pub initial_prompt: Option<String>,
     /// `--resume NAME` loads that session; `--resume` (empty string) opens
@@ -110,6 +113,7 @@ impl Launch {
             sampling: settings.sampling.clone(),
             thinking: settings.thinking.clone(),
             max_tool_rounds: settings.max_tool_rounds,
+            max_retries: settings.max_retries,
             initial_prompt: settings
                 .prompt
                 .as_deref()
@@ -233,6 +237,8 @@ fn spawn_turn(history: Vec<ChatMessage>, launch: &Launch, prompt: String, tx: Se
                     sampling: launch.sampling.clone(),
                     thinking: launch.thinking.clone(),
                     max_tool_rounds: launch.max_tool_rounds,
+                    max_retries: launch.max_retries,
+                    retry_sleep: None,
                 };
                 crate::turn::run_turn(
                     handler,
@@ -795,7 +801,12 @@ fn record_turn_event(state: &mut SessionState, app: &mut app::App, event: &TurnE
         TurnEvent::Usage { usage } => {
             state.record(app, session::usage_record(*usage));
         }
-        TurnEvent::Text { .. } | TurnEvent::Thinking { .. } | TurnEvent::ToolCall { .. } => {}
+        // Retry notices are UI-only: they are not conversation content,
+        // so nothing is recorded in the session file.
+        TurnEvent::Text { .. }
+        | TurnEvent::Thinking { .. }
+        | TurnEvent::ToolCall { .. }
+        | TurnEvent::Retrying { .. } => {}
     }
 }
 

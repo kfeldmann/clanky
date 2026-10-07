@@ -110,6 +110,11 @@ Architectural decisions already made:
 - TUI quality-of-life: `↑`/`↓` prompt recall, `/system` (view the assembled
   system prompt); fix: fresh TUI sessions now seed the system context like
   pipe mode
+- Provider retries: retryable errors (`rateLimit`, `backend` — network
+  timeouts included) are retried up to `max_retries` (default 5) with
+  exponential backoff (500 ms … 30 s cap), honoring `Retry-After`; a retry
+  is surfaced in the transcript (TUI) or on stderr (pipe), and a round that
+  already streamed content is never replayed
 - TUI reworked to linear terminal output: the transcript is printed straight
   to the normal buffer (no alternate screen, no mouse capture), so native
   scrolling and selection work and history persists after quitting; replaced

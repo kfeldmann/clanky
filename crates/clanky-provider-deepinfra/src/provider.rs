@@ -898,6 +898,30 @@ mod tests {
     }
 
     #[test]
+    fn transport_timeouts_are_retryable_backend_errors() {
+        // A network timeout/reset reaches the backend as a status-less
+        // error (ureq reports "timed out reading response" with no HTTP
+        // status). It must map to a *retryable* `backend` error so the
+        // agentic loop can retry it rather than aborting the turn.
+        let mut provider =
+            DeepInfraProvider::new(MockBackend::new(Vec::new(), "[]"), "https://x.invalid");
+        provider.backend.fail = Some(BackendError::new(None, "timed out reading response"));
+        match provider.chat(&simple_request(), &mut |_| {}).unwrap_err() {
+            Error::Provider {
+                code,
+                message,
+                retryable,
+                ..
+            } => {
+                assert_eq!(code, ErrorCode::Backend);
+                assert!(message.contains("timed out reading response"), "{message}");
+                assert!(retryable, "a network timeout must be retryable");
+            }
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
     fn list_models_parses_catalog() {
         let catalog = serde_json::json!({
             "object": "list",

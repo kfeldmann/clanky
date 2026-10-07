@@ -7,9 +7,11 @@
 //! deltas and tool activity are surfaced to the caller as [`TurnEvent`]s;
 //! in `-p` mode they are printed, in M3 the TUI will render them.
 
+use std::time::Duration;
+
 use clanky_protocol::{
-    ChatMessage, ChatRequest, ChunkPayload, FinishReason, Handler, LoopbackTransport, Sampling,
-    StreamAssembler, Thinking, ToolCall, Usage,
+    ChatMessage, ChatRequest, ChunkPayload, Error as ProtocolError, FinishReason, Handler,
+    LoopbackTransport, Sampling, StreamAssembler, Thinking, ToolCall, Usage,
 };
 
 use crate::error::{Error, Result};
@@ -25,7 +27,21 @@ use crate::tools::ToolSet;
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 0;
 
 /// Per-turn configuration taken from settings/CLI.
-#[derive(Debug, Default, Clone, PartialEq)]
+/// Retries for a retryable provider failure (rate limits, backend
+/// hiccups, network timeouts) before a turn gives up. `0` disables
+/// retrying. DeepInfra intermittently answers 429 `Model busy` or times
+/// out mid-stream; a handful of retries with growing backoff usually
+/// rides that out without bothering the user.
+pub const DEFAULT_MAX_RETRIES: u32 = 5;
+
+/// First backoff delay; each subsequent retry doubles it
+/// (500 ms, 1 s, 2 s, 4 s, 8 s …), capped at [`MAX_RETRY_DELAY`].
+pub const BASE_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Ceiling for one backoff delay, so a long retry chain stays bounded.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default, Clone)]
 pub struct TurnConfig {
     pub model: Option<String>,
     pub sampling: Option<SamplingParams>,
@@ -33,6 +49,13 @@ pub struct TurnConfig {
     /// Cap on chat rounds per turn; `None` uses [`DEFAULT_MAX_TOOL_ROUNDS`],
     /// `Some(0)` means unlimited.
     pub max_tool_rounds: Option<usize>,
+    /// Retry budget for retryable provider errors; `None` uses
+    /// [`DEFAULT_MAX_RETRIES`], `Some(0)` disables retrying.
+    pub max_retries: Option<u32>,
+    /// Sleep hook used between retries; `None` means `std::thread::sleep`.
+    /// Exists so tests exercise backoff without actually waiting.
+    #[doc(hidden)]
+    pub retry_sleep: Option<fn(Duration)>,
 }
 
 impl TurnConfig {
@@ -48,6 +71,8 @@ impl TurnConfig {
             sampling: settings.sampling.clone(),
             thinking: settings.thinking.clone(),
             max_tool_rounds: settings.max_tool_rounds,
+            max_retries: settings.max_retries,
+            retry_sleep: None,
         }
     }
 }
@@ -78,6 +103,16 @@ pub enum TurnEvent {
     /// intermediate tool-call rounds of a multi-round turn — instead of
     /// only the turn's last one.
     Usage { usage: Usage },
+    /// A retryable provider failure is being retried after `delay`. Lets
+    /// the UI show that the turn is paused on purpose instead of looking
+    /// hung or dead. `attempt` counts from 1 for the first retry;
+    /// `max_retries` is the configured budget.
+    Retrying {
+        attempt: u32,
+        max_retries: u32,
+        delay: Duration,
+        message: String,
+    },
 }
 
 /// The outcome of one turn.
@@ -127,32 +162,64 @@ pub fn run_turn(
             return Err(Error::ToolLoopLimit(max_rounds));
         }
         round += 1;
-        let mut assembler = StreamAssembler::default();
-        let done = {
-            let mut on_chunk = |payload: &ChunkPayload| {
-                match &payload {
-                    ChunkPayload::Text { text } => {
-                        on_event(TurnEvent::Text {
-                            delta: text.clone(),
+        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
+        let request = ChatRequest {
+            model: model.clone(),
+            messages: messages.clone(),
+            tools: wire_tools.clone(),
+            sampling,
+            thinking,
+        };
+        // One chat round, retried on retryable provider failures. The
+        // stream is replayed from scratch on every attempt, so a retry is
+        // only allowed while nothing has been streamed yet: once text or a
+        // tool call reached the caller, replaying would duplicate it. A
+        // mid-stream timeout therefore only retries when it hit before the
+        // first chunk — the common case for DeepInfra's `Model busy` 429s
+        // and connect/read timeouts.
+        let (assembler, done) = {
+            let mut attempt: u32 = 0;
+            loop {
+                let mut assembler = StreamAssembler::default();
+                let mut streamed = false;
+                let outcome = {
+                    let mut on_chunk = |payload: &ChunkPayload| {
+                        match &payload {
+                            ChunkPayload::Text { text } => {
+                                on_event(TurnEvent::Text {
+                                    delta: text.clone(),
+                                });
+                            }
+                            ChunkPayload::Thinking { text } => {
+                                on_event(TurnEvent::Thinking {
+                                    delta: text.clone(),
+                                });
+                            }
+                            _ => {}
+                        }
+                        streamed = true;
+                        assembler.ingest(payload);
+                    };
+                    client.chat(request.clone(), &mut on_chunk)
+                };
+                match outcome {
+                    Ok(done) => break (assembler, done),
+                    Err(err) => {
+                        if !is_retryable(&err) || streamed || attempt >= max_retries {
+                            return Err(err.into());
+                        }
+                        attempt += 1;
+                        let delay = retry_delay(attempt, retry_after(&err));
+                        on_event(TurnEvent::Retrying {
+                            attempt,
+                            max_retries,
+                            delay,
+                            message: err.to_string(),
                         });
+                        (config.retry_sleep.unwrap_or(std::thread::sleep))(delay);
                     }
-                    ChunkPayload::Thinking { text } => {
-                        on_event(TurnEvent::Thinking {
-                            delta: text.clone(),
-                        });
-                    }
-                    _ => {}
                 }
-                assembler.ingest(payload);
-            };
-            let request = ChatRequest {
-                model: model.clone(),
-                messages: messages.clone(),
-                tools: wire_tools.clone(),
-                sampling,
-                thinking,
-            };
-            client.chat(request, &mut on_chunk)?
+            }
         };
 
         let round_text = assembler.text().to_string();
@@ -197,6 +264,46 @@ pub fn run_turn(
             let output = execute_tool_call(tools, call, on_event);
             messages.push(ChatMessage::tool(call.id.clone(), output));
         }
+    }
+}
+
+/// Is this failure worth retrying? Only request-scoped provider errors
+/// carry the provider's `retryable` hint (`rateLimit`, `backend` — which
+/// includes network timeouts). Transport/protocol failures are structural
+/// and surface immediately.
+fn is_retryable(err: &ProtocolError) -> bool {
+    matches!(
+        err,
+        ProtocolError::Provider {
+            retryable: true,
+            ..
+        }
+    )
+}
+
+/// The server's own retry hint (e.g. `Retry-After` on a rate limit), if any.
+fn retry_after(err: &ProtocolError) -> Option<Duration> {
+    match err {
+        ProtocolError::Provider {
+            retry_after_ms: Some(ms),
+            ..
+        } => Some(Duration::from_millis(*ms)),
+        _ => None,
+    }
+}
+
+/// Backoff for retry `attempt` (1-based): exponential from
+/// [`BASE_RETRY_DELAY`] (500 ms, 1 s, 2 s, 4 s, 8 s …), clamped to
+/// [`MAX_RETRY_DELAY`]. A longer server hint wins (also clamped), so a
+/// `Retry-After` never has us knocking sooner than the backoff would.
+fn retry_delay(attempt: u32, hint: Option<Duration>) -> Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    let backoff = BASE_RETRY_DELAY
+        .saturating_mul(1u32 << shift)
+        .min(MAX_RETRY_DELAY);
+    match hint {
+        Some(hint) if hint > backoff => hint.min(MAX_RETRY_DELAY),
+        _ => backoff,
     }
 }
 
@@ -319,6 +426,9 @@ mod tests {
         requests: RefCell<Vec<ChatRequest>>,
         script: RefCell<VecDeque<ScriptedTurn>>,
         fail_with: Option<clanky_protocol::Error>,
+        /// Errors handed out one per `chat` call before the script is
+        /// touched; models transient failures that succeed on retry.
+        transient: VecDeque<clanky_protocol::Error>,
         /// Returned instead of panicking once the script runs dry; lets
         /// tests probe behaviour beyond the last scripted round.
         exhausted: Option<clanky_protocol::Error>,
@@ -378,6 +488,7 @@ mod tests {
                 requests: RefCell::new(Vec::new()),
                 script: RefCell::new(turns.into()),
                 fail_with: None,
+                transient: VecDeque::new(),
                 exhausted: None,
                 caps: Capabilities {
                     list_models: true,
@@ -398,11 +509,39 @@ mod tests {
             handler
         }
 
+        /// Clone a stored failure so an always-failing mock can hand it
+        /// out on every call (the protocol `Error` is not `Clone`).
+        fn reissue(err: &clanky_protocol::Error) -> clanky_protocol::Error {
+            match err {
+                clanky_protocol::Error::Provider {
+                    code,
+                    message,
+                    retryable,
+                    retry_after_ms,
+                } => clanky_protocol::Error::Provider {
+                    code: *code,
+                    message: message.clone(),
+                    retryable: *retryable,
+                    retry_after_ms: *retry_after_ms,
+                },
+                other => panic!("mock exhausted error must be a provider error, got {other}"),
+            }
+        }
+
+        /// Fails with each of `errors` once, in order, then plays the
+        /// script. Records every request it sees, including failed tries.
+        fn flaky(errors: Vec<clanky_protocol::Error>, turns: Vec<ScriptedTurn>) -> Self {
+            let mut handler = Self::scripted(turns);
+            handler.transient = errors.into();
+            handler
+        }
+
         fn failing(err: clanky_protocol::Error) -> Self {
             Self {
                 requests: RefCell::new(Vec::new()),
                 script: RefCell::new(VecDeque::new()),
                 fail_with: Some(err),
+                transient: VecDeque::new(),
                 exhausted: None,
                 caps: Capabilities {
                     list_models: true,
@@ -442,9 +581,15 @@ mod tests {
                 return Err(err);
             }
             self.requests.borrow_mut().push(request.clone());
+            if let Some(err) = self.transient.pop_front() {
+                return Err(err);
+            }
             let turn = match self.script.borrow_mut().pop_front() {
                 Some(turn) => turn,
-                None => return Err(self.exhausted.take().expect("mock script exhausted")),
+                None => {
+                    let err = self.exhausted.as_ref().expect("mock script exhausted");
+                    return Err(Self::reissue(err));
+                }
             };
             for chunk in turn.chunks {
                 sink(chunk);
@@ -496,6 +641,8 @@ mod tests {
             sampling: None,
             thinking: None,
             max_tool_rounds: None,
+            max_retries: Some(0),
+            retry_sleep: Some(|_| {}),
         }
     }
 
@@ -922,6 +1069,192 @@ mod tests {
         assert!(
             err.to_string().contains("invalid --thinking"),
             "unexpected: {err}"
+        );
+    }
+
+    // --- retries ------------------------------------------------------------
+
+    fn retryable(message: &str) -> clanky_protocol::Error {
+        clanky_protocol::Error::Provider {
+            code: ErrorCode::RateLimit,
+            message: message.into(),
+            retryable: true,
+            retry_after_ms: None,
+        }
+    }
+
+    #[test]
+    fn retryable_errors_are_retried_until_they_succeed() {
+        // Two "Model busy" 429s, then the real answer.
+        let handler = Box::new(MockHandler::flaky(
+            vec![retryable("429: Model busy"), retryable("429: Model busy")],
+            vec![text_turn("hi there")],
+        ));
+        let cfg = TurnConfig {
+            max_retries: Some(5),
+            ..config("mock/model")
+        };
+        let (output, sink) = run(handler, &toolset(), vec![], "hi", &cfg);
+        assert_eq!(output.unwrap().text, "hi there");
+        let events = sink.into_inner();
+        let retries: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                TurnEvent::Retrying {
+                    attempt,
+                    max_retries,
+                    delay,
+                    ..
+                } => Some((*attempt, *max_retries, *delay)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            retries,
+            vec![
+                (1, 5, Duration::from_millis(500)),
+                (2, 5, Duration::from_millis(1000)),
+            ]
+        );
+        // The stream is replayed from scratch, so the text appears once.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, TurnEvent::Text { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn retries_are_capped_and_the_error_surfaces() {
+        // Always failing: the turn retries exactly `max_retries` times
+        // and then gives up with the provider's message.
+        let handler = Box::new(MockHandler::scripted_then_exhausted(
+            vec![],
+            retryable("429: Model busy"),
+        ));
+        let cfg = TurnConfig {
+            max_retries: Some(2),
+            ..config("mock/model")
+        };
+        let (output, sink) = run(handler, &toolset(), vec![], "hi", &cfg);
+        let err = output.unwrap_err();
+        assert!(err.to_string().contains("429: Model busy"), "{err}");
+        assert_eq!(
+            sink.into_inner()
+                .iter()
+                .filter(|e| matches!(e, TurnEvent::Retrying { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn non_retryable_errors_are_not_retried() {
+        let handler = Box::new(MockHandler::failing(clanky_protocol::Error::provider(
+            ErrorCode::Auth,
+            "401: invalid API key",
+            false,
+        )));
+        let cfg = TurnConfig {
+            max_retries: Some(5),
+            ..config("mock/model")
+        };
+        let (output, sink) = run(handler, &toolset(), vec![], "hi", &cfg);
+        assert!(output.is_err());
+        assert!(
+            !sink
+                .into_inner()
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Retrying { .. })),
+            "a non-retryable error must surface immediately"
+        );
+    }
+
+    #[test]
+    fn max_retries_zero_disables_retrying() {
+        let handler = Box::new(MockHandler::failing(retryable("429: busy")));
+        let cfg = TurnConfig {
+            max_retries: Some(0),
+            ..config("mock/model")
+        };
+        let (output, sink) = run(handler, &toolset(), vec![], "hi", &cfg);
+        assert!(output.is_err());
+        assert!(
+            !sink
+                .into_inner()
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Retrying { .. }))
+        );
+    }
+
+    #[test]
+    fn a_mid_stream_failure_is_not_replayed() {
+        // The round streams text, then the provider dies before `done`.
+        // Retrying would duplicate the text, so the error surfaces.
+        struct HalfStream;
+        impl Handler for HalfStream {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "half".into(),
+                    capabilities: Capabilities::default(),
+                }
+            }
+            fn list_models(
+                &mut self,
+            ) -> std::result::Result<Vec<ModelInfo>, clanky_protocol::Error> {
+                Ok(vec![])
+            }
+            fn chat(
+                &mut self,
+                _request: &ChatRequest,
+                sink: &mut dyn FnMut(ChunkPayload),
+            ) -> std::result::Result<ChatDone, clanky_protocol::Error> {
+                sink(ChunkPayload::Text {
+                    text: "partial".into(),
+                });
+                Err(retryable("backend: timed out reading response"))
+            }
+        }
+        let cfg = TurnConfig {
+            max_retries: Some(5),
+            ..config("mock/model")
+        };
+        let (output, sink) = run(Box::new(HalfStream), &toolset(), vec![], "hi", &cfg);
+        assert!(output.is_err());
+        let events = sink.into_inner();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, TurnEvent::Text { .. }))
+                .count(),
+            1,
+            "partial text must not be replayed"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Retrying { .. }))
+        );
+    }
+
+    #[test]
+    fn retry_delay_grows_exponentially_and_honours_hints() {
+        assert_eq!(retry_delay(1, None), Duration::from_millis(500));
+        assert_eq!(retry_delay(2, None), Duration::from_millis(1000));
+        assert_eq!(retry_delay(3, None), Duration::from_millis(2000));
+        assert_eq!(retry_delay(5, None), Duration::from_millis(8000));
+        // Clamped, so a long chain never waits absurdly long.
+        assert_eq!(retry_delay(20, None), MAX_RETRY_DELAY);
+        // A longer server hint wins; a shorter one does not undercut us.
+        assert_eq!(
+            retry_delay(1, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            retry_delay(3, Some(Duration::from_millis(100))),
+            Duration::from_millis(2000)
         );
     }
 }
