@@ -129,7 +129,11 @@ fn print_event(event: TurnEvent) {
             );
         }
         TurnEvent::ToolCall { name, arguments } => {
-            eprintln!("\n● {name} {arguments}");
+            let preview = clanky::tools::truncate_call_arguments(
+                &arguments,
+                clanky::tools::CALL_PREVIEW_CHARS,
+            );
+            eprintln!("\n● {name} {preview}");
         }
         TurnEvent::ToolResult { name, output } => {
             let preview = clanky::tools::truncate_for_display(&output, 4_000);

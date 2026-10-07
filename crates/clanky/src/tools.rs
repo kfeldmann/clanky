@@ -263,6 +263,80 @@ pub fn truncate_for_display(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Character budget for displaying tool-call arguments (transcript and
+/// stderr); the full arguments always reach the model.
+pub const CALL_PREVIEW_CHARS: usize = 600;
+
+/// Shorten tool-call arguments for display (transcript and stderr).
+/// A long `command` is cut with an omission note; `timeout_seconds`
+/// (often the last field in the JSON, and thus the first thing a naive
+/// cut of the raw string would drop) is re-attached after the note.
+/// Anything that is not a bash-style arguments object falls back to a
+/// plain character cut of the raw string.
+pub fn truncate_call_arguments(arguments: &str, max_chars: usize) -> String {
+    let value = match serde_json::from_str::<Value>(arguments) {
+        Ok(value) => value,
+        Err(_) => return cut_with_note(arguments, max_chars),
+    };
+    let Some(command) = value.get("command").and_then(Value::as_str) else {
+        return cut_with_note(arguments, max_chars);
+    };
+
+    // Fits as-is: keep the original untouched so short calls render
+    // exactly like before.
+    if arguments.chars().count() <= max_chars {
+        return arguments.to_string();
+    }
+
+    let prefix = r#"{"command":"#;
+    let note = " … (truncated)";
+    // The timeout is re-attached after the note so it survives the cut;
+    // the closing brace is always restored.
+    let suffix = match value.get("timeout_seconds").and_then(Value::as_u64) {
+        Some(seconds) => format!(r#","timeout_seconds":{seconds}}}"#),
+        None => "}".to_string(),
+    };
+    // Fields other than `command`/`timeout_seconds` are dropped; the
+    // note covers that too.
+    let has_other = value.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .any(|k| k != "command" && k != "timeout_seconds")
+    });
+
+    // How much of the command fits: everything except the JSON prefix,
+    // the suffix, and (when the command itself overflows) the note.
+    let mut budget = max_chars
+        .saturating_sub(prefix.chars().count())
+        .saturating_sub(suffix.chars().count());
+    if command.chars().count() > budget {
+        budget = budget.saturating_sub(note.chars().count());
+    }
+    let kept: String = command.chars().take(budget).collect();
+    let cut = kept.chars().count() < command.chars().count() || has_other;
+    if !cut {
+        return arguments.to_string();
+    }
+
+    let mut out = format!(r#"{{"command":"{kept}""#);
+    if cut {
+        out.push_str(note);
+    }
+    out.push_str(&suffix);
+    out
+}
+
+/// Cut raw text to `max_chars` characters with an omission note; used
+/// when arguments are not a parseable bash-style object.
+fn cut_with_note(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("\n… (arguments truncated)");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +474,55 @@ mod tests {
             output.contains("command not found") || output.contains("[exit status: 127]"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn short_call_arguments_pass_through_untouched() {
+        let args = r#"{"command":"ls -la","timeout_seconds":30}"#;
+        assert_eq!(truncate_call_arguments(args, 600), args);
+    }
+
+    #[test]
+    fn long_command_is_cut_and_keeps_its_timeout() {
+        let long = "x".repeat(2_000);
+        let args = json!({"command": long, "timeout_seconds": 90}).to_string();
+        let shown = truncate_call_arguments(&args, CALL_PREVIEW_CHARS);
+        assert!(shown.contains("… (truncated)"), "{shown}");
+        assert!(shown.contains(r#""timeout_seconds":90}"#), "{shown}");
+        // Budget is honored: prefix + kept command + suffix, with the
+        // note on top only when the command itself overflowed.
+        assert!(shown.chars().count() <= CALL_PREVIEW_CHARS + 20, "{shown}");
+        assert!(
+            shown.chars().count() < args.chars().count(),
+            "actually shorter than the input"
+        );
+    }
+
+    #[test]
+    fn command_only_arguments_regain_a_closing_brace() {
+        let long = "y".repeat(2_000);
+        let args = json!({"command": long}).to_string();
+        let shown = truncate_call_arguments(&args, CALL_PREVIEW_CHARS);
+        assert!(shown.contains("… (truncated)"), "{shown}");
+        assert!(shown.ends_with('}'), "{shown}");
+    }
+
+    #[test]
+    fn non_object_arguments_fall_back_to_a_plain_cut() {
+        let args = "not json at all".repeat(100);
+        let shown = truncate_call_arguments(&args, 40);
+        assert!(shown.chars().count() <= 40 + 25, "{shown}");
+        assert!(shown.contains("arguments truncated"), "{shown}");
+    }
+
+    #[test]
+    fn unknown_fields_are_dropped_with_the_note() {
+        let args = json!({"command": "echo hi", "extra": "payload".repeat(300)}).to_string();
+        let shown = truncate_call_arguments(&args, CALL_PREVIEW_CHARS);
+        assert!(shown.contains("echo hi"), "{shown}");
+        assert!(!shown.contains("payload"), "{shown}");
+        assert!(shown.contains("… (truncated)"), "{shown}");
+        assert!(shown.ends_with('}'), "{shown}");
     }
 
     #[test]

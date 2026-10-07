@@ -635,12 +635,19 @@ impl App {
                 lines.push(Line::default());
             }
             Entry::ToolCall { name, arguments } => {
-                // Arguments may contain newlines (pretty-printed JSON):
-                // emit one source Line per argument line. Raw `\n`
-                // characters must never reach the terminal: LF moves the
-                // cursor down without returning to column 0, so every
-                // line would start below the end of the previous one.
-                let mut body = arguments.lines();
+                // Display a preview: very long arguments are cut (the
+                // `timeout_seconds` override survives the cut); the
+                // entry itself keeps the full text for resume. Arguments
+                // may contain newlines (pretty-printed JSON): emit one
+                // source Line per argument line. Raw `\n` characters
+                // must never reach the terminal: LF moves the cursor
+                // down without returning to column 0, so every line
+                // would start below the end of the previous one.
+                let shown = crate::tools::truncate_call_arguments(
+                    arguments,
+                    crate::tools::CALL_PREVIEW_CHARS,
+                );
+                let mut body = shown.lines();
                 let mut src = vec![Line::from(vec![
                     Span::styled("● ".to_string(), Style::new().fg(Color::Blue)),
                     Span::styled(name.clone(), Style::new().add_modifier(Modifier::BOLD)),
@@ -1150,13 +1157,39 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
-        eprintln!("TEXTS: {texts:?}");
         assert!(
             texts
                 .iter()
                 .any(|t| t.starts_with("● bash {\"command\":\"ls\"}"))
         );
         assert!(texts.iter().any(|t| t.contains("└─ bash: file.txt")));
+    }
+
+    #[test]
+    fn long_tool_call_arguments_are_cut_for_display_only() {
+        let long = "z".repeat(2_000);
+        let mut app = App::new();
+        app.on_turn_event(TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: json!({"command": long, "timeout_seconds": 90}).to_string(),
+        });
+
+        // The transcript shows the cut with the timeout kept.
+        let lines = app.transcript_lines(80);
+        let shown: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(shown.contains("… (truncated)"), "{shown}");
+        assert!(shown.contains("timeout_seconds\":90"), "{shown}");
+        assert!(shown.len() < 2_000, "display is shorter: {}", shown.len());
+
+        // The entry keeps the full text so resume restores it verbatim.
+        let full = match &app.entries[0] {
+            Entry::ToolCall { arguments, .. } => arguments.clone(),
+            other => panic!("expected a tool call entry, got {other:?}"),
+        };
+        assert!(full.contains(&long));
     }
 
     #[test]
