@@ -31,8 +31,8 @@ ENV TERM=xterm-256color
 ENV EDITOR=/usr/bin/vim
 
 COPY --chown=${USER_ID}:${GROUP_ID} vimrc /home/clanky/.vimrc
-COPY clanky /usr/local/bin/clanky
-WORKDIR /work
-ENTRYPOINT ["/usr/local/bin/clanky"]
+COPY binaries/* /usr/local/bin/
 
+ENTRYPOINT ["/usr/local/bin/clanky"]
+WORKDIR /work
 USER clanky

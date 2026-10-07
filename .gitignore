@@ -1,9 +1,9 @@
 /target
 /.clanky
-/docker/vimrc
 
 # docker
 /.cargo-cache/
-/docker/clanky
+/docker/binaries
+/docker/vimrc
 /extra-packages
 /extra-commands
