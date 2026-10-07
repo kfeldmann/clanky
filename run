@@ -21,11 +21,11 @@ set -eu
 # (docker would otherwise create it as root).
 mkdir -p "$HOME/.clanky"
 
-if [ -z $DEEPINFRA_URL ]
-then
-    echo "ERROR: Missing required environment variable: DEEPINFRA_URL" >&2
-    exit 1
-fi
+#if [ -z $DEEPINFRA_URL ]
+#then
+#    echo "ERROR: Missing required environment variable: DEEPINFRA_URL" >&2
+#    exit 1
+#fi
 if [ -z $DEEPINFRA_TOKEN ]
 then
     echo "ERROR: Missing required environment variable: DEEPINFRA_TOKEN" >&2
