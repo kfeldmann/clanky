@@ -132,7 +132,17 @@ impl<W: Write> Screen<W> {
 
         // The footer's height caps how many rows of the streaming entry
         // can stay in the redrawable tail.
-        let footer = footer_lines(app, status, picker, completion, width, height);
+        let (estimated_prompt, estimated_completion) = app.estimated_tokens();
+        let footer = footer_lines(
+            app,
+            status,
+            picker,
+            completion,
+            width,
+            height,
+            estimated_prompt,
+            estimated_completion,
+        );
 
         // Commit finalized entries that are not printed yet.
         let sealed = app.sealed_boundary();
@@ -299,6 +309,7 @@ struct Footer {
     caret: u16,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn footer_lines(
     app: &App,
     status: &Status<'_>,
@@ -306,6 +317,8 @@ fn footer_lines(
     completion: Option<&CompletionState>,
     width: u16,
     height: u16,
+    estimated_prompt: u64,
+    estimated_completion: u64,
 ) -> Footer {
     let mut lines = Vec::new();
     if let Some(picker) = picker {
@@ -313,7 +326,13 @@ fn footer_lines(
     } else if let Some(completion) = completion {
         lines.extend(completion_box(completion, width, height));
     }
-    lines.push(status_line(app, status, width));
+    lines.push(status_line(
+        app,
+        status,
+        width,
+        estimated_prompt,
+        estimated_completion,
+    ));
     let (input, caret) = input_row(app, width);
     lines.push(input);
     Footer { lines, caret }
@@ -321,7 +340,14 @@ fn footer_lines(
 
 /// Status line: provider · model · think · session · cost on the left;
 /// token usage or a hint on the right; streaming shows on the input prompt.
-fn status_line(app: &App, status: &Status<'_>, width: u16) -> Line<'static> {
+#[allow(clippy::too_many_arguments)]
+fn status_line(
+    app: &App,
+    status: &Status<'_>,
+    width: u16,
+    estimated_prompt: u64,
+    estimated_completion: u64,
+) -> Line<'static> {
     let base = Style::new().fg(Color::DarkGray);
     let mut left = vec![Span::styled(
         status.provider.to_string(),
@@ -358,9 +384,22 @@ fn status_line(app: &App, status: &Status<'_>, width: u16) -> Line<'static> {
             "○ queued".to_string(),
             Style::new().fg(Color::Yellow),
         ));
-    } else if let Some(usage) = app.last_usage {
-        let prompt = usage.prompt_tokens.unwrap_or(0);
-        let completion = usage.completion_tokens.unwrap_or(0);
+    } else if app.last_usage.is_some() || estimated_prompt > 0 || estimated_completion > 0 {
+        // Billed token counts plus estimates for content not yet covered
+        // by a provider report (user prompt and tool results before the
+        // next round; streamed text/thinking while it streams). With a
+        // report in hand the estimates are zero (exact display); they
+        // keep a huge reasoning block counting while it streams.
+        let prompt = app
+            .last_usage
+            .and_then(|usage| usage.prompt_tokens)
+            .unwrap_or(0)
+            + estimated_prompt;
+        let completion = app
+            .last_usage
+            .and_then(|usage| usage.completion_tokens)
+            .unwrap_or(0)
+            + estimated_completion;
         // With a known context window, the "tok" unit gives way to how much
         // of it the last turn consumed: the next request re-sends those
         // prompt tokens, so they are what accumulates toward the limit.
@@ -435,10 +474,7 @@ fn input_row(app: &App, width: u16) -> (Line<'static>, u16) {
         );
     }
     let (window, caret_col) = input_window(&app.input, app.cursor, view_width);
-    let mut spans = vec![
-        dot,
-        Span::styled(INPUT_PROMPT.to_string(), prompt_style),
-    ];
+    let mut spans = vec![dot, Span::styled(INPUT_PROMPT.to_string(), prompt_style)];
     spans.extend(window);
     (Line::from(spans), (prompt_width + caret_col) as u16)
 }
@@ -1062,7 +1098,7 @@ mod tests {
             prompt_tokens: Some(120),
             completion_tokens: Some(80),
         });
-        let line = status_line(&app, &status(), 40);
+        let line = status_line(&app, &status(), 40, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("deepinfra · mock/model"), "{text}");
         // Streaming keeps the counters on the right; the dot moved to the
@@ -1073,7 +1109,7 @@ mod tests {
 
         app.busy = false;
         app.pending = Some("x".into());
-        let line = status_line(&app, &status(), 40);
+        let line = status_line(&app, &status(), 40, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("○ queued"), "{text}");
     }
@@ -1089,7 +1125,7 @@ mod tests {
             cost: Some(0.0123),
             context_window: None,
         };
-        let line = status_line(&app, &status, 80);
+        let line = status_line(&app, &status, 80, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("mock/model · think 4096"), "{text}");
         assert!(text.contains("s · $0.0123"), "{text}");
@@ -1097,6 +1133,28 @@ mod tests {
         // Large costs drop to two decimals.
         assert_eq!(format_cost(12.5), "$12.50");
         assert_eq!(format_cost(0.000_099), "$0.0001");
+    }
+
+    #[test]
+    fn estimates_count_into_the_display_while_nothing_is_billed() {
+        let mut app = App::new();
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "x".repeat(96),
+        });
+        // 96 counted chars -> 3 steps * 32 chars / 3 = 32 estimated
+        // completion tokens; the display shows them with no billed
+        // usage in hand, plus a prompt estimate passed in for the user
+        // message (counted via `push_user` in the real flow).
+        let (est_p, est_c) = app.estimated_tokens();
+        let line = status_line(&app, &status(), 80, est_p + 13, est_c);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("\u{2191}13 \u{2193}32"), "{text}");
+
+        // Known window: the estimate feeds the context percentage too.
+        let line = status_line(&app, &status(), 80, 1_000, 0);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        // (1000 + 21) / 10_000 -> 10%.
+        assert!(text.contains("\u{00b7} 10% ctx"), "{text}");
     }
 
     #[test]
@@ -1114,7 +1172,7 @@ mod tests {
             context_window: None,
             ..status()
         };
-        let line = status_line(&app, &unknown, 80);
+        let line = status_line(&app, &unknown, 80, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("↑17255 ↓796 tok"), "{text}");
 
@@ -1123,7 +1181,7 @@ mod tests {
             context_window: Some(128_000),
             ..status()
         };
-        let line = status_line(&app, &known, 80);
+        let line = status_line(&app, &known, 80, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("↑17255 ↓796 · 14% ctx"), "{text}");
 
@@ -1132,7 +1190,7 @@ mod tests {
             context_window: Some(100_000),
             ..status()
         };
-        let line = status_line(&app, &known, 80);
+        let line = status_line(&app, &known, 80, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("· 18% ctx"), "{text}");
     }

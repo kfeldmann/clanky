@@ -24,6 +24,13 @@ fi
 cp target/release/clanky docker/clanky
 chmod 555 docker/clanky
 
+if [ -f ~/.vimrc ]
+then
+    cp ~/.vimrc docker/vimrc
+else
+    touch docker/vimrc
+fi
+
 # Get user and group ids
 USER_ID=$(id -u)
 GROUP_ID=$(id -g)

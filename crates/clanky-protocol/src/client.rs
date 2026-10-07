@@ -95,11 +95,12 @@ impl<T: Transport> ProviderClient<T> {
                 code,
                 message,
                 retryable,
-                ..
+                retry_after_ms,
             })) if rid == id => Err(Error::Provider {
                 code,
                 message,
                 retryable,
+                retry_after_ms,
             }),
             Some(Ok(other)) => Err(Error::Protocol(format!("expected `models`, got {other:?}"))),
             Some(Err(err)) => Err(err),
@@ -156,12 +157,13 @@ impl<T: Transport> ProviderClient<T> {
                     code,
                     message,
                     retryable,
-                    ..
+                    retry_after_ms,
                 } if rid == id => {
                     return Err(Error::Provider {
                         code,
                         message,
                         retryable,
+                        retry_after_ms,
                     });
                 }
                 Message::Error {
@@ -264,11 +266,7 @@ mod tests {
 
         fn list_models(&mut self) -> Result<Vec<ModelInfo>, Error> {
             if let Some(code) = self.fail {
-                return Err(Error::Provider {
-                    code,
-                    message: "nope".into(),
-                    retryable: false,
-                });
+                return Err(Error::provider(code, "nope", false));
             }
             Ok(vec![ModelInfo {
                 id: "fake/m".into(),
@@ -288,11 +286,7 @@ mod tests {
         ) -> Result<ChatDone, Error> {
             self.chats.borrow_mut().push(request.clone());
             if let Some(code) = self.fail {
-                return Err(Error::Provider {
-                    code,
-                    message: "denied".into(),
-                    retryable: false,
-                });
+                return Err(Error::provider(code, "denied", false));
             }
             for chunk in [
                 ChunkPayload::Thinking {
@@ -384,6 +378,7 @@ mod tests {
                 code,
                 message,
                 retryable,
+                ..
             } => {
                 assert_eq!(code, ErrorCode::Auth);
                 assert_eq!(message, "denied");

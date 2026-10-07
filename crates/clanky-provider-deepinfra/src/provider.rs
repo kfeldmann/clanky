@@ -13,8 +13,12 @@ use crate::backend::{Backend, BackendError, truncate_body};
 pub const PROVIDER_NAME: &str = "deepinfra";
 /// Default model when neither settings nor CLI name one.
 pub const DEFAULT_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash-0731";
-/// DeepInfra's OpenAI-compatible base URL.
-pub const DEFAULT_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
+/// DeepInfra API base URL. Paths are relative to this, so a chat request
+/// goes to `https://api.deepinfra.com/v1/chat/completions` — the endpoint
+/// documented by DeepInfra's OpenAPI spec. (`https://api.deepinfra.com/v1/openai`
+/// serves the same API under an OpenAI-style alias and also works; override
+/// with `DEEPINFRA_URL` if you need to pin it.)
+pub const DEFAULT_BASE_URL: &str = "https://api.deepinfra.com/v1";
 /// Primary auth env var read by this provider (never by Clanky core).
 pub const ENV_API_KEY: &str = "DEEPINFRA_API_KEY";
 /// Fallback auth env var (the CI/test environment uses this name).
@@ -58,6 +62,7 @@ fn missing_key_error() -> Error {
         code: ErrorCode::Auth,
         message: format!("no API key: set {ENV_API_KEY} (or {ENV_TOKEN_FALLBACK})"),
         retryable: false,
+        retry_after_ms: None,
     }
 }
 
@@ -156,12 +161,14 @@ impl<B: Backend> DeepInfraProvider<B> {
 }
 
 /// Map a protocol thinking budget onto DeepInfra's `reasoning_effort`
-/// (low/medium/high). `None` means "let the backend decide" (or the model
-/// does not reason).
+/// (none/low/medium/high). `None` means "let the backend decide" (or the
+/// model does not reason); an explicit budget of 0 maps to `"none"`, which
+/// DeepInfra documents as disabling reasoning when the model supports it —
+/// unlike omitting the field, which falls back to the backend default.
 fn reasoning_effort(thinking: Thinking) -> Option<&'static str> {
     match thinking.budget_tokens {
         None => None,
-        Some(0) => None,
+        Some(0) => Some("none"),
         Some(n) if n <= 2048 => Some("low"),
         Some(n) if n <= 8192 => Some("medium"),
         Some(_) => Some("high"),
@@ -243,9 +250,15 @@ fn openai_tools(tools: &[Tool]) -> Value {
     )
 }
 
-/// Map an HTTP-layer failure to a request-scoped protocol error.
+/// Map an HTTP-layer failure to a request-scoped protocol error. A
+/// server-provided `Retry-After` hint is carried through as
+/// `retry_after_ms` (spec §8 allows it on `rateLimit`).
 fn backend_to_protocol_error(err: BackendError, context: &str) -> Error {
-    let BackendError { status, message } = err;
+    let BackendError {
+        status,
+        message,
+        retry_after_ms,
+    } = err;
     let code = match status {
         Some(401 | 403) => ErrorCode::Auth,
         Some(429) => ErrorCode::RateLimit,
@@ -262,6 +275,12 @@ fn backend_to_protocol_error(err: BackendError, context: &str) -> Error {
         code,
         message: format!("{status_note}{detail}"),
         retryable: matches!(code, ErrorCode::RateLimit | ErrorCode::Backend),
+        // Spec §8: `retryAfterMs` rides on `rateLimit` errors only.
+        retry_after_ms: if code == ErrorCode::RateLimit {
+            retry_after_ms
+        } else {
+            None
+        },
     }
 }
 
@@ -339,12 +358,15 @@ struct OpenAiDelta {
     tool_calls: Option<Vec<OpenAiStreamToolCall>>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 struct OpenAiStreamToolCall {
     #[serde(default)]
     index: u32,
     #[serde(default)]
     id: Option<String>,
+    /// Lenient: some OpenAI-compatible backends emit index-only placeholder
+    /// deltas with no `function` object at all; treat that as an empty one.
+    #[serde(default)]
     function: OpenAiFunction,
 }
 
@@ -416,18 +438,35 @@ impl StreamState {
         }
         let acc = &mut self.calls[call.index as usize];
         if !acc.started {
-            acc.id = call
-                .id
-                .clone()
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| format!("call_{}", call.index));
-            acc.name = call.function.name.clone().unwrap_or_default();
+            // The id/name may still be on later deltas (some backends lead
+            // with an index-only placeholder); wait until we have something
+            // to announce before emitting `toolCallStart`.
+            if let Some(id) = call.id.clone().filter(|id| !id.is_empty()) {
+                acc.id = id;
+            }
+            if let Some(name) = call.function.name.clone().filter(|n| !n.is_empty()) {
+                acc.name = name;
+            }
+            if acc.id.is_empty() && acc.name.is_empty() {
+                return;
+            }
+            if acc.id.is_empty() {
+                acc.id = format!("call_{}", call.index);
+            }
             acc.started = true;
             sink(ChunkPayload::ToolCallStart {
                 index: call.index,
                 id: acc.id.clone(),
                 name: acc.name.clone(),
             });
+        } else if call
+            .id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty() && id != acc.id)
+        {
+            // Defensive: a repeated id after the start is ignored — the id
+            // must stay stable for the client's `toolCallId` round trip.
+            // (Name-only updates after the start are also ignored.)
         }
         if let Some(fragment) = call
             .function
@@ -731,14 +770,15 @@ mod tests {
         let body: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["reasoning_effort"], "medium");
 
-        // `off` (zero budget) is not sent.
+        // An explicit zero budget maps to `none` (reasoning disabled),
+        // not to an omitted field (backend default).
         request.thinking = Some(Thinking {
             budget_tokens: Some(0),
         });
         provider.chat(&request, &mut |_| {}).unwrap();
         let (_, body) = provider.backend.posts.borrow()[2].clone();
         let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed.get("reasoning_effort").is_none());
+        assert_eq!(parsed["reasoning_effort"], "none");
     }
 
     #[test]
@@ -780,6 +820,43 @@ mod tests {
     }
 
     #[test]
+    fn index_only_tool_call_delta_does_not_abort_the_stream() {
+        // Some OpenAI-compatible backends emit a bare index placeholder
+        // before the first real delta for that index.
+        let lines = [
+            &serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{"index": 0}]}, "finish_reason": null}]
+            })
+            .to_string(),
+            &serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}
+                }]}, "finish_reason": null}]
+            })
+            .to_string(),
+            &done_chunk("tool_calls"),
+        ];
+        let (chunks, done) = run_sse(&lines, &simple_request());
+        // The placeholder defers the start; the real id/name announce it.
+        assert_eq!(
+            chunks,
+            vec![
+                ChunkPayload::ToolCallStart {
+                    index: 0,
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                },
+                ChunkPayload::ToolCallArgs {
+                    index: 0,
+                    args_chunk: "{\"command\": \"ls\"}".into(),
+                },
+            ]
+        );
+        assert_eq!(done.unwrap().finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
     fn malformed_stream_chunk_is_a_protocol_error() {
         let lines = ["data: {not json"];
         let (_, done) = run_sse(&lines, &simple_request());
@@ -799,16 +876,14 @@ mod tests {
         for (status, expected) in cases {
             let mut provider =
                 DeepInfraProvider::new(MockBackend::new(Vec::new(), "[]"), "https://x.invalid");
-            provider.backend.fail = Some(BackendError {
-                status,
-                message: "boom".into(),
-            });
+            provider.backend.fail = Some(BackendError::new(status, "boom"));
             let err = provider.chat(&simple_request(), &mut |_| {}).unwrap_err();
             match err {
                 Error::Provider {
                     code,
                     message,
                     retryable,
+                    ..
                 } => {
                     assert_eq!(code, expected);
                     assert!(message.contains("boom"));

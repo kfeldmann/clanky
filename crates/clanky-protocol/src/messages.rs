@@ -320,7 +320,22 @@ pub enum Error {
         code: ErrorCode,
         message: String,
         retryable: bool,
+        /// Server-provided retry hint in milliseconds (spec §8: optional,
+        /// on `rateLimit`). `None` when the backend gave no usable hint.
+        retry_after_ms: Option<u64>,
     },
+}
+
+impl Error {
+    /// Construct a request-scoped provider error without a retry hint.
+    pub fn provider(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+        Self::Provider {
+            code,
+            message: message.into(),
+            retryable,
+            retry_after_ms: None,
+        }
+    }
 }
 
 /// Parse one wire-format message, ignoring unknown message types (spec §9:

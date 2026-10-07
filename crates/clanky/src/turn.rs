@@ -392,10 +392,7 @@ mod tests {
         }
 
         /// Scripted turns, then `err` when the script runs dry.
-        fn scripted_then_exhausted(
-            turns: Vec<ScriptedTurn>,
-            err: clanky_protocol::Error,
-        ) -> Self {
+        fn scripted_then_exhausted(turns: Vec<ScriptedTurn>, err: clanky_protocol::Error) -> Self {
             let mut handler = Self::scripted(turns);
             handler.exhausted = Some(err);
             handler
@@ -447,12 +444,7 @@ mod tests {
             self.requests.borrow_mut().push(request.clone());
             let turn = match self.script.borrow_mut().pop_front() {
                 Some(turn) => turn,
-                None => {
-                    return Err(self
-                        .exhausted
-                        .take()
-                        .expect("mock script exhausted"))
-                }
+                None => return Err(self.exhausted.take().expect("mock script exhausted")),
             };
             for chunk in turn.chunks {
                 sink(chunk);
@@ -700,11 +692,7 @@ mod tests {
             std::iter::repeat_with(|| tool_turn("echo_tool", r#"{}"#))
                 .take(27)
                 .collect(),
-            clanky_protocol::Error::Provider {
-                code: ErrorCode::Internal,
-                message: "script exhausted".into(),
-                retryable: false,
-            },
+            clanky_protocol::Error::provider(ErrorCode::Internal, "script exhausted", false),
         ));
         let (output, _) = run(
             handler,
@@ -741,7 +729,10 @@ mod tests {
         assert_eq!(messages.len(), 4, "system, user, assistant, tool");
         assert!(matches!(
             &messages[2],
-            ChatMessage::Assistant { tool_calls: Some(_), .. }
+            ChatMessage::Assistant {
+                tool_calls: Some(_),
+                ..
+            }
         ));
         assert!(matches!(messages[3], ChatMessage::Tool { .. }));
     }
@@ -770,11 +761,7 @@ mod tests {
             std::iter::repeat_with(|| tool_turn("echo_tool", r#"\"{}\"#))
                 .take(26)
                 .collect(),
-            clanky_protocol::Error::Provider {
-                code: ErrorCode::Internal,
-                message: "script exhausted".into(),
-                retryable: false,
-            },
+            clanky_protocol::Error::provider(ErrorCode::Internal, "script exhausted", false),
         ));
         let cfg = TurnConfig {
             max_tool_rounds: Some(0),
@@ -803,11 +790,11 @@ mod tests {
 
     #[test]
     fn provider_errors_surface_with_code() {
-        let handler = MockHandler::failing(clanky_protocol::Error::Provider {
-            code: ErrorCode::Auth,
-            message: "401: invalid API key".into(),
-            retryable: false,
-        });
+        let handler = MockHandler::failing(clanky_protocol::Error::provider(
+            ErrorCode::Auth,
+            "401: invalid API key",
+            false,
+        ));
         let (output, _) = run(
             Box::new(handler),
             &toolset(),
@@ -820,6 +807,7 @@ mod tests {
                 code,
                 message,
                 retryable,
+                ..
             }) => {
                 assert_eq!(code, ErrorCode::Auth);
                 assert_eq!(message, "401: invalid API key");
@@ -861,7 +849,11 @@ mod tests {
             &mut |_| {},
         );
         output.unwrap();
-        assert_eq!(messages.len(), 5, "system, user, assistant, tool, assistant");
+        assert_eq!(
+            messages.len(),
+            5,
+            "system, user, assistant, tool, assistant"
+        );
         assert!(matches!(messages[0], ChatMessage::System { .. }));
         assert!(matches!(messages[1], ChatMessage::User { .. }));
         assert!(matches!(

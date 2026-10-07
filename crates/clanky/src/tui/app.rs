@@ -22,6 +22,20 @@ use crate::turn::{TurnEvent, TurnOutput};
 /// result is always what the model receives).
 const TOOL_PREVIEW_LINES: usize = 8;
 
+/// Conservative tokens-per-character ratio for live usage estimates.
+/// English prose runs ~4 chars/token (incl. the space); code, JSON and
+/// identifier-heavy text run ~3. Assuming 3 overestimates prose by ~25%
+/// but never under-reports a context that is actually filling up.
+const ESTIMATE_CHARS_PER_TOKEN: f64 = 3.0;
+
+/// Fraction of a streamed message already counted before the estimate
+/// tops up. Every chunk fires `pending_tokens`, so with r character the
+/// estimate advances r - floor((r-k)/k'·k')-style in steps of k' ~ k/2:
+/// e.g. k = 32 gives +16 tokens per 32 characters (48 chars/token
+/// average, a deliberately loose lower bound) with at most one top-up
+/// lagging behind the newest text.
+const ESTIMATE_STEP_CHARS: usize = 32;
+
 /// One block in the chat transcript.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
@@ -124,6 +138,16 @@ pub struct App {
     /// The complete conversation (system context first): what is passed
     /// to the next turn. Updated after each turn, restored on resume (M4).
     pub history: Vec<ChatMessage>,
+    /// Estimate pools for content no provider report covers yet (see
+    /// `estimate_add`): character counts and the token estimates derived
+    /// from them, one pool for prompt-side content (the user prompt,
+    /// tool results fed back) and one for completion-side content
+    /// (streamed text/thinking). A usage report covers everything sent
+    /// and received so far, so it clears both pools.
+    estimate_prompt_chars: usize,
+    estimate_prompt: u64,
+    estimate_completion_chars: usize,
+    estimate_completion: u64,
     /// Active Tab-completion cycle (M7); cleared on any non-Tab key.
     pub completion: Option<CompletionState>,
     /// How many leading entries are fully printed to the terminal; the
@@ -167,26 +191,42 @@ impl App {
             open: None,
             history: Vec::new(),
             input_history: Vec::new(),
+            estimate_prompt_chars: 0,
+            estimate_prompt: 0,
+            estimate_completion_chars: 0,
+            estimate_completion: 0,
         }
     }
 
     // --- transcript ---------------------------------------------------------
 
-    /// Push a user prompt as a transcript entry.
+    /// Push a user prompt as a transcript entry and count it into the
+    /// prompt estimate: until a usage report covers it, its cost toward
+    /// the context is estimated from its length.
     pub fn push_user(&mut self, prompt: &str) {
         self.entries.push(Entry::User(prompt.to_string()));
+        self.estimate_add(prompt.chars().count(), true);
     }
 
     /// Apply one event from the agentic loop.
     pub fn on_turn_event(&mut self, event: TurnEvent) {
         match event {
-            TurnEvent::Text { delta } => self.append_delta(&delta, OpenKind::Text),
-            TurnEvent::Thinking { delta } => self.append_delta(&delta, OpenKind::Thinking),
+            TurnEvent::Text { delta } => {
+                self.estimate_add(delta.chars().count(), false);
+                self.append_delta(&delta, OpenKind::Text);
+            }
+            TurnEvent::Thinking { delta } => {
+                self.estimate_add(delta.chars().count(), false);
+                self.append_delta(&delta, OpenKind::Thinking);
+            }
             TurnEvent::ToolCall { name, arguments } => {
                 self.entries.push(Entry::ToolCall { name, arguments });
                 self.open = None;
             }
             TurnEvent::ToolResult { name, output } => {
+                // The result is fed back to the model, so it counts as
+                // prompt-side content until the next round's report.
+                self.estimate_add(output.chars().count(), true);
                 self.entries.push(Entry::ToolResult { name, output });
                 self.open = None;
             }
@@ -202,6 +242,9 @@ impl App {
                 self.last_usage = Some(usage);
                 self.total_prompt_tokens += usage.prompt_tokens.unwrap_or(0);
                 self.total_completion_tokens += usage.completion_tokens.unwrap_or(0);
+                // The report covers everything sent and received so far:
+                // live values switch to billed-only until new content lands.
+                self.estimate_reset();
             }
         }
     }
@@ -211,9 +254,53 @@ impl App {
     pub fn on_turn_done(&mut self, result: &Result<TurnOutput>) {
         self.busy = false;
         self.open = None;
+        // The turn is over; stale estimates for content that arrived
+        // without a usage report would otherwise linger.
+        self.estimate_reset();
         if let Err(err) = result {
             self.entries.push(Entry::Error(err.to_string()));
         }
+    }
+
+    // --- live usage estimates -----------------------------------------------
+
+    /// Top up an estimate pool with `chars` new characters. The pools
+    /// cover content whose real token counts are not known yet: the
+    /// prompt side holds the user prompt and tool results (both go back
+    /// to the model in the next request), the completion side holds
+    /// streamed text and thinking. A step counter keeps the display from
+    /// flickering on every chunk (see the constants above).
+    fn estimate_add(&mut self, chars: usize, prompt: bool) {
+        let (counted, tokens) = if prompt {
+            (&mut self.estimate_prompt_chars, &mut self.estimate_prompt)
+        } else {
+            (
+                &mut self.estimate_completion_chars,
+                &mut self.estimate_completion,
+            )
+        };
+        *counted += chars;
+        let steps = *counted / ESTIMATE_STEP_CHARS;
+        let chars = (steps * ESTIMATE_STEP_CHARS) as f64;
+        *tokens = (chars / ESTIMATE_CHARS_PER_TOKEN) as u64;
+    }
+
+    /// A usage report (or the turn's end) covers all prior content:
+    /// clear the pools so live values are billed-only.
+    fn estimate_reset(&mut self) {
+        self.estimate_prompt_chars = 0;
+        self.estimate_prompt = 0;
+        self.estimate_completion_chars = 0;
+        self.estimate_completion = 0;
+    }
+
+    /// Estimated `(prompt, completion)` tokens for content not yet
+    /// covered by a provider usage report. Live status values are the
+    /// billed totals plus these; with a report in hand they are zero
+    /// (exact display), but a report only lands after a round completes,
+    /// so a huge reasoning block still counts while it streams.
+    pub fn estimated_tokens(&self) -> (u64, u64) {
+        (self.estimate_prompt, self.estimate_completion)
     }
 
     fn append_delta(&mut self, delta: &str, kind: OpenKind) {
@@ -248,6 +335,7 @@ impl App {
         self.last_usage = None;
         self.total_prompt_tokens = 0;
         self.total_completion_tokens = 0;
+        self.estimate_reset();
         self.open = None;
         for record in records {
             match record {
@@ -757,6 +845,85 @@ mod tests {
         app.on_turn_done(&Err(crate::error::Error::NoModel));
         assert!(!app.busy);
         assert!(matches!(app.entries.last(), Some(Entry::Error(_))));
+    }
+
+    #[test]
+    fn estimates_streamed_text_and_resets_on_usage() {
+        let mut app = App::new();
+        assert_eq!(app.estimated_tokens(), (0, 0));
+
+        // 40 chars at a 32-char step and 3 chars/token: 32/3 -> 10.
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "x".repeat(40),
+        });
+        assert_eq!(app.estimated_tokens(), (0, 10));
+
+        // More text tops the estimate up; text and thinking share the
+        // completion-side pool.
+        app.on_turn_event(TurnEvent::Text {
+            delta: "y".repeat(40),
+        });
+        // 80 counted chars -> 64/3 = 21 (floor).
+        assert_eq!(app.estimated_tokens(), (0, 21));
+
+        // The provider's report covers everything streamed so far: the
+        // estimate clears, the billed totals carry the values.
+        app.on_turn_event(TurnEvent::Usage {
+            usage: Usage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(50),
+            },
+        });
+        assert_eq!(app.estimated_tokens(), (0, 0));
+        assert_eq!(app.total_prompt_tokens, 100);
+        assert_eq!(app.total_completion_tokens, 50);
+
+        // Streaming again starts from a clean estimate.
+        app.on_turn_event(TurnEvent::Text {
+            delta: "z".repeat(32),
+        });
+        assert_eq!(app.estimated_tokens(), (0, 10));
+    }
+
+    #[test]
+    fn user_prompt_and_tool_results_estimate_into_the_prompt_pool() {
+        let mut app = App::new();
+        // 96 chars -> 3 steps * 32 chars / 3 = 32.
+        app.push_user(&"x".repeat(96));
+        assert_eq!(app.estimated_tokens(), (32, 0));
+
+        // A tool result is fed back to the model: prompt-side too.
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "y".repeat(96),
+        });
+        assert_eq!(app.estimated_tokens(), (64, 0));
+
+        // A usage report covers everything sent and received so far.
+        app.on_turn_event(TurnEvent::Usage {
+            usage: Usage {
+                prompt_tokens: Some(500),
+                completion_tokens: Some(20),
+            },
+        });
+        assert_eq!(app.estimated_tokens(), (0, 0));
+        assert_eq!(app.total_prompt_tokens, 500);
+    }
+
+    #[test]
+    fn estimate_clears_when_a_turn_ends_without_usage() {
+        let mut app = App::new();
+        app.busy = true;
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "x".repeat(96),
+        });
+        assert_eq!(app.estimated_tokens(), (0, 32));
+        app.on_turn_done(&Ok(TurnOutput {
+            text: String::new(),
+            finish_reason: clanky_protocol::FinishReason::Stop,
+            usage: None,
+        }));
+        assert_eq!(app.estimated_tokens(), (0, 0));
     }
 
     #[test]

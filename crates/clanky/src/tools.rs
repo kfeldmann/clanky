@@ -279,7 +279,6 @@ mod tests {
             .unwrap_err()
     }
 
-
     #[test]
     fn failure_detection_covers_exit_status_and_errors() {
         assert!(!is_failed_result("out\nstderr: warn"));
@@ -362,10 +361,7 @@ mod tests {
             let err = tool
                 .execute(&json!({"command": "true", "timeout_seconds": bad}))
                 .unwrap_err();
-            assert!(
-                err.to_string().contains("`timeout_seconds`"),
-                "{err}"
-            );
+            assert!(err.to_string().contains("`timeout_seconds`"), "{err}");
         }
         let err = tool
             .execute(&json!({"command": "true", "timeout_seconds": "ten"}))
@@ -373,9 +369,10 @@ mod tests {
         assert!(err.to_string().contains("integer"), "{err}");
         // Absent and explicit null both fall back to the tool default.
         assert!(tool.execute(&json!({"command": "true"})).is_ok());
-        assert!(tool
-            .execute(&json!({"command": "true", "timeout_seconds": null}))
-            .is_ok());
+        assert!(
+            tool.execute(&json!({"command": "true", "timeout_seconds": null}))
+                .is_ok()
+        );
     }
 
     #[test]

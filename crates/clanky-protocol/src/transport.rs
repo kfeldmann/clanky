@@ -73,12 +73,13 @@ impl<H: Handler> LoopbackTransport<H> {
                     code,
                     message,
                     retryable,
+                    retry_after_ms,
                 }) => Ok(vec![Message::Error {
                     request_id: Some(id),
                     code,
                     message,
                     retryable,
-                    retry_after_ms: None,
+                    retry_after_ms,
                 }]),
                 Err(other) => Err(other),
             },
@@ -131,13 +132,14 @@ impl<H: Handler> Transport for LoopbackTransport<H> {
                     code,
                     message,
                     retryable,
+                    retry_after_ms,
                 }) => Ok(Box::new(
                     vec![Message::Error {
                         request_id: Some(id),
                         code,
                         message,
                         retryable,
-                        retry_after_ms: None,
+                        retry_after_ms,
                     }]
                     .into_iter()
                     .map(Ok),

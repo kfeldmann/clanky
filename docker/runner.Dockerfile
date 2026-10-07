@@ -7,7 +7,7 @@ FROM alpine:3.24
 ARG EXTRA_PACKAGES=""
 ARG EXTRA_COMMANDS=""
 
-RUN apk update && apk upgrade && apk add libgcc bash vim
+RUN apk update && apk upgrade && apk add libgcc curl bash vim
 
 # Optional additional packages (populated by build-runner from the
 # `extra-packages` file).

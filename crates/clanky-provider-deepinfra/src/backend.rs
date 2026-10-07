@@ -12,6 +12,93 @@ use std::time::Duration;
 pub struct BackendError {
     pub status: Option<u16>,
     pub message: String,
+    /// Server-provided retry hint in milliseconds (from a `Retry-After`
+    /// header, HTTP-date or delay-seconds form). `None` when absent or
+    /// unparseable; only meaningful on rate-limit responses.
+    pub retry_after_ms: Option<u64>,
+}
+
+impl BackendError {
+    pub fn new(status: Option<u16>, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            retry_after_ms: None,
+        }
+    }
+
+    /// Attach a retry hint parsed from a `Retry-After` header value
+    /// (delay-seconds or HTTP-date; the date form is measured against
+    /// `now_secs`, the current UNIX time).
+    pub fn with_retry_after_header(mut self, value: &str, now_secs: u64) -> Self {
+        self.retry_after_ms = parse_retry_after(value, now_secs);
+        self
+    }
+}
+
+/// Parse a `Retry-After` header into milliseconds. Accepts the
+/// delay-seconds form and the HTTP-date form (RFC 9110 IMF-fixdate);
+/// anything else is `None`. Negative/overflowing delays clamp to 0.
+fn parse_retry_after(value: &str, now_secs: u64) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let target = if let Ok(secs) = value.parse::<i64>() {
+        now_secs.checked_add_signed(secs)?
+    } else {
+        parse_http_date(value)?
+    };
+    Some(target.saturating_sub(now_secs) * 1000)
+}
+
+/// Parse an IMF-fixdate HTTP date (`Sun, 06 Nov 1994 08:49:37 GMT`) to
+/// UNIX seconds via the days-from-civil algorithm (Howard Hinnant), which
+/// is exact for the proleptic Gregorian calendar. The weekday name and the
+/// `GMT` zone suffix are validated leniently (any 3-letter weekday, any
+/// `GMT`/`UT`+offset spelling of zero). Returns `None` on anything else.
+fn parse_http_date(value: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let (weekday, rest) = value.split_once(',')?;
+    if weekday.len() != 3 || !weekday.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut parts = rest.trim_start().split_ascii_whitespace();
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month_str = parts.next()?;
+    let month = MONTHS
+        .iter()
+        .position(|m| month_str.eq_ignore_ascii_case(m))? as i64;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let zone = parts.next()?;
+    if !zone.eq_ignore_ascii_case("gmt") && !zone.eq_ignore_ascii_case("ut") {
+        return None;
+    }
+    let (hour, minute, second) = {
+        let mut t = time.split(':');
+        let h: i64 = t.next()?.parse().ok()?;
+        let m: i64 = t.next()?.parse().ok()?;
+        let s: i64 = t.next()?.parse().ok()?;
+        (h, m, s)
+    };
+    // days_from_civil: counts days since 1970-01-01 for a civil date.
+    // `month` is a 0-based index; Hinnant's formula wants the 1-based
+    // month folded into March-based years (Jan/Feb roll into the
+    // previous year as months 10/11).
+    let (y, m) = (
+        if month <= 1 { year - 1 } else { year },
+        if month <= 1 { month + 10 } else { month - 2 },
+    );
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * m + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    u64::try_from(secs).ok()
 }
 
 /// Talks to a chat-completions-style HTTP API. Full URLs are passed in by
@@ -80,12 +167,21 @@ impl Backend for UreqBackend {
     }
 }
 
+/// Current UNIX time in seconds; used to resolve HTTP-date `Retry-After`
+/// values. A missing clock falls back to 0, which turns date-form hints
+/// into large delays rather than errors.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn read_response(response: Result<ureq::Response, ureq::Error>) -> Result<String, BackendError> {
     match response {
-        Ok(resp) => resp.into_string().map_err(|e| BackendError {
-            status: None,
-            message: e.to_string(),
-        }),
+        Ok(resp) => resp
+            .into_string()
+            .map_err(|e| BackendError::new(None, e.to_string())),
         Err(err) => Err(map_ureq_error(err)),
     }
 }
@@ -93,16 +189,12 @@ fn read_response(response: Result<ureq::Response, ureq::Error>) -> Result<String
 fn map_ureq_error(err: ureq::Error) -> BackendError {
     match err {
         ureq::Error::Status(status, resp) => {
+            let retry_after = resp.header("retry-after").map(str::to_owned);
             let text = resp.into_string().unwrap_or_default();
-            BackendError {
-                status: Some(status),
-                message: text,
-            }
+            BackendError::new(Some(status), text)
+                .with_retry_after_header(retry_after.as_deref().unwrap_or(""), now_secs())
         }
-        err => BackendError {
-            status: None,
-            message: err.to_string(),
-        },
+        err => BackendError::new(None, err.to_string()),
     }
 }
 
@@ -141,10 +233,7 @@ impl<R: BufRead> Iterator for SseLines<R> {
                 return None;
             }
             if let Some(message) = self.pending_error.take() {
-                return Some(Err(BackendError {
-                    status: None,
-                    message,
-                }));
+                return Some(Err(BackendError::new(None, message)));
             }
             let mut line = String::new();
             match self.reader.read_line(&mut line) {
@@ -178,10 +267,7 @@ impl<R: BufRead> Iterator for SseLines<R> {
                     // the next call (self.finished bounds it to one).
                     self.finished = true;
                     if self.data.is_empty() {
-                        return Some(Err(BackendError {
-                            status: None,
-                            message: source.to_string(),
-                        }));
+                        return Some(Err(BackendError::new(None, source.to_string())));
                     }
                     let payload = std::mem::take(&mut self.data).join("\n");
                     self.pending_error = Some(source.to_string());
@@ -252,6 +338,36 @@ mod tests {
         let items = payloads("data: a\r\n\r\ndata: b\r\n");
         let payloads: Vec<String> = items.into_iter().map(Result::unwrap).collect();
         assert_eq!(payloads, ["a", "b"]);
+    }
+
+    #[test]
+    fn retry_after_delay_seconds_parses() {
+        assert_eq!(parse_retry_after("3", 1_000_000), Some(3_000));
+        assert_eq!(parse_retry_after(" 0 ", 1_000_000), Some(0));
+        // Negative delay clamps to 0.
+        assert_eq!(parse_retry_after("-5", 1_000_000), Some(0));
+        assert_eq!(parse_retry_after("", 1_000_000), None);
+        assert_eq!(parse_retry_after("soon", 1_000_000), None);
+    }
+
+    #[test]
+    fn retry_after_http_date_parses() {
+        // Classic RFC 9110 example: Sun, 06 Nov 1994 08:49:37 GMT.
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        // 1994-11-06T08:49:37Z = 784111777.
+        assert_eq!(parse_http_date(date), Some(784_111_777));
+        // 30s in the future from that instant -> 30_000 ms.
+        assert_eq!(parse_retry_after(date, 784_111_747), Some(30_000));
+        // Past date clamps to 0.
+        assert_eq!(parse_retry_after(date, 784_111_777), Some(0));
+        // Case-insensitive weekday/month, no space after the comma.
+        assert_eq!(
+            parse_http_date("sun, 06 nov 1994 08:49:37 gmt"),
+            Some(784_111_777)
+        );
+        // Junk is None.
+        assert_eq!(parse_http_date("tomorrow"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 PST"), None);
     }
 
     #[test]
