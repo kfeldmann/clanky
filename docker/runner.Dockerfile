@@ -32,6 +32,7 @@ ENV EDITOR=/usr/bin/vim
 
 COPY --chown=${USER_ID}:${GROUP_ID} vimrc /home/clanky/.vimrc
 COPY clanky /usr/local/bin/clanky
+WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/clanky"]
 
 USER clanky
