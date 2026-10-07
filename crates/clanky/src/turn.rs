@@ -16,12 +16,13 @@ use crate::error::{Error, Result};
 use crate::settings::SamplingParams;
 use crate::tools::ToolSet;
 
-/// Default maximum number of chat rounds (tool calls included) in one
-/// turn, so a model stuck in a tool-calling cycle cannot run forever.
-/// Users can override this with the `max_tool_rounds` setting (or the
-/// `--max-tool-rounds` flag); `0` disables the limit entirely and lets
-/// the user judge when to stop a runaway turn.
-pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 25;
+/// Fallback tool-loop round cap when neither the settings nor the
+/// `--max-tool-rounds` flag specify one. `0` disables the cap entirely,
+/// so by default the loop runs until the model stops calling tools and
+/// the user judges when to stop a runaway turn. Set `max_tool_rounds`
+/// to a non-zero number (settings or `--max-tool-rounds` flag) to cap
+/// chat rounds (tool calls included) in one turn.
+pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 0;
 
 /// Per-turn configuration taken from settings/CLI.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -71,6 +72,12 @@ pub enum TurnEvent {
     ToolCall { name: String, arguments: String },
     /// The tool finished; `output` is the result fed back to the model.
     ToolResult { name: String, output: String },
+    /// Token usage for one completed chat round. Emitted as soon as the
+    /// backend reports it (the final chunk of the round's stream), so the
+    /// status line tracks every model response — including the
+    /// intermediate tool-call rounds of a multi-round turn — instead of
+    /// only the turn's last one.
+    Usage { usage: Usage },
 }
 
 /// The outcome of one turn.
@@ -159,6 +166,7 @@ pub fn run_turn(
         });
         if let Some(usage) = done.usage {
             usage_seen = true;
+            on_event(TurnEvent::Usage { usage });
             usage_total.prompt_tokens =
                 Some(usage_total.prompt_tokens.unwrap_or(0) + usage.prompt_tokens.unwrap_or(0));
             usage_total.completion_tokens = Some(
@@ -331,6 +339,15 @@ mod tests {
                 prompt_tokens: Some(3),
                 completion_tokens: Some(2),
             }),
+        }
+    }
+
+    fn usage_event(p: u64, c: u64) -> TurnEvent {
+        TurnEvent::Usage {
+            usage: Usage {
+                prompt_tokens: Some(p),
+                completion_tokens: Some(c),
+            },
         }
     }
 
@@ -531,6 +548,7 @@ mod tests {
                     thinking: "".into(),
                     calls: vec![]
                 },
+                usage_event(3, 2),
             ]
         );
     }
@@ -567,6 +585,7 @@ mod tests {
                         arguments: serde_json::json!({"input": "hello"}),
                     }],
                 },
+                usage_event(5, 4),
                 TurnEvent::ToolCall {
                     name: "echo_tool".into(),
                     arguments: r#"{"input":"hello"}"#.into(),
@@ -583,6 +602,7 @@ mod tests {
                     thinking: "".into(),
                     calls: vec![]
                 },
+                usage_event(3, 2),
             ]
         );
     }
@@ -603,8 +623,15 @@ mod tests {
         assert_eq!(output.unwrap().text, "recovered");
         let sink = sink.into_inner();
         assert!(
-            matches!(&sink[2], TurnEvent::ToolResult { output, .. } if output.starts_with("ERROR:")),
+            matches!(&sink[3], TurnEvent::ToolResult { output, .. } if output.starts_with("ERROR:")),
             "unexpected events: {sink:?}"
+        );
+        // Usage is reported per round, not only at end of turn.
+        assert_eq!(
+            sink.iter()
+                .filter(|e| matches!(e, TurnEvent::Usage { .. }))
+                .count(),
+            2
         );
     }
 
@@ -624,7 +651,7 @@ mod tests {
         assert_eq!(output.unwrap().text, "recovered");
         let sink = sink.into_inner();
         assert!(
-            matches!(&sink[2], TurnEvent::ToolResult { output, .. } if output.contains("ERROR:")),
+            matches!(&sink[3], TurnEvent::ToolResult { output, .. } if output.contains("ERROR:")),
             "unexpected events: {sink:?}"
         );
     }
@@ -652,6 +679,7 @@ mod tests {
                     thinking: "".into(),
                     calls: vec![]
                 },
+                usage_event(3, 2),
             ]
         );
     }
@@ -664,11 +692,19 @@ mod tests {
     }
 
     #[test]
-    fn endless_tool_loop_hits_the_limit() {
-        let handler = Box::new(MockHandler::scripted(
+    fn default_limit_is_unlimited() {
+        // No cap configured: the loop keeps going until the model stops
+        // calling tools (here: the mock script runs dry). 27 rounds is
+        // well past the old built-in cap of 25.
+        let handler = Box::new(MockHandler::scripted_then_exhausted(
             std::iter::repeat_with(|| tool_turn("echo_tool", r#"{}"#))
-                .take(DEFAULT_MAX_TOOL_ROUNDS + 2)
+                .take(27)
                 .collect(),
+            clanky_protocol::Error::Provider {
+                code: ErrorCode::Internal,
+                message: "script exhausted".into(),
+                retryable: false,
+            },
         ));
         let (output, _) = run(
             handler,
@@ -678,10 +714,11 @@ mod tests {
             &config("mock/model"),
         );
         let err = output.unwrap_err();
-        assert!(
-            matches!(err, Error::ToolLoopLimit(DEFAULT_MAX_TOOL_ROUNDS)),
-            "{err}"
-        );
+        let msg = match &err {
+            Error::Provider(clanky_protocol::Error::Provider { message, .. }) => message.clone(),
+            other => panic!("unexpected error: {other}"),
+        };
+        assert_eq!(msg, "script exhausted", "{err}");
     }
 
     #[test]
@@ -727,8 +764,8 @@ mod tests {
 
     #[test]
     fn max_tool_rounds_zero_runs_past_the_default_cap() {
-        // 26 tool rounds would trip the default cap of 25; `0` disables it,
-        // so the loop only stops when the mock runs out of script.
+        // `0` disables the cap, so the loop only stops when the mock runs
+        // out of script (not when the tool-loop guard trips).
         let handler = Box::new(MockHandler::scripted_then_exhausted(
             std::iter::repeat_with(|| tool_turn("echo_tool", r#"\"{}\"#))
                 .take(26)

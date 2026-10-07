@@ -5,4 +5,5 @@
 - plan.md - the original requirements brainstorm (242 words)
 
 DeepInfra is the first provider that will be supported
+- OpenAI Chat Completions API: https://docs.deepinfra.com/api-reference/chat-completions/openai-chat-completions.md 
 - DeepInfra documentation index: https://docs.deepinfra.com/llms.txt

@@ -112,7 +112,9 @@ pub struct App {
     pub busy: bool,
     /// A prompt typed while busy, sent when the turn finishes.
     pub pending: Option<String>,
-    /// Usage of the most recently completed turn, for the status line.
+    /// Usage of the most recently completed chat round (not turn), for
+    /// the status line: its prompt tokens are what the next request
+    /// re-sends, so they drive the ctx % display.
     pub last_usage: Option<Usage>,
     /// Session totals across all completed turns (prompt tokens are
     /// re-billed every turn, so the cumulative sum is what the cost display
@@ -191,22 +193,26 @@ impl App {
             // Round summaries are for the session recorder only; the
             // transcript is built from the streaming deltas above.
             TurnEvent::Round { .. } => {}
+            // Per-round usage arrives before the turn's `done`; the
+            // turn-total event is gone, so this is the only place
+            // counters are updated. `last_usage` becomes the latest
+            // round's own usage — exactly what the next request re-sends
+            // as prompt tokens, which is what the ctx % should show.
+            TurnEvent::Usage { usage } => {
+                self.last_usage = Some(usage);
+                self.total_prompt_tokens += usage.prompt_tokens.unwrap_or(0);
+                self.total_completion_tokens += usage.completion_tokens.unwrap_or(0);
+            }
         }
     }
 
-    /// Finalize the turn: record usage or surface the error.
+    /// Finalize the turn: surface the error, if any. Usage was already
+    /// applied round-by-round via [`TurnEvent::Usage`].
     pub fn on_turn_done(&mut self, result: &Result<TurnOutput>) {
         self.busy = false;
         self.open = None;
-        match result {
-            Ok(output) => {
-                self.last_usage = output.usage;
-                if let Some(usage) = output.usage {
-                    self.total_prompt_tokens += usage.prompt_tokens.unwrap_or(0);
-                    self.total_completion_tokens += usage.completion_tokens.unwrap_or(0);
-                }
-            }
-            Err(err) => self.entries.push(Entry::Error(err.to_string())),
+        if let Err(err) = result {
+            self.entries.push(Entry::Error(err.to_string()));
         }
     }
 
@@ -714,31 +720,38 @@ mod tests {
     }
 
     #[test]
-    fn done_records_usage_or_error() {
+    fn usage_accumulates_per_round_and_done_surfaces_errors() {
         let mut app = App::new();
         app.busy = true;
-        let usage = Some(Usage {
+        let round1 = Usage {
             prompt_tokens: Some(10),
             completion_tokens: Some(3),
-        });
-        app.on_turn_done(&Ok(TurnOutput {
-            text: "hi".into(),
-            finish_reason: clanky_protocol::FinishReason::Stop,
-            usage,
-        }));
-        assert_eq!(app.last_usage, usage);
-        assert!(!app.busy);
-        assert_eq!(app.total_prompt_tokens, 10);
-        assert_eq!(app.total_completion_tokens, 3);
+        };
+        let round2 = Usage {
+            prompt_tokens: Some(12),
+            completion_tokens: Some(4),
+        };
+        // A two-round turn: usage lands as each round completes.
+        app.on_turn_event(TurnEvent::Usage { usage: round1 });
+        app.on_turn_event(TurnEvent::Usage { usage: round2 });
+        assert_eq!(app.last_usage, Some(round2), "last round's own usage");
+        assert_eq!(app.total_prompt_tokens, 22, "rounds sum into the total");
+        assert_eq!(app.total_completion_tokens, 7);
 
-        app.busy = true;
+        // done only ends the turn; usage was already applied.
+        let before = (app.total_prompt_tokens, app.total_completion_tokens);
         app.on_turn_done(&Ok(TurnOutput {
             text: "hi".into(),
             finish_reason: clanky_protocol::FinishReason::Stop,
-            usage,
+            usage: None,
         }));
-        assert_eq!(app.total_prompt_tokens, 20, "usage accumulates per turn");
-        assert_eq!(app.total_completion_tokens, 6);
+        assert!(!app.busy);
+        assert_eq!(app.last_usage, Some(round2));
+        assert_eq!(
+            (app.total_prompt_tokens, app.total_completion_tokens),
+            before,
+            "done must not re-add usage"
+        );
 
         app.busy = true;
         app.on_turn_done(&Err(crate::error::Error::NoModel));

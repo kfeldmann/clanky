@@ -25,6 +25,12 @@
               "command": {
                 "description": "The bash command to run",
                 "type": "string"
+              },
+              "timeout_seconds": {
+                "description": "Optional per-call timeout override in seconds",
+                "maximum": 600,
+                "minimum": 1,
+                "type": "integer"
               }
             },
             "required": [
@@ -78,6 +84,12 @@
               "command": {
                 "description": "The bash command to run",
                 "type": "string"
+              },
+              "timeout_seconds": {
+                "description": "Optional per-call timeout override in seconds",
+                "maximum": 600,
+                "minimum": 1,
+                "type": "integer"
               }
             },
             "required": [

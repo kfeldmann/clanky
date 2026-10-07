@@ -62,7 +62,7 @@ pub struct BashTool {
 impl Default for BashTool {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(120),
+            timeout: Duration::from_secs(600),
             max_output_chars: 20_000,
         }
     }
@@ -93,6 +93,12 @@ impl Tool for BashTool {
                 "command": {
                     "type": "string",
                     "description": "The bash command to run"
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "Optional per-call timeout override in seconds",
+                    "minimum": 1,
+                    "maximum": 600
                 }
             },
             "required": ["command"]
@@ -106,12 +112,33 @@ impl Tool for BashTool {
                 message: "expected a string field `command`".into(),
             });
         };
-        self.run(command)
+        let timeout = match arguments.get("timeout_seconds") {
+            None | Some(Value::Null) => self.timeout,
+            Some(value) => {
+                let Some(seconds) = value.as_u64() else {
+                    return Err(ToolError::InvalidArguments {
+                        tool: self.name().into(),
+                        message: "expected an integer field `timeout_seconds`".into(),
+                    });
+                };
+                if seconds == 0 || seconds > self.timeout.as_secs() {
+                    return Err(ToolError::InvalidArguments {
+                        tool: self.name().into(),
+                        message: format!(
+                            "`timeout_seconds` must be between 1 and {}",
+                            self.timeout.as_secs()
+                        ),
+                    });
+                }
+                Duration::from_secs(seconds)
+            }
+        };
+        self.run_with_timeout(command, timeout)
     }
 }
 
 impl BashTool {
-    fn run(&self, command: &str) -> Result<String, ToolError> {
+    fn run_with_timeout(&self, command: &str, timeout: Duration) -> Result<String, ToolError> {
         let mut child = Command::new("bash")
             .arg("-c")
             .arg(command)
@@ -131,7 +158,7 @@ impl BashTool {
         let stdout_reader = std::thread::spawn(move || read_to_bytes(stdout_pipe));
         let stderr_reader = std::thread::spawn(move || read_to_bytes(stderr_pipe));
 
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + timeout;
         let status = loop {
             match child.wait_timeout(Duration::from_millis(100)) {
                 Ok(Some(status)) => break Ok(status),
@@ -141,7 +168,7 @@ impl BashTool {
                         let _ = child.wait();
                         break Err(format!(
                             "command exceeded its {}s timeout and was killed",
-                            self.timeout.as_secs()
+                            timeout.as_secs()
                         ));
                     }
                 }
@@ -252,6 +279,7 @@ mod tests {
             .unwrap_err()
     }
 
+
     #[test]
     fn failure_detection_covers_exit_status_and_errors() {
         assert!(!is_failed_result("out\nstderr: warn"));
@@ -308,6 +336,46 @@ mod tests {
                 .contains("expected a string field `command`")
         );
         let _ = run_err; // keep helper referenced
+    }
+
+    #[test]
+    fn per_call_timeout_extends_or_shortens_deadline() {
+        // A per-call override longer than needed succeeds even though it
+        // could exceed nothing here; a short one kills the same sleep.
+        let tool = BashTool::default();
+        let ok = tool
+            .execute(&json!({"command": "true", "timeout_seconds": 5}))
+            .unwrap();
+        assert_eq!(ok, "(no output)");
+
+        let short = BashTool::new(Duration::from_secs(600), 20_000);
+        let err = short
+            .execute(&json!({"command": "sleep 30", "timeout_seconds": 1}))
+            .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+    }
+
+    #[test]
+    fn per_call_timeout_is_validated() {
+        let tool = BashTool::default();
+        for bad in [0u64, 601, u64::MAX] {
+            let err = tool
+                .execute(&json!({"command": "true", "timeout_seconds": bad}))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("`timeout_seconds`"),
+                "{err}"
+            );
+        }
+        let err = tool
+            .execute(&json!({"command": "true", "timeout_seconds": "ten"}))
+            .unwrap_err();
+        assert!(err.to_string().contains("integer"), "{err}");
+        // Absent and explicit null both fall back to the tool default.
+        assert!(tool.execute(&json!({"command": "true"})).is_ok());
+        assert!(tool
+            .execute(&json!({"command": "true", "timeout_seconds": null}))
+            .is_ok());
     }
 
     #[test]

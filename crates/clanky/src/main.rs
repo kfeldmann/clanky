@@ -113,6 +113,8 @@ fn print_event(event: TurnEvent) {
         // Round summaries are for the session recorder (M4); pipe mode
         // has already streamed the text deltas.
         TurnEvent::Round { .. } => {}
+        // Pipe mode prints no token counters.
+        TurnEvent::Usage { .. } => {}
         TurnEvent::ToolCall { name, arguments } => {
             eprintln!("\n● {name} {arguments}");
         }

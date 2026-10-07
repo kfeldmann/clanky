@@ -792,21 +792,21 @@ fn record_turn_event(state: &mut SessionState, app: &mut app::App, event: &TurnE
                 },
             );
         }
+        TurnEvent::Usage { usage } => {
+            state.record(app, session::usage_record(*usage));
+        }
         TurnEvent::Text { .. } | TurnEvent::Thinking { .. } | TurnEvent::ToolCall { .. } => {}
     }
 }
 
-/// Map a finished turn onto session records (usage or error) and update
-/// the conversation history. The history is adopted even when the turn
+/// Map a finished turn onto session records (error; usage is recorded
+/// round-by-round in `record_turn_event`) and update the conversation
+/// history. The history is adopted even when the turn
 /// failed, so the model sees the partial context (its prompt, rounds and
 /// tool results) on the next turn.
 fn record_done(state: &mut SessionState, app: &mut app::App, done: &TurnEnd) {
     match &done.result {
-        Ok(output) => {
-            if let Some(usage) = output.usage {
-                state.record(app, session::usage_record(usage));
-            }
-        }
+        Ok(_) => {}
         Err(err) => {
             state.record(
                 app,

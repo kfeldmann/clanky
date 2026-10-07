@@ -1102,14 +1102,12 @@ mod tests {
     #[test]
     fn usage_shows_context_percent_when_the_window_is_known() {
         let mut app = App::new();
-        app.on_turn_done(&Ok(TurnOutput {
-            text: String::new(),
-            finish_reason: clanky_protocol::FinishReason::Stop,
-            usage: Some(clanky_protocol::Usage {
+        app.on_turn_event(TurnEvent::Usage {
+            usage: clanky_protocol::Usage {
                 prompt_tokens: Some(17255),
                 completion_tokens: Some(796),
-            }),
-        }));
+            },
+        });
 
         // Unknown window: the plain token counts keep their unit.
         let unknown = Status {
