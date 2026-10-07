@@ -11,8 +11,9 @@ Architectural decisions already made:
   crash-isolated).
 - **All providers are plugins — homogeneous architecture.** DeepInfra ships as a
   provider plugin binary from the same workspace (`cargo install` installs
-  `clanky` + `clanky-provider-deepinfra`); Clanky auto-discovers the sibling
-  binary, so the default experience is zero-config. Core contains no
+  `clanky` + `clanky-provider-deepinfra`, both into `~/.cargo/bin`); Clanky
+  discovers `clanky-provider-*` on `$PATH`, so the default experience is
+  zero-config. Core contains no
   provider-specific code. The provider protocol is defined in M1; the DeepInfra
   client is protocol-shaped from the start, so the M8 process-boundary work is
   mechanical.
@@ -76,7 +77,7 @@ Architectural decisions already made:
 - Done when: all pickers work; unknown `/foo` errors cleanly.
 
 ## ✔ M6 — Context & config completion
-- Full `~/.clanky/` and `./.clanky/` layout: `AGENTS.md`, `SYSTEM.md`, `skills/`, `prompts/`, `plugins/`
+- Full `~/.clanky/` and `./.clanky/` layout: `AGENTS.md`, `SYSTEM.md`, `skills/`, `prompts/`, `plugins/` (the `plugins/` directory is dropped in M8 — never used; see M8)
 - Layering rules user < project; doc the precedence
 - Done when: skills/prompts load from both scopes.
 
@@ -93,10 +94,18 @@ Architectural decisions already made:
 - Cancellation (protocol cancel message + kill fallback)
 - Crash isolation: restart policy; plugin stderr → debug log, never the chat;
   errors pass through intact (a 401 surfaces as "401: bad API key")
-- Plugin declaration in settings: `[plugins.<name>] command = "..." args = [...]`
-- Sibling-binary auto-discovery + protocol version negotiated at handshake
+- PATH-only auto-discovery of `clanky-provider-*` executables on `$PATH`;
+  protocol version negotiated at handshake
+- Default model advertised by the plugin at handshake (core drops its
+  hardcoded per-provider table)
 - Done when: `clanky -p "say hi"` works via the spawned DeepInfra plugin, and a
   hello-world provider plugin written in Python serves a chat turn.
+
+  Decisions (see `provider-plugins-plan.md`): discovery is PATH-only — no
+  sibling-of-binary scan, and no settings declaration in M8 (plugins inherit
+  core's environment, so nothing needs configuring). `[plugins.<name>]`
+  declarations arrive in M9 for MCP servers. `.clanky/plugins/` is removed,
+  not reserved.
 
 ## ☐ M9 — MCP tools (deferred until needed)
 - Speak to MCP servers over stdio; their tools join `bash` behind the `Tool`
@@ -131,5 +140,6 @@ Architectural decisions already made:
    Answer: lazy
 3. ✔ **Discovery details:** how aggressively to auto-discover sibling binaries
    (`clanky-provider-*` naming convention?) vs requiring settings entries.
-   Answer: naming convension
+   Answer: naming convension (refined in M8 planning to PATH-only lookup, no
+   sibling scan and no settings entries — see `provider-plugins-plan.md`)
 4. ☐ **MCP scope when it arrives:** tools first; prompts/resources later if wanted.
