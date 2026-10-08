@@ -1,5 +1,5 @@
 /target
-/.clanky
+.clanky/
 
 # docker
 /.cargo-cache/

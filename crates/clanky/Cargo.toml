@@ -8,7 +8,6 @@ repository.workspace = true
 
 [dependencies]
 clanky-protocol = { path = "../clanky-protocol" }
-clanky-provider-deepinfra = { path = "../clanky-provider-deepinfra" }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }

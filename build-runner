@@ -14,16 +14,23 @@ set -eu
 
 cd "$(dirname "$0")"
 
-# Stage the release binary where the Dockerfile can COPY it (docker/ is the
-# build context, so the huge target/ dir stays out of it). Requires a musl
-# binary, so it must have been produced by ./build-linux-musl.
+# Stage the release binaries where the Dockerfile can COPY them (docker/ is
+# the build context, so the huge target/ dir stays out of it). Both are musl
+# binaries, so they must have been produced by ./build-linux-musl. The
+# provider plugin is a separate executable discovered on $PATH inside the
+# image (M8); /usr/local/bin is on PATH, so no configuration is needed.
 if [ ! -x target/release/clanky ]; then
   echo "ERROR: target/release/clanky not found. Run ./build-linux-musl first." >&2
   exit 1
 fi
+if [ ! -x target/release/clanky-provider-deepinfra ]; then
+  echo "ERROR: target/release/clanky-provider-deepinfra not found. Run ./build-linux-musl first." >&2
+  exit 1
+fi
 test -d docker/binaries || mkdir docker/binaries
 cp target/release/clanky docker/binaries/clanky
-chmod 755 docker/binaries/clanky
+cp target/release/clanky-provider-deepinfra docker/binaries/clanky-provider-deepinfra
+chmod 755 docker/binaries/clanky docker/binaries/clanky-provider-deepinfra
 
 if [ -f ~/.vimrc ]
 then

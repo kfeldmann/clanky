@@ -2,8 +2,8 @@
 //! completions (streaming over SSE).
 
 use clanky_protocol::{
-    Capabilities, ChatDone, ChatMessage, ChatRequest, ChunkPayload, Error, ErrorCode, FinishReason,
-    Handler, ModelInfo, PluginInfo, Thinking, Tool, Usage,
+    CancelFlag, Capabilities, ChatDone, ChatMessage, ChatRequest, ChunkPayload, Error, ErrorCode,
+    FinishReason, Handler, ModelInfo, PluginInfo, Thinking, Tool, Usage,
 };
 use serde_json::{Value, json};
 
@@ -31,6 +31,10 @@ pub const ENV_BASE_URL: &str = "DEEPINFRA_URL";
 pub struct DeepInfraProvider<B: Backend> {
     backend: B,
     base_url: String,
+    /// Set by the plugin runtime (spec §7); checked between SSE events so a
+    /// cancel stops generation at the next event boundary. A cancel during a
+    /// single blocked read is covered by the client's kill fallback.
+    cancel: CancelFlag,
 }
 
 impl DeepInfraProvider<crate::backend::UreqBackend> {
@@ -71,6 +75,7 @@ impl<B: Backend> DeepInfraProvider<B> {
         Self {
             backend,
             base_url: base_url.into(),
+            cancel: CancelFlag::default(),
         }
     }
 
@@ -88,7 +93,13 @@ impl<B: Backend> Handler for DeepInfraProvider<B> {
                 thinking: true,
                 tools: true,
             },
+            // Advertised at handshake so core needs no per-provider table.
+            default_model: Some(DEFAULT_MODEL.into()),
         }
+    }
+
+    fn set_cancel_flag(&mut self, flag: CancelFlag) {
+        self.cancel = flag;
     }
 
     fn list_models(&mut self) -> Result<Vec<ModelInfo>, Error> {
@@ -111,6 +122,12 @@ impl<B: Backend> Handler for DeepInfraProvider<B> {
             .map_err(|e| backend_to_protocol_error(e, "chat completion"))?;
         let mut state = StreamState::default();
         for payload in payloads {
+            // Spec §7: stop promptly once the client cancels. The check runs
+            // between SSE events; a cancel during a blocked read is handled
+            // by the client's kill fallback.
+            if self.cancel.is_cancelled() {
+                return Ok(state.finish_cancelled());
+            }
             let payload = payload.map_err(|e| backend_to_protocol_error(e, "chat stream"))?;
             let trimmed = payload.trim();
             if trimmed.is_empty() {
@@ -495,6 +512,15 @@ impl StreamState {
     fn finish(self) -> ChatDone {
         ChatDone {
             finish_reason: self.finish_reason.unwrap_or(FinishReason::Stop),
+            usage: self.usage,
+        }
+    }
+
+    /// Terminal status for a cancelled turn: whatever usage was reported
+    /// before the cancel, and `cancelled` as the finish reason (spec §7).
+    fn finish_cancelled(self) -> ChatDone {
+        ChatDone {
+            finish_reason: FinishReason::Cancelled,
             usage: self.usage,
         }
     }

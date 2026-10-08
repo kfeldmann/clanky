@@ -50,7 +50,8 @@ Plugin → client:
 ```json
 {"type": "hello", "protocolVersion": 1,
  "name": "deepinfra",
- "capabilities": {"listModels": true, "thinking": true, "tools": true}}
+ "capabilities": {"listModels": true, "thinking": true, "tools": true},
+ "defaultModel": "deepseek-ai/DeepSeek-V3"}
 ```
 
 Rules:
@@ -60,6 +61,12 @@ Rules:
 - `capabilities` flags are optional; absent = false. `listModels: false` means
   models come only from settings; `tools: false` means the plugin rejects
   chat requests containing `tools`.
+- `defaultModel` is an optional, additive hint (v1): the model Clanky uses
+  when neither settings nor `--model` name one. It lets the client keep no
+  hardcoded per-provider table. Absent means "no built-in default; require
+  explicit configuration".
+- `name` is the provider's real name, and is what Clanky registers the plugin
+  under (the `clanky-provider-<suffix>` filename is only the discovery hint).
 
 ## 4. List models
 
@@ -238,7 +245,7 @@ def main():
         msg = json.loads(line)
         if msg["type"] == "hello":
             emit({"type": "hello", "protocolVersion": 1, "name": "hello-world",
-                  "capabilities": {}})
+                  "capabilities": {}, "defaultModel": "hello-world/tiny"})
         elif msg["type"] == "chat":
             # ... call backend, translate each delta to a chunk event ...
             emit({"type": "chunk", "requestId": msg["id"],
@@ -254,7 +261,8 @@ if __name__ == "__main__":
 ```
 > {"type":"hello","protocolVersion":1}
 < {"type":"hello","protocolVersion":1,"name":"deepinfra",
-   "capabilities":{"listModels":true,"thinking":true,"tools":true}}
+   "capabilities":{"listModels":true,"thinking":true,"tools":true},
+   "defaultModel":"deepseek-ai/DeepSeek-V3"}
 > {"type":"listModels","id":7}
 < {"type":"models","id":7,"models":[{"id":"deepseek-ai/DeepSeek-V3"}]}
 > {"type":"chat","id":42,"model":"deepseek-ai/DeepSeek-V3",

@@ -86,7 +86,7 @@ Architectural decisions already made:
 - `$EDITOR` launch key (suspend TUI, edit, resume)
 - Done when: both work in TUI without breaking rendering.
 
-## ☐ M8 — Plugin system (providers)
+## ✔ M8 — Plugin system (providers)
 - Process-boundary transport for the provider protocol: spawn, handshake,
   long-lived process (keep alive for the session)
 - Migrate DeepInfra client into `clanky-provider-deepinfra` binary (mechanical —
@@ -107,6 +107,15 @@ Architectural decisions already made:
   declarations arrive in M9 for MCP servers. `.clanky/plugins/` is removed,
   not reserved.
 
+  As built: the plugin's name and default model come from the `hello`
+  handshake (core has no provider table); one long-lived process per session,
+  spawned lazily, moved into the TUI turn worker and handed back on
+  completion; plugin stderr → `./.clanky/logs/plugin-<name>.log`; a crashed
+  process is discarded and respawned on next use (no auto-retry of the turn).
+  The plugin-side wire rules live once in `clanky_protocol::serve`, shared by
+  the real binary and the loopback transport. The hello-world Python plugin
+  lives in `examples/hello-world-provider/`.
+
 ## ☐ M9 — MCP tools (deferred until needed)
 - Speak to MCP servers over stdio; their tools join `bash` behind the `Tool`
   trait from M2
@@ -115,7 +124,8 @@ Architectural decisions already made:
 
 ## ☐ M10 — Polish & release
 - Error messages, logging, docs, packaging (crates.io / release binaries)
-- Example provider plugin in the repo (hello-world, Python)
+- Example provider plugin in the repo (hello-world, Python) — already added
+  in M8 (`examples/hello-world-provider/`), so M10 only needs to link it
 - TUI quality-of-life: `↑`/`↓` prompt recall, `/system` (view the assembled
   system prompt); fix: fresh TUI sessions now seed the system context like
   pipe mode

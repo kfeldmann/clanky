@@ -75,6 +75,7 @@ use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use crate::error::Result;
 use crate::export::{self, ExportOptions};
 use crate::prompts::{self, Template};
+use crate::provider::ProviderSession;
 use crate::session::{self, SessionInfo, SessionWriter};
 use crate::settings::{SamplingParams, Settings};
 use crate::turn::{TurnConfig, TurnEvent, TurnOutput};
@@ -115,15 +116,14 @@ pub struct Launch {
 }
 
 impl Launch {
-    /// Build from merged settings for the chosen provider. The model falls
-    /// back to the provider default, mirroring pipe mode.
+    /// Build from merged settings for the chosen provider. When the settings
+    /// name no model, the plugin's advertised default (from the handshake)
+    /// fills it in at the first turn / catalog fetch (M8) — core keeps no
+    /// per-provider default table.
     pub fn from_settings(provider: &str, settings: &Settings) -> Self {
         Self {
             provider: provider.to_string(),
-            model: settings
-                .model
-                .clone()
-                .or_else(|| crate::provider::default_model(provider).map(str::to_string)),
+            model: settings.model.clone(),
             sampling: settings.sampling.clone(),
             thinking: settings.thinking.clone(),
             max_tool_rounds: settings.max_tool_rounds,
@@ -147,14 +147,28 @@ impl Launch {
 struct TurnEnd {
     result: crate::error::Result<TurnOutput>,
     history: Vec<ChatMessage>,
+    /// The long-lived plugin session, handed back to the UI thread so the
+    /// next turn reuses the same process (M8 decision #2). `None` when the
+    /// session could not be created (the next turn retries).
+    session: Option<ProviderSession>,
 }
 
 enum WorkerEvent {
     Turn(TurnEvent),
     /// Terminal status of the turn.
     Done(TurnEnd),
-    /// Model list for the [`Catalog`].
-    Models(crate::error::Result<Vec<ModelInfo>>),
+    /// Model list for the [`Catalog`], plus the plugin's advertised default
+    /// model (from the handshake).
+    Models(crate::error::Result<CatalogFetch>),
+}
+
+/// One catalog fetch: the provider it was for, its models, and its default
+/// model. The provider name guards against a stale fetch (a switch races an
+/// in-flight listing) adopting the wrong provider's default.
+struct CatalogFetch {
+    provider: String,
+    models: Vec<ModelInfo>,
+    default_model: Option<String>,
 }
 
 /// Effective per-million-token prices for one model, as used by the
@@ -253,28 +267,56 @@ fn restore<W: std::io::Write>(screen: &mut screen::Screen<W>) -> Result<()> {
     Ok(())
 }
 
-/// Spawn one agentic turn on a worker thread. The provider handler is
-/// created inside the thread, so `Handler` implementations need not be
-/// `Send` (M8's process transport will be).
-fn spawn_turn(history: Vec<ChatMessage>, launch: &Launch, prompt: String, tx: Sender<WorkerEvent>) {
+/// Spawn one agentic turn on a worker thread, reusing the long-lived plugin
+/// session when one exists (M8 decision #2). The session is moved in and
+/// handed back in [`TurnEnd`], so the process survives across turns without
+/// an extra thread. When no session exists yet, one is spawned lazily here
+/// (settled open question #2).
+fn spawn_turn(
+    history: Vec<ChatMessage>,
+    launch: &Launch,
+    session: Option<ProviderSession>,
+    prompt: String,
+    tx: Sender<WorkerEvent>,
+) {
     let launch = launch.clone();
     let mut messages = history;
     messages.push(ChatMessage::user(prompt));
     std::thread::Builder::new()
         .name("clanky-turn".into())
         .spawn(move || {
+            // Reuse the session from the previous turn, or spawn the plugin
+            // lazily on first use (settled open question #2). A session from
+            // a different provider (after `/provider`) or a crashed process
+            // is discarded and respawned here (restart on next use, spec §8).
+            // A failed spawn keeps `session` as `None`, so the next turn
+            // retries.
+            let mut session = match session {
+                Some(session) if session.is_alive() && session.name() == launch.provider => {
+                    Some(session)
+                }
+                _ => None,
+            };
             let outcome = (|| {
-                let handler = crate::provider::create(&launch.provider)?;
+                if session.is_none() {
+                    session = Some(crate::provider::create(&launch.provider)?);
+                }
+                let session = session.as_mut().expect("session was just ensured");
+                // The plugin's advertised default fills in for an unset model.
+                let model = launch
+                    .model
+                    .clone()
+                    .or_else(|| session.default_model().map(str::to_string));
                 let config = TurnConfig {
-                    model: launch.model.clone(),
+                    model,
                     sampling: launch.sampling.clone(),
                     thinking: launch.thinking.clone(),
                     max_tool_rounds: launch.max_tool_rounds,
                     max_retries: launch.max_retries,
                     retry_sleep: None,
                 };
-                crate::turn::run_turn(
-                    handler,
+                crate::turn::run_turn_with(
+                    session.client_mut(),
                     &crate::tools::default_tools(),
                     &mut messages,
                     &config,
@@ -283,11 +325,13 @@ fn spawn_turn(history: Vec<ChatMessage>, launch: &Launch, prompt: String, tx: Se
                     },
                 )
             })();
-            // Hand the conversation back in every case, not just on
-            // success: an aborted turn still leaves valid context behind.
+            // Hand the conversation and the session back in every case, not
+            // just on success: an aborted turn still leaves valid context
+            // behind, and the plugin process stays alive for the next turn.
             let _ = tx.send(WorkerEvent::Done(TurnEnd {
                 result: outcome,
                 history: messages,
+                session,
             }));
         })
         .expect("failed to spawn turn worker thread");
@@ -295,17 +339,23 @@ fn spawn_turn(history: Vec<ChatMessage>, launch: &Launch, prompt: String, tx: Se
 
 /// Fetch the provider's model list on a worker thread (network I/O must
 /// not block the render loop); the result feeds [`Catalog`].
+///
+/// Model listing happens before the first turn (there is no long-lived
+/// session yet) and after a `/provider` switch, so it uses a short-lived
+/// plugin process of its own. The handshake also yields the provider's
+/// default model, which the catalog fetch reports back.
 fn spawn_models(provider_name: String, tx: Sender<WorkerEvent>) {
     std::thread::Builder::new()
         .name("clanky-models".into())
         .spawn(move || {
-            let outcome: crate::error::Result<Vec<ModelInfo>> = (|| {
-                let handler = crate::provider::create(&provider_name)?;
-                let mut client = clanky_protocol::ProviderClient::new(
-                    clanky_protocol::LoopbackTransport::new(handler),
-                );
-                client.handshake()?;
-                Ok(client.list_models()?)
+            let outcome: crate::error::Result<CatalogFetch> = (|| {
+                let mut session = crate::provider::create(&provider_name)?;
+                let models = session.client_mut().list_models()?;
+                Ok(CatalogFetch {
+                    provider: provider_name.clone(),
+                    models,
+                    default_model: session.default_model().map(str::to_string),
+                })
             })();
             let _ = tx.send(WorkerEvent::Models(outcome));
         })
@@ -410,10 +460,13 @@ fn picker_for(kind: &PickerKind) -> picker::Picker {
             crate::provider::available()
                 .iter()
                 .map(|name| picker::PickerItem {
-                    label: (*name).to_string(),
-                    detail: crate::provider::default_model(name)
-                        .unwrap_or("")
-                        .to_string(),
+                    label: name.clone(),
+                    // The resolved command is cheap and needs no handshake;
+                    // the default model is only known after a handshake, so
+                    // it is not shown here.
+                    detail: crate::provider::command_for(name)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
                 })
                 .collect(),
         ),
@@ -655,9 +708,13 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     app.history = crate::context::system_messages();
     let mut state = SessionState::new(launch.clone());
     // Prefetch the provider's model catalog in the background: it prices
-    // the session-cost display and makes `/model` instant.
+    // the session-cost display and makes `/model` instant. The fetch also
+    // reports the plugin's advertised default model.
     let mut catalog = Catalog::new(launch.provider.clone());
     catalog.request(launch.provider.clone(), &tx, false);
+    // The long-lived plugin session (M8 decision #2): spawned lazily on the
+    // first turn, moved into the turn worker and handed back on completion.
+    let mut session_owner: Option<ProviderSession> = None;
     // Open picker with the payload it selects from, when active.
     let mut picker: Option<(picker::Picker, PickerKind)> = None;
     // Open modal, with the `/md` export it will write, when active.
@@ -690,7 +747,13 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
             },
         );
         app.busy = true;
-        spawn_turn(app.history.clone(), launch, prompt, tx.clone());
+        spawn_turn(
+            app.history.clone(),
+            launch,
+            session_owner.take(),
+            prompt,
+            tx.clone(),
+        );
     }
 
     loop {
@@ -770,7 +833,13 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                                         app.pending = Some(prompt);
                                     } else {
                                         app.busy = true;
-                                        spawn_turn(app.history.clone(), launch, prompt, tx.clone());
+                                        spawn_turn(
+                                            app.history.clone(),
+                                            launch,
+                                            session_owner.take(),
+                                            prompt,
+                                            tx.clone(),
+                                        );
                                     }
                                 }
                                 Action::None => {}
@@ -804,15 +873,25 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                     app.on_turn_event(turn_event.clone());
                     record_turn_event(&mut state, &mut app, &turn_event);
                 }
-                WorkerEvent::Done(done) => {
+                WorkerEvent::Done(mut done) => {
+                    // Reclaim the long-lived plugin process for the next turn.
+                    if let Some(session) = done.session.take() {
+                        session_owner = Some(session);
+                    }
                     record_done(&mut state, &mut app, &done);
                     app.on_turn_done(&done.result);
                     turn_finished = true;
                 }
                 WorkerEvent::Models(result) => match result {
                     Ok(fetched) => {
-                        let empty = fetched.is_empty();
-                        catalog.models = fetched;
+                        let empty = fetched.models.is_empty();
+                        // Adopt the plugin's advertised default when the
+                        // user/settings named no model. A late response for
+                        // a provider that is no longer active is ignored.
+                        if fetched.provider == launch.provider && launch.model.is_none() {
+                            launch.model = fetched.default_model.clone();
+                        }
+                        catalog.models = fetched.models;
                         if catalog.for_picker {
                             catalog.for_picker = false;
                             if empty {
@@ -840,7 +919,13 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                 },
             );
             app.busy = true;
-            spawn_turn(app.history.clone(), launch, prompt, tx.clone());
+            spawn_turn(
+                app.history.clone(),
+                launch,
+                session_owner.take(),
+                prompt,
+                tx.clone(),
+            );
         }
 
         if dirty {
@@ -1085,11 +1170,8 @@ fn apply_picker_selection(
         }
         PickerKind::Providers => {
             // Item order matches provider::available().
-            if let Some(name) = crate::provider::available().get(index) {
-                match set_provider(launch, name) {
-                    Ok(message) => app.entries.push(app::Entry::Info(message)),
-                    Err(message) => app.entries.push(app::Entry::Error(message)),
-                }
+            if let Some(name) = crate::provider::available().get(index).cloned() {
+                switch_provider(launch, catalog, tx, &name, app);
             }
         }
         PickerKind::Thinking => {
@@ -1116,6 +1198,7 @@ fn apply_picker_selection(
                         handle_command(app, state, launch, catalog, Command::Model(None), tx);
                     }
                     "/provider" => {
+                        crate::provider::refresh();
                         *picker = Some((picker_for(&PickerKind::Providers), PickerKind::Providers));
                     }
                     "/thinking" => {
@@ -1192,17 +1275,14 @@ fn handle_command(
             }
         }
         Command::Provider(Some(name)) => {
-            match set_provider(launch, &name) {
-                Ok(message) => {
-                    // Refresh the catalog so pricing follows the provider.
-                    catalog.request(name.clone(), tx, false);
-                    app.entries.push(app::Entry::Info(message));
-                }
-                Err(message) => app.entries.push(app::Entry::Error(message)),
-            }
+            switch_provider(launch, catalog, tx, &name, app);
             Action::None
         }
-        Command::Provider(None) => Action::OpenPicker(PickerKind::Providers),
+        Command::Provider(None) => {
+            // Re-scan $PATH so a plugin installed since startup shows up.
+            crate::provider::refresh();
+            Action::OpenPicker(PickerKind::Providers)
+        }
         Command::Thinking(Some(raw)) => {
             match crate::turn::parse_thinking(&raw) {
                 Ok(parsed) => {
@@ -1279,20 +1359,40 @@ fn push_system_report(app: &mut app::App, parts: &[(String, String)]) {
     }
 }
 
-/// Switch provider; the model resets to the new provider's default (model
-/// ids do not transfer between providers).
-fn set_provider(launch: &mut Launch, name: &str) -> std::result::Result<String, String> {
-    let Some(default_model) = crate::provider::default_model(name) else {
+/// Validate a provider name against discovery; the model is cleared (model
+/// ids do not transfer between providers) and filled from the new plugin's
+/// handshake at the next turn.
+fn set_provider(launch: &mut Launch, name: &str) -> std::result::Result<(), String> {
+    if crate::provider::find(name).is_none() {
         return Err(format!(
-            "unknown provider `{name}`; available: {}",
+            "unknown provider `{name}`; discovered plugins: {}",
             crate::provider::available().join(", ")
         ));
-    };
+    }
     launch.provider = name.to_string();
-    launch.model = Some(default_model.to_string());
-    Ok(format!(
-        "provider set to `{name}` (model `{default_model}`)"
-    ))
+    launch.model = None;
+    Ok(())
+}
+
+/// Apply a provider switch: tear down the old session (the next turn spawns
+/// the new plugin), reset the model, and refresh the catalog.
+fn switch_provider(
+    launch: &mut Launch,
+    catalog: &mut Catalog,
+    tx: &Sender<WorkerEvent>,
+    name: &str,
+    app: &mut app::App,
+) {
+    match set_provider(launch, name) {
+        Ok(()) => {
+            // The model is resolved from the new plugin's handshake on the
+            // next turn; refresh the catalog so pricing follows the provider.
+            catalog.request(name.to_string(), tx, false);
+            app.entries
+                .push(app::Entry::Info(format!("provider set to `{name}`")));
+        }
+        Err(message) => app.entries.push(app::Entry::Error(message)),
+    }
 }
 
 /// Apply a `/sampling` edit to the launch config, reporting as an entry.
@@ -1525,10 +1625,29 @@ fn handle_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Plugin;
     use crate::settings::Settings;
 
     fn launch() -> Launch {
         Launch::from_settings("deepinfra", &Settings::default())
+    }
+
+    /// Install a fake discovered-plugin list for the duration of one test.
+    /// The cache is process-wide, so the lock serializes these tests; tests
+    /// that only read `launch()` never touch discovery.
+    fn with_providers(plugins: &[(&str, &str)]) -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::provider::override_for_test(
+            plugins
+                .iter()
+                .map(|(name, path)| Plugin {
+                    name: (*name).to_string(),
+                    path: PathBuf::from(path),
+                })
+                .collect(),
+        );
+        guard
     }
 
     #[test]
@@ -1638,6 +1757,7 @@ mod tests {
         assert!(all.contains("thinking"), "{all}");
         assert!(all.contains("$0.40 · $1.20 /Mtok"), "{all}");
 
+        let _guard = with_providers(&[("deepinfra", "/usr/local/bin/clanky-provider-deepinfra")]);
         assert_eq!(picker_for(&PickerKind::Providers).title(), "provider");
         let providers = picker_for(&PickerKind::Providers)
             .lines(10)
@@ -1652,6 +1772,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(providers.contains("deepinfra"), "{providers}");
+        assert!(
+            providers.contains("clanky-provider-deepinfra"),
+            "{providers}"
+        );
 
         assert_eq!(picker_for(&PickerKind::Thinking).title(), "thinking");
         let thinking = picker_for(&PickerKind::Thinking)
@@ -1753,20 +1877,22 @@ mod tests {
     }
 
     #[test]
-    fn set_provider_validates_and_resets_model() {
+    fn set_provider_validates_and_clears_the_model() {
+        let _guard = with_providers(&[
+            ("deepinfra", "/usr/local/bin/clanky-provider-deepinfra"),
+            ("other", "/usr/local/bin/clanky-provider-other"),
+        ]);
         let mut launch = launch();
         launch.model = Some("old/model".into());
-        let message = set_provider(&mut launch, "deepinfra").unwrap();
-        assert_eq!(launch.provider, "deepinfra");
-        assert_eq!(
-            launch.model.as_deref(),
-            Some("deepseek-ai/DeepSeek-V4-Flash-0731")
-        );
-        assert!(message.contains("deepinfra"), "{message}");
+        set_provider(&mut launch, "other").unwrap();
+        assert_eq!(launch.provider, "other");
+        // The model is resolved from the new plugin's handshake, so it is
+        // cleared rather than carried over.
+        assert_eq!(launch.model, None);
 
         let err = set_provider(&mut launch, "nonexistent").unwrap_err();
         assert!(err.contains("unknown provider `nonexistent`"), "{err}");
-        assert_eq!(launch.provider, "deepinfra", "failed switch is a no-op");
+        assert_eq!(launch.provider, "other", "failed switch is a no-op");
     }
 
     #[test]

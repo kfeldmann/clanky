@@ -2,10 +2,10 @@
 //!
 //! M3: interactive TUI (chat view, streaming render, markdown wrap) with
 //! the M2 agentic tool loop underneath. A prompt is run against the
-//! DeepInfra provider via the protocol loopback transport. When stdin or
-//! stdout is redirected (or `-p` is passed) the same turn runs in plain
-//! command-line mode, streaming text to stdout and tool activity to
-//! stderr. Spawned provider plugin processes arrive in M8.
+//! provider plugin (discovered on `$PATH`, spawned as a subprocess, M8).
+//! When stdin or stdout is redirected (or `-p` is passed) the same turn runs
+//! in plain command-line mode, streaming text to stdout and tool activity to
+//! stderr.
 
 use std::io::{IsTerminal as _, Write as _};
 use std::process::ExitCode;
@@ -75,14 +75,17 @@ fn run_pipe(settings: &mut Settings) -> Result<()> {
         .take()
         .unwrap_or_else(|| provider::DEFAULT_PROVIDER.into());
 
-    let handler = provider::create(&provider_name)?;
-    let config = turn::TurnConfig::from_settings(&provider_name, settings);
+    // One long-lived plugin process for the turn (M8). It is shut down when
+    // the session drops (stdin EOF per spec §1).
+    let mut session = provider::create(&provider_name)?;
+    let default_model = session.default_model().map(str::to_string);
+    let config = turn::TurnConfig::from_settings(settings, default_model.as_deref());
 
     let mut messages = context::system_messages();
     messages.push(clanky_protocol::ChatMessage::user(&prompt_text));
 
-    let output = turn::run_turn(
-        handler,
+    let output = turn::run_turn_with(
+        session.client_mut(),
         &tools::default_tools(),
         &mut messages,
         &config,

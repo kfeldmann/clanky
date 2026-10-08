@@ -24,8 +24,52 @@ pub enum Error {
     #[error("no prompt given: pass a prompt on the command line or pipe one via stdin")]
     NoPrompt,
 
-    #[error("unknown provider `{0}`; available: deepinfra")]
-    UnknownProvider(String),
+    #[error("unknown provider `{name}`; discovered plugins: {available}", available = available.join(", "))]
+    UnknownProvider {
+        name: String,
+        /// Discovered `clanky-provider-*` names (possibly empty).
+        available: Vec<String>,
+    },
+
+    #[error(
+        "no plugin found for the default provider `{name}`: install `{binary}` (e.g. `cargo install {binary}`) so it is on $PATH"
+    )]
+    DefaultProviderMissing {
+        name: String,
+        binary: String,
+        available: Vec<String>,
+    },
+
+    #[error("failed to start provider plugin `{name}` from {}: {source} (plugin log: {})", command.display(), log.display())]
+    PluginSpawn {
+        name: String,
+        command: PathBuf,
+        log: PathBuf,
+        #[source]
+        source: Box<clanky_protocol::Error>,
+    },
+
+    #[error("provider plugin `{name}` failed its handshake: {source} (plugin log: {})", log.display())]
+    PluginHandshake {
+        name: String,
+        log: PathBuf,
+        #[source]
+        source: Box<clanky_protocol::Error>,
+    },
+
+    #[error(
+        "provider plugin `{name}` requires protocol v{peer}, but clanky speaks v{supported}; upgrade clanky or the plugin"
+    )]
+    PluginProtocolVersion {
+        name: String,
+        peer: u32,
+        supported: u32,
+    },
+
+    #[error(
+        "provider plugin `{requested}` reported the name `{reported}` at handshake; the name must match the `clanky-provider-*` filename suffix"
+    )]
+    PluginNameMismatch { requested: String, reported: String },
 
     #[error("no model configured: set `model` in settings.toml or pass --model")]
     NoModel,

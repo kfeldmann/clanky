@@ -1,7 +1,11 @@
 # Dockerfile for the clanky runner image: Alpine + the compiled release
-# binary, with a user matching the host UID/GID. Built by the `build-runner`
-# script with `docker/` as the build context (so `clanky` below is the
-# release binary staged there by build-runner).
+# binaries, with a user matching the host UID/GID. Built by the `build-runner`
+# script with `docker/` as the build context (so the files copied from
+# `binaries/` below are the release binaries staged there by build-runner).
+#
+# Both `clanky` and `clanky-provider-deepinfra` land in /usr/local/bin, which
+# is on PATH, so Clanky's PATH-based plugin discovery finds the provider with
+# zero configuration (M8).
 FROM alpine:3.24
 
 ARG EXTRA_PACKAGES=""

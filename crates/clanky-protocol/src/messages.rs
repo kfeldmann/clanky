@@ -26,6 +26,11 @@ pub enum Message {
         name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         capabilities: Option<Capabilities>,
+        /// Provider-recommended default model (plugin → client only). Lets
+        /// core drop its hardcoded per-provider default table; absent means
+        /// "no built-in default, require explicit configuration".
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_model: Option<String>,
     },
     /// Client → plugin: enumerate models.
     ListModels { id: u64 },
@@ -327,6 +332,11 @@ pub enum Error {
     Protocol(String),
     #[error("transport error: {0}")]
     Io(#[from] std::io::Error),
+    /// The plugin process died or could not be spoken to (spec §8: an
+    /// unexpected exit mid-request is a crash). The caller restarts the
+    /// plugin on next use; the in-flight turn is not retried.
+    #[error("provider plugin process failed: {message}")]
+    ProcessDied { message: String },
     #[error("{code}: {message}")]
     Provider {
         code: ErrorCode,
@@ -389,6 +399,7 @@ mod tests {
                 thinking: true,
                 tools: true,
             }),
+            default_model: None,
         };
         let json = serde_json::to_value(&hello).unwrap();
         assert_eq!(
@@ -398,8 +409,38 @@ mod tests {
                 "protocolVersion": 1,
                 "name": "deepinfra",
                 "capabilities": {"listModels": true, "thinking": true, "tools": true}
+            }),
+            "an absent default model is omitted from the wire form"
+        );
+    }
+
+    #[test]
+    fn hello_carries_an_optional_default_model() {
+        let hello = Message::Hello {
+            protocol_version: 1,
+            name: Some("deepinfra".into()),
+            capabilities: None,
+            default_model: Some("deepseek-ai/DeepSeek-V4-Flash-0731".into()),
+        };
+        let json = serde_json::to_value(&hello).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "type": "hello",
+                "protocolVersion": 1,
+                "name": "deepinfra",
+                "defaultModel": "deepseek-ai/DeepSeek-V4-Flash-0731"
             })
         );
+
+        // Absent on the wire means `None` (additive, optional v1 change).
+        let parsed = parse_message(r#"{"type": "hello", "protocolVersion": 1, "name": "x"}"#)
+            .unwrap()
+            .expect("hello");
+        match parsed {
+            Message::Hello { default_model, .. } => assert_eq!(default_model, None),
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     #[test]

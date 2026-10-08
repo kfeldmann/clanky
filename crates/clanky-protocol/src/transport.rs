@@ -7,7 +7,8 @@
 //! agnostic.
 
 use crate::handler::{ChatDone, ChatRequest, Handler};
-use crate::messages::{ChunkPayload, Error, Message, PROTOCOL_VERSION};
+use crate::messages::{ChunkPayload, Error, Message};
+use crate::serve::dispatch_request;
 
 /// Client-side transport: send one request, receive the response messages up
 /// to and including the request's terminal message.
@@ -49,44 +50,14 @@ impl<H: Handler> LoopbackTransport<H> {
 
     fn dispatch(&mut self, msg: Message) -> Result<Vec<Message>, Error> {
         // NOTE: `Message::Chat` never reaches this method; see `Transport::send`.
-        match msg {
-            Message::Hello {
-                protocol_version, ..
-            } => {
-                if protocol_version != PROTOCOL_VERSION {
-                    // A real plugin would send `error` + exit; the loopback
-                    // surfaces it directly.
-                    return Err(Error::VersionMismatch {
-                        peer: protocol_version,
-                    });
-                }
-                let info = self.handler.info();
-                Ok(vec![Message::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                    name: Some(info.name),
-                    capabilities: Some(info.capabilities),
-                }])
-            }
-            Message::ListModels { id } => match self.handler.list_models() {
-                Ok(models) => Ok(vec![Message::Models { id, models }]),
-                Err(Error::Provider {
-                    code,
-                    message,
-                    retryable,
-                    retry_after_ms,
-                }) => Ok(vec![Message::Error {
-                    request_id: Some(id),
-                    code,
-                    message,
-                    retryable,
-                    retry_after_ms,
-                }]),
-                Err(other) => Err(other),
-            },
-            other => Err(Error::Protocol(format!(
-                "unexpected message from client: {:?}",
-                other
-            ))),
+        // The non-streaming wire rules are shared with the process plugin
+        // runtime via `serve::dispatch_request`, so the loopback and a real
+        // plugin cannot drift apart.
+        match dispatch_request(&mut self.handler, msg)? {
+            Some(response) => Ok(vec![response]),
+            None => Err(Error::Protocol(
+                "unexpected message from client: expected hello/listModels".into(),
+            )),
         }
     }
 }

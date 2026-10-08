@@ -38,6 +38,7 @@ impl Handler for ScriptedProvider {
                 thinking: true,
                 tools: true,
             },
+            default_model: None,
         }
     }
 

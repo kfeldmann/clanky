@@ -1,9 +1,9 @@
 //! DeepInfra provider plugin for Clanky.
 //!
 //! Implements the Clanky provider protocol (`clanky-protocol`) on top of
-//! DeepInfra's OpenAI-compatible chat completions API. M1 runs it in-process
-//! behind the loopback transport; in M8 the same handler ships behind a
-//! spawned process (`clanky-provider-deepinfra` binary).
+//! DeepInfra's OpenAI-compatible chat completions API. The library holds the
+//! provider logic (testable in-process); the `clanky-provider-deepinfra`
+//! binary serves it as a plugin process over stdin/stdout.
 //!
 //! Auth: the provider reads its own credentials from the environment —
 //! `DEEPINFRA_API_KEY`, falling back to `DEEPINFRA_TOKEN`. Clanky core never

@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Hello-world Clanky provider plugin.
+
+A complete, dependency-free provider plugin: it speaks the JSONL protocol
+from `provider-protocol.md` over stdin/stdout, so Clanky can run it as a
+subprocess with no configuration beyond putting an executable named
+`clanky-provider-hello-world` on `$PATH`.
+
+It answers every chat with a fixed greeting (and a canned model list), which
+makes it the smallest useful plugin to copy when writing a real one. See the
+README section "Writing a provider plugin".
+"""
+
+import json
+import sys
+
+PROTOCOL_VERSION = 1
+DEFAULT_MODEL = "hello-world/tiny"
+
+
+def emit(message):
+    """Write one protocol message as a single JSON line."""
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def on_hello(message):
+    if message["protocolVersion"] != PROTOCOL_VERSION:
+        emit({
+            "type": "error",
+            "code": "protocolVersion",
+            "message": "this plugin speaks protocol v%d" % PROTOCOL_VERSION,
+        })
+        sys.exit(1)
+    emit({
+        "type": "hello",
+        "protocolVersion": PROTOCOL_VERSION,
+        "name": "hello-world",
+        "capabilities": {"listModels": True, "tools": False, "thinking": False},
+        "defaultModel": DEFAULT_MODEL,
+    })
+
+
+def on_list_models(message):
+    emit({
+        "type": "models",
+        "id": message["id"],
+        "models": [{
+            "id": DEFAULT_MODEL,
+            "displayName": "Hello World Tiny",
+            "contextWindow": 4096,
+        }],
+    })
+
+
+def on_chat(message):
+    request_id = message["id"]
+    # Stream the answer in a couple of pieces, like a real backend would.
+    for text in ["Hello from ", "a plugin!"]:
+        emit({
+            "type": "chunk",
+            "requestId": request_id,
+            "payload": {"kind": "text", "text": text},
+        })
+    emit({
+        "type": "done",
+        "requestId": request_id,
+        "finishReason": "stop",
+        "usage": {"promptTokens": 0, "completionTokens": 2},
+    })
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            # Never die on junk; the protocol ignores what it does not know.
+            continue
+        kind = message.get("type")
+        if kind == "hello":
+            on_hello(message)
+        elif kind == "listModels":
+            on_list_models(message)
+        elif kind == "chat":
+            on_chat(message)
+        elif kind == "cancel":
+            # Nothing to abort: this plugin emits its whole answer at once.
+            # A real streaming plugin would stop and emit
+            # `finishReason: "cancelled"`.
+            pass
+        # Unknown types are ignored (protocol v1 is additive).
+
+
+if __name__ == "__main__":
+    main()

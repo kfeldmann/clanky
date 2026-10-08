@@ -112,7 +112,6 @@ name = "clanky"
 version = "0.1.0"
 dependencies = [
  "clanky-protocol",
- "clanky-provider-deepinfra",
  "clap",
  "dirs",
  "ratatui",
@@ -131,6 +130,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "wait-timeout",
 ]
 
 [[package]]

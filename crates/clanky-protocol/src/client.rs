@@ -8,6 +8,7 @@ use crate::messages::{ChunkPayload, Error, Message, ModelInfo, PROTOCOL_VERSION}
 use crate::transport::Transport;
 
 /// Drives one provider connection.
+#[derive(Debug)]
 pub struct ProviderClient<T: Transport> {
     transport: T,
     next_id: u64,
@@ -29,6 +30,16 @@ impl<T: Transport> ProviderClient<T> {
 
     pub fn into_transport(self) -> T {
         self.transport
+    }
+
+    /// Borrow the underlying transport (e.g. to reach a plugin process's
+    /// [`CancelHandle`](crate::process::CancelHandle)).
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -53,6 +64,7 @@ impl<T: Transport> ProviderClient<T> {
             protocol_version: PROTOCOL_VERSION,
             name: None,
             capabilities: None,
+            default_model: None,
         };
         let mut no_chunks = |_: ChunkPayload| {};
         let mut responses = self.transport.send(hello, &mut no_chunks)?;
@@ -61,6 +73,7 @@ impl<T: Transport> ProviderClient<T> {
                 protocol_version,
                 name,
                 capabilities,
+                default_model,
             })) => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(Error::VersionMismatch {
@@ -70,6 +83,7 @@ impl<T: Transport> ProviderClient<T> {
                 self.peer = Some(PluginInfo {
                     name: name.unwrap_or_default(),
                     capabilities: capabilities.unwrap_or_default(),
+                    default_model,
                 });
                 Ok(())
             }
@@ -128,6 +142,10 @@ impl<T: Transport> ProviderClient<T> {
         let responses = self.transport.send(msg, &mut sink)?;
         for resp in responses {
             match resp? {
+                // A transport may deliver stream events either through the
+                // `sink` (loopback, in-process) or as `chunk` messages in
+                // the response iterator (process transport); both are
+                // forwarded here, exactly once.
                 Message::Chunk {
                     request_id,
                     payload,
@@ -261,6 +279,7 @@ mod tests {
             PluginInfo {
                 name: self.name.into(),
                 capabilities: self.caps,
+                default_model: None,
             }
         }
 
@@ -406,6 +425,7 @@ mod tests {
                         protocol_version: 99,
                         name: Some("old".into()),
                         capabilities: None,
+                        default_model: None,
                     }]
                     .into_iter()
                     .map(Ok),

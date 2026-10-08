@@ -20,9 +20,12 @@ entries optional:
 │   └── <name>/SKILL.md     pi-style directory skill
 ├── prompts/                prompt templates, invoked as /<name> slash commands
 │   └── <name>.md
-├── plugins/                plugin declarations (providers; arrives in M8)
+├── logs/                   provider plugin stderr logs (project scope only)
 └── sessions/               session files (project scope only)
 ```
+
+Provider plugins are **not** configured here: they are discovered on `$PATH`
+(see [Provider plugins](#provider-plugins) below).
 
 ### Precedence
 
@@ -89,6 +92,60 @@ screen, no mouse capture — so scrolling and copy/paste are your
 terminal's own (native scrollbar or wheel, native text selection), and
 the conversation stays in the terminal after clanky quits. `ctrl+l`
 erases the visible screen (scrollback is kept).
+
+## Provider plugins
+
+Clanky core contains no provider-specific code. Every provider is a separate
+executable named `clanky-provider-<name>` on `$PATH`, speaking a small JSONL
+protocol over stdin/stdout (see `provider-protocol.md`). This means:
+
+- **Zero config.** Install `clanky` and `clanky-provider-deepinfra` (both from
+  the same workspace) and Clanky finds the provider on `$PATH`:
+
+  ```sh
+  cargo install clanky clanky-provider-deepinfra
+  ```
+
+  (Both land in `~/.cargo/bin`, which is on `$PATH`.)
+
+- **Any language.** A plugin is a process; the contract is JSON over stdio.
+  There is a complete ~90-line Python example in
+  [`examples/hello-world-provider/`](examples/hello-world-provider/).
+- **Provider name comes from the handshake, not the filename.** The binary
+  `clanky-provider-deepinfra` reports `name: "deepinfra"` when it starts, and
+  Clanky registers it under that name (`--provider deepinfra`, sessions, and
+  settings all keep working).
+- **No settings table.** A plugin reads its own credentials from the
+  environment, which it inherits from Clanky (`DEEPINFRA_API_KEY` /
+  `DEEPINFRA_TOKEN` / `DEEPINFRA_URL`); Clanky never handles provider keys.
+- **Isolation.** Each plugin is a long-lived subprocess (one per session,
+  spawned lazily on first use). Its stderr goes to
+  `./.clanky/logs/plugin-<name>.log`, never to the chat; a crash mid-turn
+  surfaces an error and the plugin is respawned on the next turn.
+
+The provider's default model (used when neither settings nor `--model` name
+one) is advertised by the plugin at handshake, so Clanky keeps no hardcoded
+per-provider table.
+
+### Writing a provider plugin
+
+A plugin is a program that:
+
+1. Reads one JSON message per line from stdin and writes one per line to
+   stdout (stderr is ignored except for logging).
+2. Answers `hello` with its `name`, `capabilities`, and `defaultModel`.
+3. Answers `listModels` with its catalog.
+4. Answers `chat` with `chunk` events and exactly one terminal `done`/`error`.
+5. Exits when stdin closes.
+
+See `provider-protocol.md` for the full spec and
+[`examples/hello-world-provider/clanky-provider-hello-world`](examples/hello-world-provider/clanky-provider-hello-world)
+for a minimal working example. To try it:
+
+```sh
+export PATH="$PWD/examples/hello-world-provider:$PATH"
+clanky --provider hello-world -p "say hi"
+```
 
 ## TUI keys
 

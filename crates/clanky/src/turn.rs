@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use clanky_protocol::{
     ChatMessage, ChatRequest, ChunkPayload, Error as ProtocolError, FinishReason, Handler,
-    LoopbackTransport, Sampling, StreamAssembler, Thinking, ToolCall, Usage,
+    LoopbackTransport, ProviderClient, Sampling, StreamAssembler, Thinking, ToolCall, Transport,
+    Usage,
 };
 
 use crate::error::{Error, Result};
@@ -59,15 +60,18 @@ pub struct TurnConfig {
 }
 
 impl TurnConfig {
-    /// Build from merged settings for the chosen provider; the model falls
-    /// back to the provider default when unset. Used by both pipe and TUI
-    /// modes (M3).
-    pub fn from_settings(provider: &str, settings: &crate::settings::Settings) -> Self {
+    /// Build from merged settings. `default_model` comes from the plugin
+    /// handshake (M8), so core keeps no per-provider default table; it is
+    /// used only when the settings name no model.
+    pub fn from_settings(
+        settings: &crate::settings::Settings,
+        default_model: Option<&str>,
+    ) -> Self {
         Self {
             model: settings
                 .model
                 .clone()
-                .or_else(|| crate::provider::default_model(provider).map(str::to_string)),
+                .or_else(|| default_model.map(str::to_string)),
             sampling: settings.sampling.clone(),
             thinking: settings.thinking.clone(),
             max_tool_rounds: settings.max_tool_rounds,
@@ -123,7 +127,8 @@ pub struct TurnOutput {
     pub usage: Option<clanky_protocol::Usage>,
 }
 
-/// Run one full agentic turn against `handler` (in-process until M8).
+/// Run one full agentic turn against an in-process `handler` (loopback
+/// transport; used by tests and the golden transcripts).
 ///
 /// `messages` is the complete conversation so far, ending with the new
 /// user prompt (system context first). It is mutated in place: the turn's
@@ -137,9 +142,25 @@ pub fn run_turn(
     config: &TurnConfig,
     on_event: &mut dyn FnMut(TurnEvent),
 ) -> Result<TurnOutput> {
-    let mut client = clanky_protocol::ProviderClient::new(LoopbackTransport::new(handler));
-    client.handshake()?;
+    let mut client = ProviderClient::new(LoopbackTransport::new(handler));
+    run_turn_with(&mut client, tools, messages, config, on_event)
+}
 
+/// Run one full agentic turn through an already-handshaken provider client.
+///
+/// This is the real entry point for a process-backed [`ProviderSession`]
+/// (M8); [`run_turn`] is the in-process loopback wrapper used by tests.
+///
+/// [`ProviderSession`]: crate::provider::ProviderSession
+pub fn run_turn_with<T: Transport>(
+    client: &mut ProviderClient<T>,
+    tools: &ToolSet,
+    messages: &mut Vec<ChatMessage>,
+    config: &TurnConfig,
+    on_event: &mut dyn FnMut(TurnEvent),
+) -> Result<TurnOutput> {
+    // Idempotent: a `ProviderSession` already handshook when it was created.
+    client.handshake()?;
     let tool_capable = client.peer().is_some_and(|peer| peer.capabilities.tools);
     let wire_tools = if tool_capable && !tools.is_empty() {
         Some(tools.iter().map(|tool| tool.wire()).collect::<Vec<_>>())
@@ -562,6 +583,7 @@ mod tests {
             PluginInfo {
                 name: "mock".into(),
                 capabilities: self.caps,
+                default_model: None,
             }
         }
 
@@ -1206,6 +1228,7 @@ mod tests {
                 PluginInfo {
                     name: "half".into(),
                     capabilities: Capabilities::default(),
+                    default_model: None,
                 }
             }
             fn list_models(

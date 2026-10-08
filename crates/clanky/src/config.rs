@@ -23,7 +23,7 @@
 //! ├── AGENTS.md       agent instructions
 //! ├── skills/         skill markdown, loaded into context
 //! ├── prompts/        prompt templates, invoked as /<name> slash commands
-//! ├── plugins/        plugin declarations (providers; arrives in M8)
+//! ├── logs/           plugin stderr logs (created on demand)
 //! └── sessions/       session files (project scope only)
 //! ```
 //!
@@ -42,8 +42,9 @@ pub const AGENTS_FILE: &str = "AGENTS.md";
 pub const PROMPTS_DIR: &str = "prompts";
 /// Skills directory inside a scope directory.
 pub const SKILLS_DIR: &str = "skills";
-/// Plugins directory inside a scope directory.
-pub const PLUGINS_DIR: &str = "plugins";
+/// Logs directory inside the project scope directory; provider plugin
+/// stderr is appended to `logs/plugin-<name>.log` (never the chat).
+pub const LOGS_DIR: &str = "logs";
 /// Sessions directory inside the project scope directory.
 pub const SESSIONS_DIR: &str = "sessions";
 
@@ -95,7 +96,7 @@ mod tests {
         assert_eq!(scope.join(AGENTS_FILE), PathBuf::from(".clanky/AGENTS.md"));
         assert_eq!(scope.join(PROMPTS_DIR), PathBuf::from(".clanky/prompts"));
         assert_eq!(scope.join(SKILLS_DIR), PathBuf::from(".clanky/skills"));
-        assert_eq!(scope.join(PLUGINS_DIR), PathBuf::from(".clanky/plugins"));
+        assert_eq!(scope.join(LOGS_DIR), PathBuf::from(".clanky/logs"));
         assert_eq!(scope.join(SESSIONS_DIR), PathBuf::from(".clanky/sessions"));
     }
 }

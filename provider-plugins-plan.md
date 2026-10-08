@@ -1,5 +1,10 @@
 # Plan — Provider plugins (M8)
 
+> **Status: implemented.** Every work-breakdown item below landed; see
+> `milestones.md` M8 for the as-built notes and the test suites in
+> `crates/clanky-protocol/tests/process.rs`, `crates/clanky/tests/plugin_e2e.rs`,
+> and `crates/clanky/tests/plugin_pipe.rs`.
+
 Extract the DeepInfra provider out of the `clanky` binary into a standalone plugin process, and make Clanky core provider-agnostic. This is milestone M8 (`milestones.md`): "Plugin system (providers)".
 
 ## Goal

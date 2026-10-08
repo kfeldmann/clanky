@@ -45,6 +45,7 @@ fi
 docker run \
   ${INTERACTIVE_FLAGS} --rm \
   --env DEEPINFRA_URL \
+  --env DEEPINFRA_API_KEY \
   --env DEEPINFRA_TOKEN \
   -v "$(pwd):/work" \
   -v "$HOME/.clanky:/home/clanky/.clanky" \
