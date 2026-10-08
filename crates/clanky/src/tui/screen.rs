@@ -32,6 +32,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use super::app::{App, CompletionState};
+use super::modal::Modal;
 use super::picker::Picker;
 
 /// Prompt symbol for the input line.
@@ -125,6 +126,7 @@ impl<W: Write> Screen<W> {
         app: &mut App,
         status: &Status<'_>,
         picker: Option<&Picker>,
+        modal: Option<&Modal>,
         completion: Option<&CompletionState>,
     ) -> io::Result<()> {
         let width = self.width;
@@ -137,6 +139,7 @@ impl<W: Write> Screen<W> {
             app,
             status,
             picker,
+            modal,
             completion,
             width,
             height,
@@ -314,6 +317,7 @@ fn footer_lines(
     app: &App,
     status: &Status<'_>,
     picker: Option<&Picker>,
+    modal: Option<&Modal>,
     completion: Option<&CompletionState>,
     width: u16,
     height: u16,
@@ -321,7 +325,16 @@ fn footer_lines(
     estimated_completion: u64,
 ) -> Footer {
     let mut lines = Vec::new();
-    if let Some(picker) = picker {
+    // An open modal owns the caret: it is drawn above the status line and
+    // the main input row (which stays visible) keeps its own.
+    let mut modal_caret = None;
+    if let Some(modal) = modal {
+        let (box_lines, caret) = modal_box(modal, width, height);
+        if !box_lines.is_empty() {
+            modal_caret = Some(caret);
+        }
+        lines.extend(box_lines);
+    } else if let Some(picker) = picker {
         lines.extend(picker_box(picker, width, height));
     } else if let Some(completion) = completion {
         lines.extend(completion_box(completion, width, height));
@@ -335,7 +348,10 @@ fn footer_lines(
     ));
     let (input, caret) = input_row(app, width);
     lines.push(input);
-    Footer { lines, caret }
+    Footer {
+        lines,
+        caret: modal_caret.unwrap_or(caret),
+    }
 }
 
 /// Status line: provider · model · think · session · cost on the left;
@@ -567,6 +583,38 @@ fn completion_box(completion: &CompletionState, width: u16, height: u16) -> Vec<
     boxed(&title, rows, width)
 }
 
+/// The text-entry modal: a prompt row and the field being typed, windowed
+/// so the caret stays visible. Returns the box rows and the caret column
+/// within them (the box may be skipped on a tiny terminal, in which case
+/// the caller keeps the main input caret).
+fn modal_box(modal: &Modal, width: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+    if width < 24 || height < 8 {
+        return (Vec::new(), 0);
+    }
+    let title = format!(" {} ", modal.title());
+    let prompt = Line::from(Span::styled(
+        modal.prompt().to_string(),
+        Style::new().fg(Color::DarkGray),
+    ));
+    // Size the box from the prompt (the field is windowed to the box, so
+    // it can never widen it) and window the field to that inner width.
+    let inner = box_width(title.width(), line_width(&prompt), width) - 4;
+    let (field, caret_col) = input_window(&modal.input, modal.cursor, inner);
+    let rows = vec![prompt, Line::from(field)];
+    (boxed(&title, rows, width), 2 + caret_col as u16)
+}
+
+/// The box width for a title and content of the given widths: wide enough
+/// for both, never wider than the screen.
+fn box_width(title_width: usize, content_width: usize, width: u16) -> usize {
+    content_width
+        .max(title_width)
+        .saturating_add(4) // "│ " + " │"
+        .min(width.saturating_sub(2) as usize)
+        .max(title_width + 6)
+        .max(8)
+}
+
 /// Wrap `rows` in a rounded box with `title` in the top border. The box
 /// is as wide as the widest row (plus padding), never wider than the
 /// screen; rows are truncated and padded to the box width.
@@ -575,12 +623,7 @@ fn boxed(title: &str, rows: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>
     let title_style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
     let content_width = rows.iter().map(|l| line_width(l)).max().unwrap_or(0);
-    let box_width = content_width
-        .max(title.width())
-        .saturating_add(4) // "│ " + " │"
-        .min(width.saturating_sub(2) as usize)
-        .max(title.width() + 6)
-        .max(8);
+    let box_width = box_width(title.width(), content_width, width);
     let inner_width = box_width - 4;
 
     let mut lines = Vec::with_capacity(rows.len() + 2);
@@ -856,7 +899,7 @@ mod tests {
 
         macro_rules! render {
             ($frame:expr) => {{
-                s.render(&mut app, &st, None, None).unwrap();
+                s.render(&mut app, &st, None, None, None).unwrap();
                 let buf = std::mem::take(&mut s.out);
                 std::fs::write(dir.join(format!("frame-{:04}.bin", $frame)), &buf.0).unwrap();
                 s.out = buf;
@@ -916,11 +959,11 @@ mod tests {
         let mut app = App::new();
         app.push_user("hello");
         let mut s = screen(buf, 60, 10);
-        s.render(&mut app, &status(), None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
         assert_eq!(s.take_out().count("❯ hello"), 1);
 
         // A re-render with no new entries must not reprint the transcript.
-        s.render(&mut app, &status(), None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
         assert_eq!(s.take_out().count("❯ hello"), 0);
     }
 
@@ -932,13 +975,13 @@ mod tests {
         app.on_turn_event(TurnEvent::Text {
             delta: "alpha".into(),
         });
-        s.render(&mut app, &status(), None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
         assert_eq!(s.take_out().count("alpha"), 1);
 
         app.on_turn_event(TurnEvent::Text {
             delta: " beta".into(),
         });
-        s.render(&mut app, &status(), None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
         let text = s.take_out().text();
         assert_eq!(text.matches("alpha").count(), 1, "tail is rewritten");
         assert_eq!(text.matches("beta").count(), 1);
@@ -948,11 +991,11 @@ mod tests {
             name: "bash".into(),
             arguments: "{}".into(),
         });
-        s.render(&mut app, &status(), None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
         let text = s.take_out().text();
         assert_eq!(text.matches("alpha").count(), 1, "final entry reprinted");
         assert!(text.contains("● bash"));
-        s.render(&mut app, &status(), None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
         let text = s.take_out().text();
         assert_eq!(text.matches("alpha").count(), 0, "then left alone");
         assert_eq!(text.matches("● bash").count(), 0);
@@ -967,7 +1010,7 @@ mod tests {
             app.on_turn_event(TurnEvent::Text {
                 delta: format!("line-{n}\n"),
             });
-            s.render(&mut app, &status(), None, None).unwrap();
+            s.render(&mut app, &status(), None, None, None).unwrap();
         }
         let out = s.take_out().text();
         // Early lines were committed permanently, newest stay in the tail.
@@ -984,10 +1027,10 @@ mod tests {
     fn redraw_keeps_the_tail_in_place() {
         let mut app = App::new();
         let mut s = Screen::new(Buf::default(), 80, 8);
-        s.render(&mut app, &status(), None, None).unwrap(); // placeholder
+        s.render(&mut app, &status(), None, None, None).unwrap(); // placeholder
         app.input = "Say hello".into();
         app.cursor = 9;
-        s.render(&mut app, &status(), None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
 
         let rows = s.take_out().emulated_screen(80, 8);
         assert!(
@@ -1025,7 +1068,7 @@ mod tests {
             output: "aaa\nbbb".into(),
         });
         let mut s = Screen::new(Buf::default(), 40, 12);
-        s.render(&mut app, &status(), None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
         let rows = s.take_out().emulated_screen(40, 12);
         let aaa = rows
             .iter()
@@ -1246,6 +1289,66 @@ mod tests {
         let picker = Picker::new("resume", vec![]);
         assert!(picker_box(&picker, 20, 20).is_empty());
         assert!(picker_box(&picker, 60, 6).is_empty());
+    }
+
+    #[test]
+    fn modal_box_shows_the_prompt_and_the_field() {
+        let modal = Modal::new("export markdown", "file name", "notes.md");
+        let (rows, caret) = modal_box(&modal, 60, 20);
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        assert!(texts[0].contains("export markdown"), "{texts:?}");
+        assert!(texts[0].starts_with('╭') && texts[0].ends_with('╮'));
+        assert!(texts.iter().any(|t| t.contains("file name")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("notes.md")), "{texts:?}");
+        assert!(texts[texts.len() - 1].starts_with('╰'));
+        // Caret column: border + padding, then the field text.
+        assert_eq!(caret, 2 + "notes.md".len() as u16);
+
+        // Every row is the same display width.
+        let widths: Vec<usize> = rows.iter().map(line_width).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "{widths:?}");
+    }
+
+    #[test]
+    fn modal_box_skips_when_the_terminal_is_tiny() {
+        let modal = Modal::new("export markdown", "file name", "");
+        assert!(modal_box(&modal, 20, 20).0.is_empty());
+        assert!(modal_box(&modal, 60, 6).0.is_empty());
+    }
+
+    #[test]
+    fn modal_box_windows_a_long_value_and_keeps_the_caret_inside() {
+        let long = "x".repeat(200);
+        let modal = Modal::new("export markdown", "file name", &long);
+        let (rows, caret) = modal_box(&modal, 40, 20);
+        assert!(!rows.is_empty());
+        assert!((2..40).contains(&caret), "caret inside the box: {caret}");
+        assert!(
+            rows.iter().all(|l| line_width(l) <= 40),
+            "no row exceeds the screen width"
+        );
+    }
+
+    #[test]
+    fn an_open_modal_owns_the_caret() {
+        let mut app = App::new();
+        app.input = "typing".into();
+        app.cursor = 6;
+        let modal = Modal::new("export markdown", "file name", "a.md");
+        let mut s = Screen::new(Buf::default(), 60, 12);
+        s.render(&mut app, &status(), None, Some(&modal), None)
+            .unwrap();
+        let rows = s.take_out().emulated_screen(60, 12);
+        assert!(
+            rows.iter().any(|r| r.contains("export markdown")),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("a.md")), "{rows:?}");
+        // The main input row is still drawn (dimmed behind the dialog).
+        assert!(rows.iter().any(|r| r.contains("❯ typing")), "{rows:?}");
     }
 
     #[test]

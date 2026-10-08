@@ -3,6 +3,7 @@
 //! Built-in commands take precedence over prompt templates; an unknown
 //! command parses to `Err` and is never sent to the model.
 
+use crate::export::ExportOptions;
 use crate::prompts::Template;
 
 /// A parsed slash command.
@@ -22,6 +23,12 @@ pub enum Command {
     Sampling(SamplingEdit),
     /// `/system`: show the assembled system prompt in the transcript.
     System,
+    /// `/md [flags] [filename]`: export the session to a Markdown file;
+    /// with no filename the TUI asks for one.
+    Export {
+        options: ExportOptions,
+        path: Option<String>,
+    },
     /// `/` with no command word: open the command palette (commands and
     /// templates).
     Palette,
@@ -69,6 +76,7 @@ pub fn parse_command(
         "thinking" => Ok(Command::Thinking(optional_arg())),
         "sampling" => parse_sampling(arg).map(Command::Sampling),
         "system" => Ok(Command::System),
+        "md" => parse_md(arg),
         _ if let Some(template) = templates.iter().find(|t| t.name == word) => {
             Ok(Command::Template {
                 template: template.clone(),
@@ -80,6 +88,34 @@ pub fn parse_command(
              to .clanky/prompts/"
         )),
     })
+}
+
+/// Parse the `/md` argument: optional `--all`/`--thinking`/`--tools`
+/// flags (which combine) and at most one filename.
+fn parse_md(arg: &str) -> std::result::Result<Command, String> {
+    let mut options = ExportOptions::default();
+    let mut path: Option<String> = None;
+    for token in arg.split_whitespace() {
+        match token {
+            "--all" => options = options.or(ExportOptions::ALL),
+            "--thinking" => options.thinking = true,
+            "--tools" => options.tools = true,
+            flag if flag.starts_with("--") => {
+                return Err(format!(
+                    "unknown flag `{flag}` for /md (expected --all, --thinking or --tools)"
+                ));
+            }
+            name => {
+                if path.is_some() {
+                    return Err(format!(
+                        "unexpected argument `{name}` for /md: give at most one filename"
+                    ));
+                }
+                path = Some(name.to_string());
+            }
+        }
+    }
+    Ok(Command::Export { options, path })
 }
 
 /// Parse the `/sampling` argument into an edit.
@@ -210,6 +246,58 @@ mod tests {
         assert!(matches!(
             parse_command("/sampling temperature=0.7,top_p", none),
             Some(Err(message)) if message.contains("cannot mix")
+        ));
+    }
+
+    #[test]
+    fn md_parses_flags_and_filename() {
+        let none = &[];
+        assert_eq!(
+            parse_command("/md", none),
+            Some(Ok(Command::Export {
+                options: ExportOptions::default(),
+                path: None,
+            }))
+        );
+        assert_eq!(
+            parse_command("/md --all", none),
+            Some(Ok(Command::Export {
+                options: ExportOptions::ALL,
+                path: None,
+            }))
+        );
+        assert_eq!(
+            parse_command("/md --thinking --tools", none),
+            Some(Ok(Command::Export {
+                options: ExportOptions::ALL,
+                path: None,
+            })),
+            "flags combine"
+        );
+        assert_eq!(
+            parse_command("/md --thinking out/session.md", none),
+            Some(Ok(Command::Export {
+                options: ExportOptions {
+                    thinking: true,
+                    tools: false,
+                },
+                path: Some("out/session.md".into()),
+            }))
+        );
+        assert_eq!(
+            parse_command("/md notes.md", none),
+            Some(Ok(Command::Export {
+                options: ExportOptions::default(),
+                path: Some("notes.md".into()),
+            }))
+        );
+        assert!(matches!(
+            parse_command("/md --verbose", none),
+            Some(Err(message)) if message.contains("unknown flag `--verbose`")
+        ));
+        assert!(matches!(
+            parse_command("/md a.md b.md", none),
+            Some(Err(message)) if message.contains("at most one filename")
         ));
     }
 

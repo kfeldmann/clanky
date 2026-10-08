@@ -25,6 +25,11 @@
 //! the input. Configuration commands and `/<model id>` open pickers;
 //! unknown commands error cleanly and are never sent to the model.
 //!
+//! `/md` exports the session as Markdown (`crate::export`): optional
+//! `--all`/`--thinking`/`--tools` flags choose which record types are
+//! written, and the target file is either named on the command line or
+//! asked for in a modal (see `modal.rs`).
+//!
 //! Input ergonomics (M7): Tab completes the file path at the caret (longest
 //! common prefix first, further Tabs cycle candidates, shown in a popup
 //! above the input line); ctrl+e opens `$EDITOR` with the prompt buffer —
@@ -47,6 +52,7 @@ mod commands;
 mod completion;
 mod editor;
 mod markdown;
+mod modal;
 mod picker;
 mod screen;
 
@@ -60,6 +66,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 
 use crate::error::Result;
+use crate::export::{self, ExportOptions};
 use crate::prompts::{self, Template};
 use crate::session::{self, SessionInfo, SessionWriter};
 use crate::settings::{SamplingParams, Settings};
@@ -287,6 +294,8 @@ enum Action {
     Submit(String),
     /// Open a picker; the kind carries the data it selects from.
     OpenPicker(PickerKind),
+    /// Open a modal asking for the `/md` export filename.
+    OpenExportModal(ExportSource),
     /// Suspend the TUI and edit the prompt buffer in `$EDITOR` (M7).
     OpenEditor,
 }
@@ -322,6 +331,7 @@ const PALETTE_BUILTINS: &[(&str, &str)] = &[
     ("/thinking", "thinking presets"),
     ("/sampling ", "edit sampling parameters"),
     ("/system", "show the assembled system prompt"),
+    ("/md ", "export the session as Markdown"),
     ("/name ", "rename the session"),
     ("/resume", "load a saved session"),
 ];
@@ -497,6 +507,84 @@ impl SessionState {
             },
         }
     }
+
+    /// A session header stamped now, for a session with no records yet.
+    fn fresh_header(launch: &Launch) -> session::Header {
+        session::Header {
+            version: session::FORMAT_VERSION,
+            created: session::now_millis(),
+            provider: Some(launch.provider.clone()),
+            model: launch.model.clone(),
+        }
+    }
+}
+
+/// The complete input of one `/md` export, captured when the command runs
+/// so a modal that is still open exports what the command saw rather than
+/// whatever the session looks like when the filename is confirmed.
+struct ExportSource {
+    /// Session display name (the file stem), when there is one.
+    name: Option<String>,
+    header: session::Header,
+    records: Vec<session::Record>,
+    options: ExportOptions,
+}
+
+impl ExportSource {
+    /// Capture the current session. A session with an open file exports
+    /// exactly the records that file holds — the same stream `/resume`
+    /// would restore — while a session that has not recorded anything yet
+    /// exports an empty document with a fresh header.
+    fn snapshot(state: &SessionState, options: ExportOptions) -> Result<Self> {
+        let name = state.current_name();
+        let (header, records) = match state.writer.as_ref() {
+            Some(writer) if writer.path().exists() => {
+                let data = session::load(writer.path())?;
+                (data.header, data.records)
+            }
+            _ => (SessionState::fresh_header(&state.launch), Vec::new()),
+        };
+        Ok(Self {
+            name,
+            header,
+            records,
+            options,
+        })
+    }
+
+    /// Render the document and write it to `target`; the returned count
+    /// is how many session records went into it.
+    fn write(&self, target: &str) -> std::io::Result<usize> {
+        let document = export::render(
+            self.name.as_deref(),
+            &self.header,
+            &self.records,
+            self.options,
+        );
+        write_export(target, &document)?;
+        Ok(self.records.len())
+    }
+}
+
+/// Write an export and report the outcome in the transcript.
+fn apply_export(app: &mut app::App, target: &str, source: &ExportSource) {
+    match source.write(target) {
+        Ok(count) => app.entries.push(app::Entry::Info(format!(
+            "exported {count} record(s) to `{target}`"
+        ))),
+        Err(err) => app
+            .entries
+            .push(app::Entry::Error(format!("cannot write `{target}`: {err}"))),
+    }
+}
+
+/// Write an exported document, creating parent directories as needed.
+fn write_export(target: &str, document: &str) -> std::io::Result<()> {
+    let path = PathBuf::from(target);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, document)
 }
 
 /// Load a saved session into the app: transcript, usage and history;
@@ -544,6 +632,8 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     catalog.request(launch.provider.clone(), &tx, false);
     // Open picker with the payload it selects from, when active.
     let mut picker: Option<(picker::Picker, PickerKind)> = None;
+    // Open modal, with the `/md` export it will write, when active.
+    let mut modal: Option<(modal::Modal, ExportSource)> = None;
     // Something changed since the last render (transcript, input, popup).
     let mut dirty = true;
 
@@ -582,7 +672,27 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                     if let Some(key) = pressed(key) {
                         let tab = key.code == KeyCode::Tab
                             && !key.modifiers.contains(KeyModifiers::CONTROL);
-                        if picker.is_some() {
+                        if let Some((mut dialog, source)) = modal.take() {
+                            // Ctrl+C/Ctrl+Q quit the whole TUI, exactly as
+                            // they do while a picker is open; Esc closes the
+                            // dialog alone.
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
+                            {
+                                break;
+                            }
+                            match dialog.key(key) {
+                                // Still editing: put the dialog back.
+                                modal::ModalOutcome::None => modal = Some((dialog, source)),
+                                modal::ModalOutcome::Cancelled => {}
+                                modal::ModalOutcome::Accepted => {
+                                    // Enter only accepts a non-blank value.
+                                    if let Some(value) = dialog.value() {
+                                        apply_export(&mut app, &value, &source);
+                                    }
+                                }
+                            }
+                        } else if picker.is_some() {
                             match picker_key(
                                 &mut picker,
                                 key,
@@ -609,6 +719,10 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                                 Action::OpenPicker(kind) => {
                                     app.completion = None;
                                     picker = Some((picker_for(&kind), kind));
+                                }
+                                Action::OpenExportModal(source) => {
+                                    app.completion = None;
+                                    modal = Some((export_modal(), source));
                                 }
                                 Action::OpenEditor => {
                                     if let Err(err) = run_editor(&mut app, screen) {
@@ -727,8 +841,15 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                     .context_window_for(&launch.provider, launch.model.as_deref()),
             };
             let picker_ref = picker.as_ref().map(|(p, _)| p);
+            let modal_ref = modal.as_ref().map(|(m, _)| m);
             let completion = app.completion.clone();
-            screen.render(&mut app, &status, picker_ref, completion.as_ref())?;
+            screen.render(
+                &mut app,
+                &status,
+                picker_ref,
+                modal_ref,
+                completion.as_ref(),
+            )?;
             dirty = false;
         }
     }
@@ -828,6 +949,16 @@ fn record_done(state: &mut SessionState, app: &mut app::App, done: &TurnEnd) {
         }
     }
     app.history = done.history.clone();
+}
+
+/// The modal that asks for the `/md` export filename (the options the
+/// command was invoked with are carried beside it in the event loop).
+fn export_modal() -> modal::Modal {
+    modal::Modal::new(
+        "export markdown",
+        "file name (relative paths resolve against the working directory)",
+        "",
+    )
 }
 
 /// What a picker key press produced.
@@ -1057,6 +1188,24 @@ fn handle_command(
         Command::System => {
             push_system_report(app, &crate::context::system_parts());
             Action::None
+        }
+        Command::Export { options, path } => {
+            let source = match ExportSource::snapshot(state, options) {
+                Ok(source) => source,
+                Err(err) => {
+                    app.entries
+                        .push(app::Entry::Error(format!("cannot export session: {err}")));
+                    return Action::None;
+                }
+            };
+            match path {
+                Some(path) => {
+                    apply_export(app, &path, &source);
+                    Action::None
+                }
+                // No filename: ask for one.
+                None => Action::OpenExportModal(source),
+            }
         }
         Command::Palette => Action::OpenPicker(palette_kind(prompts::templates())),
         Command::Template { template, extra } => {
@@ -1694,6 +1843,152 @@ mod tests {
         let shown = first_line(&long);
         assert_eq!(shown.chars().count(), 61, "60 chars + ellipsis");
         assert!(shown.ends_with('…'));
+    }
+
+    /// A `SessionState` with one open session file in its own scratch
+    /// directory (tests run in parallel, so nothing may be shared).
+    fn session_with_file(tag: &str) -> (SessionState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-md-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let mut writer = SessionWriter::new(
+            path.clone(),
+            session::Header {
+                version: session::FORMAT_VERSION,
+                created: 1_700_000_000_000,
+                provider: Some("deepinfra".into()),
+                model: Some("mock/model".into()),
+            },
+        );
+        for record in [
+            session::Record::User {
+                text: "count files".into(),
+            },
+            session::Record::Thinking {
+                text: "I should run ls.".into(),
+            },
+            session::Record::Assistant {
+                text: "Let me check.".into(),
+                calls: vec![],
+            },
+        ] {
+            writer.append(&record).unwrap();
+        }
+        let state = SessionState {
+            dir: dir.clone(),
+            launch: launch(),
+            writer: Some(writer),
+            pending_name: None,
+        };
+        (state, dir)
+    }
+
+    #[test]
+    fn md_export_writes_the_default_selection() {
+        let (state, dir) = session_with_file("default");
+        let mut app = app::App::new();
+        let source = ExportSource::snapshot(&state, ExportOptions::default()).unwrap();
+        let target = dir.join("out/session.md");
+        apply_export(&mut app, target.to_str().unwrap(), &source);
+
+        let doc = std::fs::read_to_string(&target).unwrap();
+        assert!(doc.contains("# Clanky session: session"), "{doc}");
+        assert!(doc.contains("## User\n\ncount files"), "{doc}");
+        assert!(doc.contains("## Assistant\n\nLet me check."), "{doc}");
+        assert!(!doc.contains("I should run ls."), "{doc}");
+        assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn md_export_all_includes_thinking() {
+        let (state, dir) = session_with_file("all");
+        let mut app = app::App::new();
+        let source = ExportSource::snapshot(&state, ExportOptions::ALL).unwrap();
+        let target = dir.join("all.md");
+        apply_export(&mut app, target.to_str().unwrap(), &source);
+        let doc = std::fs::read_to_string(&target).unwrap();
+        assert!(doc.contains("## Thinking"), "{doc}");
+        assert!(doc.contains("I should run ls."), "{doc}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn md_export_without_a_session_writes_an_empty_document() {
+        let mut state = SessionState::new(launch());
+        state.dir = std::env::temp_dir();
+        let mut app = app::App::new();
+        let source = ExportSource::snapshot(&state, ExportOptions::default()).unwrap();
+        let target =
+            std::env::temp_dir().join(format!("clanky-md-empty-{}.md", std::process::id()));
+        apply_export(&mut app, target.to_str().unwrap(), &source);
+        let doc = std::fs::read_to_string(&target).unwrap();
+        assert!(doc.contains("_Nothing to export"), "{doc}");
+        std::fs::remove_file(target).ok();
+    }
+
+    #[test]
+    fn md_export_reports_write_failures() {
+        let (state, dir) = session_with_file("unwritable");
+        let mut app = app::App::new();
+        let source = ExportSource::snapshot(&state, ExportOptions::default()).unwrap();
+        // A directory cannot be written as a file.
+        apply_export(&mut app, dir.to_str().unwrap(), &source);
+        assert!(matches!(app.entries.last(), Some(app::Entry::Error(_))));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn md_command_without_a_filename_opens_the_modal() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(cfg.clone());
+        let mut app = app::App::new();
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+
+        let action = handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::Export {
+                options: ExportOptions::ALL,
+                path: None,
+            },
+            &tx,
+        );
+        match action {
+            Action::OpenExportModal(source) => {
+                assert_eq!(source.options, ExportOptions::ALL);
+                assert!(source.records.is_empty(), "no session recorded yet");
+                assert_eq!(source.header.provider.as_deref(), Some("deepinfra"));
+            }
+            _ => panic!("expected an export modal"),
+        }
+
+        let action = handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::Export {
+                options: ExportOptions::default(),
+                path: Some("out.md".into()),
+            },
+            &tx,
+        );
+        assert!(matches!(action, Action::None));
+        assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
+        assert!(std::path::Path::new("out.md").exists(), "file written");
+        std::fs::remove_file("out.md").ok();
     }
 
     #[test]

@@ -104,6 +104,30 @@ erases the visible screen (scrollback is kept).
 | text selection | copy/paste (native terminal selection) |
 | `/` (empty input) | command palette |
 | `/system` | show the assembled system prompt (context files and skills, as sent to the model) |
+| `/md [flags] [file]` | export the session as a Markdown file (asks for a filename in a modal when none is given) |
+
+### `/md` — export the session as Markdown
+
+`/md` writes the current session to a Markdown file. The default export
+contains the user prompts and the assistant's visible answers; two flags
+add the rest, and combine freely:
+
+| Flag | Adds |
+| --- | --- |
+| `--thinking` | the assistant's thinking blocks |
+| `--tools` | tool calls (with their arguments) and their results |
+| `--all` | both of the above |
+
+A filename may be given on the command line; without one, a modal asks
+for it (`Esc` cancels, `Enter` confirms). Relative paths resolve against
+the working directory, parent directories are created as needed, and an
+existing file is overwritten. For example:
+
+```text
+/md session.md
+/md --tools --thinking out/session.md
+/md --all
+```
 
 The TUI only starts when stdin *and* stdout are terminals; piped input
 falls back to plain one-shot mode.

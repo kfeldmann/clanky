@@ -37,7 +37,7 @@ pub fn sessions_dir() -> PathBuf {
 }
 
 /// Current wall-clock time as epoch milliseconds.
-fn now_millis() -> u64 {
+pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

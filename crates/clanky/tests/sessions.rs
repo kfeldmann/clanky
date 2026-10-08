@@ -314,3 +314,96 @@ fn r_user_text(record: &Record) -> Option<&str> {
         _ => None,
     }
 }
+
+/// `/md` acceptance: the document exported from a session file is the
+/// same conversation a resume would rebuild, and the flags gate exactly
+/// the record types they name.
+#[test]
+fn markdown_export_covers_the_session_and_honors_its_flags() {
+    use clanky::export::{self, ExportOptions};
+
+    let dir = std::env::temp_dir().join(format!(
+        "clanky-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("conversation.jsonl");
+
+    let records = vec![
+        Record::User {
+            text: "count files".into(),
+        },
+        Record::Thinking {
+            text: "run ls first".into(),
+        },
+        Record::Assistant {
+            text: "Let me check.".into(),
+            calls: vec![clanky_protocol::ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "ls | wc -l"}),
+            }],
+        },
+        Record::ToolResult {
+            name: "bash".into(),
+            output: "42".into(),
+        },
+        Record::Assistant {
+            text: "42 files.".into(),
+            calls: vec![],
+        },
+        Record::Usage {
+            prompt_tokens: Some(120),
+            completion_tokens: Some(30),
+        },
+    ];
+    let mut writer = SessionWriter::new(
+        path.clone(),
+        session::Header {
+            version: session::FORMAT_VERSION,
+            created: 1_700_000_000_000,
+            provider: Some("deepinfra".into()),
+            model: Some("mock/model".into()),
+        },
+    );
+    for record in &records {
+        writer.append(record).unwrap();
+    }
+    drop(writer);
+
+    let data = session::load(&path).unwrap();
+
+    // Default: user + assistant text only.
+    let default = export::render(None, &data.header, &data.records, ExportOptions::default());
+    assert!(default.contains("## User\n\ncount files"), "{default}");
+    assert!(
+        default.contains("## Assistant\n\nLet me check."),
+        "{default}"
+    );
+    assert!(default.contains("42 files."), "{default}");
+    assert!(!default.contains("run ls first"), "{default}");
+    assert!(!default.contains("Tool call"), "{default}");
+    assert!(!default.contains("\"command\""), "{default}");
+
+    // --all: everything.
+    let all = export::render(None, &data.header, &data.records, ExportOptions::ALL);
+    assert!(all.contains("## Thinking"), "{all}");
+    assert!(all.contains("run ls first"), "{all}");
+    assert!(all.contains("### Tool call: `bash`"), "{all}");
+    assert!(all.contains("\"command\": \"ls | wc -l\""), "{all}");
+    assert!(all.contains("### Tool result: `bash`"), "{all}");
+    assert!(all.contains("42"), "{all}");
+
+    // The exported conversation matches what resume rebuilds.
+    let history = session::history_from_records(&data.records);
+    assert_eq!(history.len(), 4, "user, assistant+call, tool, assistant");
+    assert_eq!(history[0].content(), "count files");
+    assert_eq!(history[3].content(), "42 files.");
+
+    std::fs::remove_dir_all(dir).ok();
+}
