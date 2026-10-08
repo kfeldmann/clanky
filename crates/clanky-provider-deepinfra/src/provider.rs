@@ -12,7 +12,7 @@ use crate::backend::{Backend, BackendError, truncate_body};
 /// Provider name reported at handshake.
 pub const PROVIDER_NAME: &str = "deepinfra";
 /// Default model when neither settings nor CLI name one.
-pub const DEFAULT_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash-0731";
+pub const DEFAULT_MODEL: &str = "zai-org/GLM-5.3-Flash";
 /// DeepInfra API base URL. Paths are relative to this, so a chat request
 /// goes to `https://api.deepinfra.com/v1/chat/completions` — the endpoint
 /// documented by DeepInfra's OpenAPI spec. (`https://api.deepinfra.com/v1/openai`
@@ -630,6 +630,16 @@ mod tests {
 
     fn done_chunk(reason: &str) -> String {
         serde_json::json!({"choices": [{"delta": {}, "finish_reason": reason}]}).to_string()
+    }
+
+    #[test]
+    fn handshake_advertises_the_default_model() {
+        let provider =
+            DeepInfraProvider::new(MockBackend::new(Vec::new(), ""), "https://x.invalid");
+        let info = provider.info();
+        assert_eq!(info.name, PROVIDER_NAME);
+        assert_eq!(info.default_model.as_deref(), Some(DEFAULT_MODEL));
+        assert_eq!(DEFAULT_MODEL, "zai-org/GLM-5.3-Flash");
     }
 
     #[test]

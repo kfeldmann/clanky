@@ -343,11 +343,6 @@ impl App {
         }
     }
 
-    /// Whether streamed thinking is currently displayed (ctrl+t).
-    pub fn show_thinking(&self) -> bool {
-        self.show_thinking
-    }
-
     // --- live usage estimates -----------------------------------------------
 
     /// Top up an estimate pool with `chars` new characters. The pools

@@ -45,9 +45,6 @@ pub struct Status<'a> {
     /// Active thinking setting, when enabled (token budget, e.g. `4096`;
     /// `off`/unset is not shown).
     pub thinking: Option<&'a str>,
-    /// Whether streamed thinking is displayed (ctrl+t); shown as
-    /// `think:on`/`think:off` so the current state is always visible.
-    pub show_thinking: bool,
     /// Display name of the current session file, when one exists.
     pub session: Option<&'a str>,
     /// Estimated session cost in dollars (catalog pricing × billed token
@@ -358,7 +355,7 @@ fn footer_lines(
     }
 }
 
-/// Status line: provider · model · think · session on the left; cost,
+/// Status line: provider · model · session on the left; cost,
 /// context use, or a hint on the right; streaming shows on the prompt.
 #[allow(clippy::too_many_arguments)]
 fn status_line(
@@ -383,16 +380,6 @@ fn status_line(
                 Style::new().fg(Color::Cyan),
             ));
         }
-        // ctrl+t display state, shown whether or not thinking is enabled.
-        left.push(Span::styled(" · think:".to_string(), base));
-        left.push(Span::styled(
-            if status.show_thinking { "on" } else { "off" }.to_string(),
-            if status.show_thinking {
-                Style::new().fg(Color::Cyan)
-            } else {
-                base
-            },
-        ));
     }
     if let Some(session) = status.session {
         left.push(Span::styled(" · ".to_string(), base));
@@ -962,7 +949,6 @@ mod tests {
             provider: "deepinfra",
             model: Some("mock/model"),
             thinking: None,
-            show_thinking: true,
             session: None,
             cost: None,
             context_window: Some(10000),
@@ -1175,37 +1161,6 @@ mod tests {
     }
 
     #[test]
-    fn status_line_shows_the_thinking_display_state() {
-        let app = App::new();
-        let with = |show| Status {
-            provider: "deepinfra",
-            model: Some("mock/model"),
-            thinking: None,
-            show_thinking: show,
-            session: None,
-            cost: None,
-            context_window: None,
-        };
-        let text = |status: &Status<'_>| -> String {
-            status_line(&app, status, 80, 0, 0)
-                .spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect()
-        };
-        assert!(
-            text(&with(true)).contains("think:on"),
-            "{}",
-            text(&with(true))
-        );
-        assert!(
-            text(&with(false)).contains("think:off"),
-            "{}",
-            text(&with(false))
-        );
-    }
-
-    #[test]
     fn hidden_thinking_renders_as_a_placeholder_line() {
         let mut app = App::new();
         app.toggle_thinking_display(); // off
@@ -1234,7 +1189,6 @@ mod tests {
             provider: "deepinfra",
             model: Some("mock/model"),
             thinking: Some("4096"),
-            show_thinking: true,
             session: Some("s"),
             cost: Some(0.0123),
             context_window: None,

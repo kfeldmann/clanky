@@ -955,7 +955,6 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                 provider: &launch.provider,
                 model: launch.model.as_deref(),
                 thinking,
-                show_thinking: app.show_thinking(),
                 session: session_name.as_deref(),
                 cost,
                 context_window: catalog

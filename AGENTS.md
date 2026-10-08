@@ -2,8 +2,8 @@
 
 The clanky project is in `/work`.
 
-- milestones.md - The project plan (985 words)
-- provider-protocol.md - Provider protocol spec (1278 words)
+- milestones.md - The project plan (1275 words)
+- provider-protocol.md - Provider protocol spec (1461 words)
 - plan.md - the original requirements brainstorm (242 words)
 
 DeepInfra is the first provider that will be supported
