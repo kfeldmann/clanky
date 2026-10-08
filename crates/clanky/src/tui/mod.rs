@@ -1216,9 +1216,10 @@ fn handle_command(
 }
 
 /// Push the `/system` report to the transcript: a summary `Info` line,
-/// then one labelled `SystemPart` entry per part (or a single `Info`
-/// explaining there is no context). Pure apart from `app`, so it can be
-/// tested with synthetic parts.
+/// then one `SystemPart` entry per part with the content shown verbatim
+/// (the parts already carry their own provenance headings), or a single
+/// `Info` explaining there is no context. Pure apart from `app`, so it
+/// can be tested with synthetic parts.
 fn push_system_report(app: &mut app::App, parts: &[(String, String)]) {
     let total: usize = parts
         .iter()
@@ -1234,9 +1235,8 @@ fn push_system_report(app: &mut app::App, parts: &[(String, String)]) {
             parts.len(),
             total
         )));
-        for (label, content) in parts {
+        for (_, content) in parts {
             app.entries.push(app::Entry::SystemPart {
-                label: label.clone(),
                 content: content.clone(),
             });
         }
@@ -2001,15 +2001,14 @@ mod tests {
         push_system_report(&mut app, &parts);
         assert_eq!(app.entries.len(), 3, "summary + one entry per part");
         assert!(matches!(app.entries[0], app::Entry::Info(_)));
-        let app::Entry::SystemPart { label, content } = &app.entries[1] else {
+        let app::Entry::SystemPart { content } = &app.entries[1] else {
             panic!("expected a SystemPart, got {:?}", app.entries[1]);
         };
-        assert_eq!(label, "~/.clanky/SYSTEM.md");
         assert_eq!(content, "be terse");
-        let app::Entry::SystemPart { label, .. } = &app.entries[2] else {
+        let app::Entry::SystemPart { content } = &app.entries[2] else {
             panic!("expected a SystemPart, got {:?}", app.entries[2]);
         };
-        assert_eq!(label, "AGENTS.md");
+        assert_eq!(content, "be helpful");
     }
 
     #[test]

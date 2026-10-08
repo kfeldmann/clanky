@@ -54,10 +54,9 @@ pub enum Entry {
     /// A UI-only note (command feedback, etc.); not sent to the model
     /// and not recorded in the session file.
     Info(String),
-    /// One labelled part of the assembled system prompt, shown by
+    /// One part of the assembled system prompt, shown verbatim by
     /// `/system` (UI-only): not sent, not recorded.
     SystemPart {
-        label: String,
         content: String,
     },
 }
@@ -719,14 +718,9 @@ impl App {
                     width,
                 ));
             }
-            Entry::SystemPart { label, content } => {
-                lines.push(Line::from(vec![
-                    Span::styled("◆ ", Style::new().fg(Color::Cyan)),
-                    Span::styled(
-                        label.clone(),
-                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
+            // Show the part exactly as it is sent to the model: the
+            // content already carries its own provenance heading.
+            Entry::SystemPart { content } => {
                 let dimmed = Style::new().fg(Color::Gray);
                 lines.extend(markdown::wrap_text(content, dimmed, width));
                 lines.push(Line::default());
@@ -1408,8 +1402,7 @@ mod tests {
         let mut app = App::new();
         app.entries.push(Entry::Info("2 part(s)".into()));
         app.entries.push(Entry::SystemPart {
-            label: "skill review".into(),
-            content: "Check the diffs.".into(),
+            content: "# Context — skill review\n\nCheck the diffs.".into(),
         });
         let lines = app.transcript_lines(80);
         let texts: Vec<String> = lines
@@ -1417,7 +1410,7 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
         assert!(
-            texts.iter().any(|t| t.contains("◆ skill review")),
+            texts.iter().any(|t| t.contains("# Context — skill review")),
             "{texts:?}"
         );
         assert!(texts.iter().any(|t| t.contains("Check the diffs.")));
