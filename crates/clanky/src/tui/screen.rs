@@ -354,8 +354,8 @@ fn footer_lines(
     }
 }
 
-/// Status line: provider · model · think · session · cost on the left;
-/// token usage or a hint on the right; streaming shows on the input prompt.
+/// Status line: provider · model · think · session on the left; cost,
+/// context use, or a hint on the right; streaming shows on the prompt.
 #[allow(clippy::too_many_arguments)]
 fn status_line(
     app: &App,
@@ -384,28 +384,39 @@ fn status_line(
         left.push(Span::styled(" · ".to_string(), base));
         left.push(Span::styled(session.to_string(), base));
     }
-    if let Some(cost) = status.cost {
-        left.push(Span::styled(" · ".to_string(), base));
-        left.push(Span::styled(
-            format_cost(cost),
-            Style::new().fg(Color::Yellow),
-        ));
-    }
-
-    // Streaming is signalled by the input prompt's dot, not here, so the
-    // token counters stay visible while a turn is running.
+    // Streaming is signalled by the input prompt's dot, not here. The
+    // right side carries the session cost and how much of the context
+    // window the last turn consumed (the next request re-sends those
+    // prompt tokens, so they are what accumulates toward the limit).
     let mut right = Vec::new();
     if app.pending.is_some() {
         right.push(Span::styled(
             "○ queued".to_string(),
             Style::new().fg(Color::Yellow),
         ));
-    } else if app.last_usage.is_some() || estimated_prompt > 0 || estimated_completion > 0 {
+    }
+    if let Some(cost) = status.cost {
+        if !right.is_empty() {
+            right.push(Span::styled(" · ".to_string(), base));
+        }
+        right.push(Span::styled(
+            format_cost(cost),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    let has_usage =
+        app.last_usage.is_some() || estimated_prompt > 0 || estimated_completion > 0;
+    if let Some(window) = status.context_window
+        && window > 0
+        && has_usage
+    {
         // Billed token counts plus estimates for content not yet covered
         // by a provider report (user prompt and tool results before the
         // next round; streamed text/thinking while it streams). With a
-        // report in hand the estimates are zero (exact display); they
-        // keep a huge reasoning block counting while it streams.
+        // report in hand the estimates are zero.
+        if !right.is_empty() {
+            right.push(Span::styled(" · ".to_string(), base));
+        }
         let prompt = app
             .last_usage
             .and_then(|usage| usage.prompt_tokens)
@@ -416,22 +427,12 @@ fn status_line(
             .and_then(|usage| usage.completion_tokens)
             .unwrap_or(0)
             + estimated_completion;
-        // With a known context window, the "tok" unit gives way to how much
-        // of it the last turn consumed: the next request re-sends those
-        // prompt tokens, so they are what accumulates toward the limit.
-        match status.context_window {
-            Some(window) if window > 0 => right.push(Span::styled(
-                format!(
-                    "↑{} ↓{} · {}% ctx",
-                    prompt,
-                    completion,
-                    (prompt + completion) * 100 / window
-                ),
-                base,
-            )),
-            _ => right.push(Span::styled(format!("↑{prompt} ↓{completion} tok"), base)),
-        }
-    } else {
+        right.push(Span::styled(
+            format!("{}% ctx", (prompt + completion) * 100 / window),
+            base,
+        ));
+    }
+    if right.is_empty() {
         right.push(Span::styled("/ commands · ctrl+c quit".to_string(), base));
     }
 
@@ -1144,9 +1145,9 @@ mod tests {
         let line = status_line(&app, &status(), 40, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("deepinfra · mock/model"), "{text}");
-        // Streaming keeps the counters on the right; the dot moved to the
-        // input prompt instead.
-        assert!(text.contains("↑120 ↓80 · 2% ctx"), "{text}");
+        // Streaming keeps the context use on the right; the dot moved to
+        // the input prompt instead.
+        assert!(text.contains("2% ctx"), "{text}");
         assert!(!text.contains("streaming"), "{text}");
         assert_eq!(text.chars().count(), 40, "padded to the full width");
 
@@ -1171,7 +1172,8 @@ mod tests {
         let line = status_line(&app, &status, 80, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("mock/model · think 4096"), "{text}");
-        assert!(text.contains("s · $0.0123"), "{text}");
+        // Cost sits on the right side.
+        assert!(text.contains("s") && text.contains("$0.0123"), "{text}");
 
         // Large costs drop to two decimals.
         assert_eq!(format_cost(12.5), "$12.50");
@@ -1191,13 +1193,14 @@ mod tests {
         let (est_p, est_c) = app.estimated_tokens();
         let line = status_line(&app, &status(), 80, est_p + 13, est_c);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
-        assert!(text.contains("\u{2191}13 \u{2193}32"), "{text}");
+        // (13 + 32) / 10_000 with a known window.
+        assert!(text.contains("0% ctx"), "{text}");
 
-        // Known window: the estimate feeds the context percentage too.
+        // The estimate feeds the context percentage too.
         let line = status_line(&app, &status(), 80, 1_000, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         // (1000 + 21) / 10_000 -> 10%.
-        assert!(text.contains("\u{00b7} 10% ctx"), "{text}");
+        assert!(text.contains("10% ctx"), "{text}");
     }
 
     #[test]
@@ -1210,23 +1213,24 @@ mod tests {
             },
         });
 
-        // Unknown window: the plain token counts keep their unit.
+        // No known window: the hint fills the right side instead.
         let unknown = Status {
             context_window: None,
             ..status()
         };
         let line = status_line(&app, &unknown, 80, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
-        assert!(text.contains("↑17255 ↓796 tok"), "{text}");
+        assert!(text.contains("/ commands · ctrl+c quit"), "{text}");
+        assert!(!text.contains("ctx"), "{text}");
 
-        // Known window: "tok" gives way to the consumed percentage.
+        // Known window: the consumed percentage.
         let known = Status {
             context_window: Some(128_000),
             ..status()
         };
         let line = status_line(&app, &known, 80, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
-        assert!(text.contains("↑17255 ↓796 · 14% ctx"), "{text}");
+        assert!(text.contains("14% ctx"), "{text}");
 
         // Integer division: 18_051 / 100_000 → 18% (floors, never 19).
         let known = Status {
@@ -1235,7 +1239,7 @@ mod tests {
         };
         let line = status_line(&app, &known, 80, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
-        assert!(text.contains("· 18% ctx"), "{text}");
+        assert!(text.contains("18% ctx"), "{text}");
     }
 
     #[test]
