@@ -37,6 +37,13 @@
 //! with the edited text. `↑`/`↓` recall previously submitted prompts
 //! (the first `↑` saves the current input as a draft).
 //!
+//! ctrl+t toggles whether streamed thinking is displayed (see
+//! [`app::App::toggle_thinking_display`]). It is display-only — the session
+//! file always records the full text — and, because the printed transcript
+//! cannot be rewritten, it takes effect from the delta that arrives next:
+//! hidden blocks collapse to a single `Thinking...` line, and the toggle
+//! works mid-stream in both directions.
+//!
 //! Scrolling and copying are the terminal's own: the mouse is never
 //! captured and no alternate screen is used, so the wheel, the scrollbar,
 //! and native selection (including shift+drag) work as in any shell.
@@ -310,6 +317,8 @@ enum Action {
     None,
     Quit,
     Clear,
+    /// Toggle the display of streamed thinking (ctrl+t); display-only.
+    ToggleThinking,
     Submit(String),
     /// Open a picker; the kind carries the data it selects from.
     OpenPicker(PickerKind),
@@ -735,6 +744,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                                     app.clear();
                                     screen.clear_screen();
                                 }
+                                Action::ToggleThinking => app.toggle_thinking_display(),
                                 Action::OpenPicker(kind) => {
                                     app.completion = None;
                                     picker = Some((picker_for(&kind), kind));
@@ -860,6 +870,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                 provider: &launch.provider,
                 model: launch.model.as_deref(),
                 thinking,
+                show_thinking: app.show_thinking(),
                 session: session_name.as_deref(),
                 cost,
                 context_window: catalog
@@ -1447,6 +1458,7 @@ fn handle_key(
         (true, KeyCode::Char('c')) | (true, KeyCode::Char('q')) => Action::Quit,
         (true, KeyCode::Char('d')) if app.input.is_empty() => Action::Quit,
         (true, KeyCode::Char('l')) => Action::Clear,
+        (true, KeyCode::Char('t')) => Action::ToggleThinking,
         (true, KeyCode::Char('e')) => Action::OpenEditor,
 
         (false, KeyCode::Tab) => {
@@ -1517,6 +1529,56 @@ mod tests {
 
     fn launch() -> Launch {
         Launch::from_settings("deepinfra", &Settings::default())
+    }
+
+    #[test]
+    fn ctrl_t_toggles_thinking_display() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(cfg.clone());
+        let mut app = app::App::new();
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+
+        let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, key),
+            Action::ToggleThinking
+        ));
+        // Plain `t` still types a character.
+        let plain = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, plain);
+        assert_eq!(app.input, "t");
+    }
+
+    #[test]
+    fn toggling_mid_stream_collapses_and_resumes() {
+        let mut app = app::App::new();
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "one ".into(),
+        });
+        app.toggle_thinking_display(); // off mid-stream
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "two".into(),
+        });
+        assert_eq!(
+            app.entries,
+            vec![
+                app::Entry::Thinking("one ".into()),
+                app::Entry::ThinkingHidden
+            ]
+        );
+        app.toggle_thinking_display(); // on mid-stream: new block below
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "three".into(),
+        });
+        assert_eq!(
+            app.entries,
+            vec![
+                app::Entry::Thinking("one ".into()),
+                app::Entry::ThinkingHidden,
+                app::Entry::Thinking("three".into()),
+            ]
+        );
     }
 
     #[test]

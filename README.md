@@ -100,11 +100,33 @@ erases the visible screen (scrollback is kept).
 | `ctrl+e` | edit the prompt buffer in `$EDITOR` (the TUI suspends; an emptied buffer clears the input) |
 | `ctrl+c` / `ctrl+d` | quit |
 | `ctrl+l` | clear the visible screen |
+| `ctrl+t` | toggle showing streamed thinking (display only; the session file always records it) |
 | mouse wheel, scrollbar | scroll (native terminal scrolling) |
 | text selection | copy/paste (native terminal selection) |
 | `/` (empty input) | command palette |
 | `/system` | show the assembled system prompt (context files and skills, as sent to the model) |
 | `/md [flags] [file]` | export the session as a Markdown file (asks for a filename in a modal when none is given) |
+
+### `ctrl+t` — show/hide thinking
+
+`ctrl+t` toggles whether streamed thinking is displayed. The status line
+always shows the current state (`think:on` / `think:off`). This is a
+display-only switch: the session file records every thinking block, so
+`/md --thinking` and `--all` still export the full text.
+
+Because the transcript is printed straight to the terminal, it cannot be
+rewritten to expand or collapse what is already on screen. The toggle
+therefore affects text from that point on:
+
+- While thinking is hidden, each new thinking block prints a single
+  `Thinking...` line — interleaved with whatever comes around it (tool
+  calls, results, assistant text) in the order things happen.
+- The hidden text is deliberately discarded rather than stored, so
+  turning the display back on cannot surface a block out of order.
+- The toggle works mid-stream. Turning it off while thinking is
+  streaming ends the block there and prints `Thinking...`; turning it on
+  resumes printing from that delta — possibly mid-sentence, as a new
+  block below what was already printed.
 
 ### `/md` — export the session as Markdown
 

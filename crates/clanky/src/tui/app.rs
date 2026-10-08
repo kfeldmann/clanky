@@ -41,7 +41,13 @@ const ESTIMATE_STEP_CHARS: usize = 32;
 pub enum Entry {
     User(String),
     Assistant(String),
+    /// Streamed thinking, displayed while the display is on (ctrl+t).
     Thinking(String),
+    /// A thinking block that streamed while the display was off: it shows
+    /// as a single `Thinking...` placeholder line, one per block. The text
+    /// is deliberately discarded rather than kept — the terminal history
+    /// cannot be rewritten, so surfacing it later would land out of order.
+    ThinkingHidden,
     ToolCall {
         name: String,
         arguments: String,
@@ -192,6 +198,11 @@ pub struct App {
     input_index: Option<usize>,
     /// The live input saved when ↑ first recalled a prompt.
     draft: String,
+    /// Whether streamed thinking is displayed (ctrl+t). Display-only: the
+    /// session file always records the full thinking text. Turning it on
+    /// affects text that arrives from that point on; blocks that streamed
+    /// while it was off stay collapsed as [`Entry::Thinking`] placeholders.
+    show_thinking: bool,
     open: Option<OpenKind>,
 }
 
@@ -216,6 +227,7 @@ impl App {
             printed: Vec::new(),
             input_index: None,
             draft: String::new(),
+            show_thinking: true,
             open: None,
             history: Vec::new(),
             input_history: Vec::new(),
@@ -309,6 +321,33 @@ impl App {
         }
     }
 
+    /// ctrl+t: toggle whether streamed thinking is displayed. Display-only:
+    /// the session file still records every thinking block. The change takes
+    /// effect from here on, because the printed terminal history cannot be
+    /// rewritten — turning the display off ends the current block with a
+    /// placeholder line, and turning it on resumes printing at the next
+    /// delta (possibly mid-sentence, as a new entry below what was printed).
+    pub fn toggle_thinking_display(&mut self) {
+        self.show_thinking = !self.show_thinking;
+        if self.open != Some(OpenKind::Thinking) {
+            return;
+        }
+        if self.show_thinking {
+            // Resume as a fresh displayed entry at the next delta.
+            self.open = None;
+        } else {
+            // Collapse the rest of the block right away: the displayed
+            // text ends and one placeholder marks the block. `open` stays
+            // `Thinking`, so further deltas append nothing.
+            self.entries.push(Entry::ThinkingHidden);
+        }
+    }
+
+    /// Whether streamed thinking is currently displayed (ctrl+t).
+    pub fn show_thinking(&self) -> bool {
+        self.show_thinking
+    }
+
     // --- live usage estimates -----------------------------------------------
 
     /// Top up an estimate pool with `chars` new characters. The pools
@@ -351,6 +390,15 @@ impl App {
     }
 
     fn append_delta(&mut self, delta: &str, kind: OpenKind) {
+        if kind == OpenKind::Thinking && !self.show_thinking {
+            // Display off: collapse the block into one placeholder and
+            // discard the text (it must not resurface out of order later).
+            if self.open != Some(OpenKind::Thinking) {
+                self.entries.push(Entry::ThinkingHidden);
+            }
+            self.open = Some(OpenKind::Thinking);
+            return;
+        }
         let matches_kind = |entry: &Entry| {
             matches!(
                 (entry, kind),
@@ -389,7 +437,17 @@ impl App {
                     self.entries.push(Entry::User(text.clone()));
                     self.input_history.push(text.clone());
                 }
-                Record::Thinking { text } => self.entries.push(Entry::Thinking(text.clone())),
+                Record::Thinking { text } => {
+                    // Past thinking is only shown while the display is on;
+                    // a resumed session with the display off keeps the
+                    // collapsed placeholders (the session file still has
+                    // the text, e.g. for `/md --thinking`).
+                    if self.show_thinking {
+                        self.entries.push(Entry::Thinking(text.clone()));
+                    } else {
+                        self.entries.push(Entry::ThinkingHidden);
+                    }
+                }
                 Record::Assistant { text, calls } => {
                     self.entries.push(Entry::Assistant(text.clone()));
                     for call in calls {
@@ -669,6 +727,16 @@ impl App {
                 lines.extend(markdown::wrap(&markdown::render(text, base), width));
                 lines.push(Line::default());
             }
+            // A collapsed thinking block: one placeholder line, so the
+            // transcript shows that reasoning happened at this point
+            // without ever printing the text.
+            Entry::ThinkingHidden => {
+                let base = Style::new()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+                lines.push(Line::from(Span::styled("Thinking...", base)));
+                lines.push(Line::default());
+            }
             Entry::ToolCall { name, arguments } => {
                 // Display a preview: very long arguments are cut (the
                 // `timeout_seconds` override survives the cut); the
@@ -820,6 +888,62 @@ mod tests {
         assert_eq!(
             app.entries,
             vec![Entry::Thinking("hmm".into()), Entry::Assistant("hi".into())]
+        );
+
+        // With the display off, the same stream collapses to placeholders.
+        let mut app = App::new();
+        app.toggle_thinking_display();
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "hmm".into(),
+        });
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: " more".into(),
+        });
+        app.on_turn_event(TurnEvent::Text { delta: "hi".into() });
+        assert_eq!(
+            app.entries,
+            vec![Entry::ThinkingHidden, Entry::Assistant("hi".into())]
+        );
+    }
+
+    #[test]
+    fn hidden_thinking_interleaves_with_tools_in_order() {
+        // The user-visible shape with the display off:
+        //   Thinking...
+        //   ● bash {...}
+        //   └─ bash: ...
+        //   Thinking...
+        let mut app = App::new();
+        app.toggle_thinking_display();
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "reason 1".into(),
+        });
+        app.on_turn_event(TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        });
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "a".into(),
+        });
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "reason 2".into(),
+        });
+        assert_eq!(
+            app.entries,
+            vec![
+                Entry::ThinkingHidden,
+                Entry::ToolCall {
+                    name: "bash".into(),
+                    arguments: r#"{"command":"ls"}"#.into()
+                },
+                Entry::ToolResult {
+                    name: "bash".into(),
+                    output: "a".into()
+                },
+                Entry::ThinkingHidden,
+            ],
+            "each block is one placeholder, in event order"
         );
     }
 
