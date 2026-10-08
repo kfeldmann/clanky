@@ -21,6 +21,7 @@ if [ ! -x target/release/clanky ]; then
   echo "ERROR: target/release/clanky not found. Run ./build-linux-musl first." >&2
   exit 1
 fi
+test -d docker/binaries || mkdir docker/binaries
 cp target/release/clanky docker/binaries/clanky
 chmod 755 docker/binaries/clanky
 
