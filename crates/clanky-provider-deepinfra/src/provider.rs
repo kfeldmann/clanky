@@ -323,6 +323,7 @@ fn parse_models(body: &str) -> Result<Vec<ModelInfo>, Error> {
                 supports_text_generation,
                 input_price_per_mtok: price("input_tokens"),
                 output_price_per_mtok: price("output_tokens"),
+                cache_read_price_per_mtok: price("cache_read_tokens"),
             })
         })
         .collect();
@@ -380,12 +381,20 @@ struct OpenAiFunction {
     arguments: Option<Value>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+/// OpenAI-style cached-token breakdown inside `usage.prompt_tokens_details`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 /// Accumulates one streamed completion and translates deltas into protocol
@@ -413,6 +422,7 @@ impl StreamState {
             self.usage = Some(Usage {
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
+                cached_tokens: usage.prompt_tokens_details.and_then(|d| d.cached_tokens),
             });
         }
         for choice in chunk.choices {
@@ -615,9 +625,32 @@ mod tests {
             done.usage,
             Some(Usage {
                 prompt_tokens: Some(11),
-                completion_tokens: Some(2)
+                completion_tokens: Some(2),
+                cached_tokens: None
             })
         );
+    }
+
+    #[test]
+    fn usage_parses_the_cached_token_breakdown() {
+        let lines = [
+            &text_chunk("Hi!"),
+            &serde_json::json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 5000,
+                    "completion_tokens": 50,
+                    "prompt_tokens_details": {"cached_tokens": 4800}
+                }
+            })
+            .to_string(),
+            "data: [DONE]",
+        ];
+        let (_, done) = run_sse(&lines, &simple_request());
+        let usage = done.unwrap().usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(5000));
+        assert_eq!(usage.cached_tokens, Some(4800));
+        assert_eq!(usage.completion_tokens, Some(50));
     }
 
     #[test]
@@ -928,7 +961,7 @@ mod tests {
             "data": [
                 {"id": "deepseek-ai/DeepSeek-V4", "metadata": {"context_length": 163840,
                   "tags": ["chat", "reasoning"],
-                  "pricing": {"input_tokens": 0.09, "output_tokens": 0.18}}},
+                  "pricing": {"input_tokens": 0.09, "output_tokens": 0.18, "cache_read_tokens": 0.011}}},
                 {"id": "black-forest-labs/FLUX-1-schnell", "metadata":
                   {"tags": ["image-gen"]}},
                 {"id": "no-pricing-model"},
@@ -946,6 +979,7 @@ mod tests {
         assert_eq!(models[0].display_name.as_deref(), Some("DeepSeek-V4"));
         assert_eq!(models[0].input_price_per_mtok, Some(0.09));
         assert_eq!(models[0].output_price_per_mtok, Some(0.18));
+        assert_eq!(models[0].cache_read_price_per_mtok, Some(0.011));
         assert_eq!(models[0].supports_text_generation, Some(true));
         assert_eq!(models[1].id, "black-forest-labs/FLUX-1-schnell");
         assert_eq!(models[1].supports_text_generation, Some(false));

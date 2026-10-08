@@ -123,6 +123,12 @@ pub struct ModelInfo {
     pub input_price_per_mtok: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price_per_mtok: Option<f64>,
+    /// Dollars per million cached input tokens, when the provider
+    /// distinguishes cache reads from full-price input (DeepInfra's
+    /// `metadata.pricing.cache_read_tokens`). Absent means unknown, and
+    /// the cost display then treats cached tokens at the input rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_price_per_mtok: Option<f64>,
 }
 
 /// One conversation message. `content` is always a plain string in v1.
@@ -304,6 +310,12 @@ pub struct Usage {
     pub prompt_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u64>,
+    /// How many of `prompt_tokens` were served from the provider's prompt
+    /// cache and billed at the cheaper cache-read rate. Absent when the
+    /// backend does not report it (most OpenAI-compatible backends put it
+    /// in `prompt_tokens_details.cached_tokens`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
 }
 
 /// Errors surfaced by the protocol layer (either side of the transport).

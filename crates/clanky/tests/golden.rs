@@ -35,6 +35,7 @@ fn text_turn(text: &str) -> ScriptedTurn {
         usage: Some(Usage {
             prompt_tokens: Some(7),
             completion_tokens: Some(3),
+            cached_tokens: None,
         }),
     }
 }
@@ -230,6 +231,7 @@ fn tool_loop_transcript_matches_golden() {
             usage: Some(Usage {
                 prompt_tokens: Some(12),
                 completion_tokens: Some(9),
+                cached_tokens: None,
             }),
         },
         // Round 2: it answers with the tool result in hand.
@@ -275,6 +277,7 @@ fn bash_tool_transcript_matches_golden() {
             usage: Some(Usage {
                 prompt_tokens: Some(15),
                 completion_tokens: Some(6),
+                cached_tokens: None,
             }),
         },
         text_turn("The command printed 42."),

@@ -148,7 +148,8 @@ pub fn render(
 }
 
 /// Total token usage across `records` (prompt and completion summed over
-/// every turn's report), for the transcript footer and `/md` summaries.
+/// every per-round usage report), for the transcript footer and `/md`
+/// summaries.
 pub fn total_usage(records: &[Record]) -> Usage {
     let mut prompt = 0u64;
     let mut completion = 0u64;
@@ -165,6 +166,7 @@ pub fn total_usage(records: &[Record]) -> Usage {
     Usage {
         prompt_tokens: Some(prompt),
         completion_tokens: Some(completion),
+        cached_tokens: None,
     }
 }
 

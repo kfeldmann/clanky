@@ -3,6 +3,7 @@
     "finishReason": "stop",
     "text": "Let me use the tool.The tool said: fake ran with input=hello",
     "usage": {
+      "cachedTokens": 0,
       "completionTokens": 12,
       "promptTokens": 19
     }

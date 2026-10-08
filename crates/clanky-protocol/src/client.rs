@@ -276,6 +276,7 @@ mod tests {
                 supports_text_generation: None,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
+                cache_read_price_per_mtok: None,
             }])
         }
 
@@ -304,6 +305,7 @@ mod tests {
                 usage: Some(Usage {
                     prompt_tokens: Some(10),
                     completion_tokens: Some(3),
+                    cached_tokens: None,
                 }),
             })
         }

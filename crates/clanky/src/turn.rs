@@ -239,6 +239,8 @@ pub fn run_turn(
             usage_total.completion_tokens = Some(
                 usage_total.completion_tokens.unwrap_or(0) + usage.completion_tokens.unwrap_or(0),
             );
+            usage_total.cached_tokens =
+                Some(usage_total.cached_tokens.unwrap_or(0) + usage.cached_tokens.unwrap_or(0));
         }
 
         let calls = assembler.tool_calls();
@@ -448,6 +450,7 @@ mod tests {
             usage: Some(Usage {
                 prompt_tokens: Some(3),
                 completion_tokens: Some(2),
+                cached_tokens: None,
             }),
         }
     }
@@ -457,6 +460,7 @@ mod tests {
             usage: Usage {
                 prompt_tokens: Some(p),
                 completion_tokens: Some(c),
+                cached_tokens: None,
             },
         }
     }
@@ -478,6 +482,7 @@ mod tests {
             usage: Some(Usage {
                 prompt_tokens: Some(5),
                 completion_tokens: Some(4),
+                cached_tokens: None,
             }),
         }
     }
@@ -569,6 +574,7 @@ mod tests {
                 supports_text_generation: None,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
+                cache_read_price_per_mtok: None,
             }])
         }
 
@@ -976,7 +982,8 @@ mod tests {
             output.usage,
             Some(Usage {
                 prompt_tokens: Some(8),
-                completion_tokens: Some(6)
+                completion_tokens: Some(6),
+                cached_tokens: Some(0)
             })
         );
     }

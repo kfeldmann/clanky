@@ -150,6 +150,17 @@ enum WorkerEvent {
     Models(crate::error::Result<Vec<ModelInfo>>),
 }
 
+/// Effective per-million-token prices for one model, as used by the
+/// session-cost display. `cache_read` is the billed rate for prompt
+/// tokens the provider served from its cache; it defaults to the full
+/// input rate when the catalog does not separate them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Pricing {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+}
+
 /// The provider's model catalog, fetched on a worker thread so the status
 /// line can price the session and `/model` can open instantly.
 struct Catalog {
@@ -191,14 +202,22 @@ impl Catalog {
             .context_window
     }
 
-    /// Pricing of `model` (dollars per million tokens: input, output)
-    /// when the catalog matches the active provider and carries prices.
-    fn pricing_for(&self, provider: &str, model: Option<&str>) -> Option<(f64, f64)> {
+    /// Pricing of `model` (dollars per million tokens) when the catalog
+    /// matches the active provider and carries input/output prices. The
+    /// cache-read price falls back to the input price when the catalog
+    /// does not distinguish them (most models do not).
+    fn pricing_for(&self, provider: &str, model: Option<&str>) -> Option<Pricing> {
         if self.provider != provider {
             return None;
         }
         let info = self.models.iter().find(|m| Some(m.id.as_str()) == model)?;
-        Some((info.input_price_per_mtok?, info.output_price_per_mtok?))
+        Some(Pricing {
+            input: info.input_price_per_mtok?,
+            output: info.output_price_per_mtok?,
+            cache_read: info
+                .cache_read_price_per_mtok
+                .unwrap_or(info.input_price_per_mtok?),
+        })
     }
 }
 
@@ -817,13 +836,19 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
         if dirty {
             let session_name = state.current_name();
             // Estimated session cost: catalog pricing (dollars per million
-            // tokens) × cumulative token totals. Prompt tokens are re-billed
-            // every turn, so summing turns is what the provider charges for.
+            // tokens) × billed token totals. Every chat round is its own
+            // billed request (its report covers that request's full
+            // prompt), and each turn re-sends the whole conversation, so
+            // reports simply sum across rounds and turns. Cached prompt
+            // tokens bill at the cheaper cache-read rate.
             let cost = catalog
                 .pricing_for(&launch.provider, launch.model.as_deref())
-                .map(|(input, output)| {
-                    (app.total_prompt_tokens as f64 * input
-                        + app.total_completion_tokens as f64 * output)
+                .map(|p| {
+                    let u = &app.billed_usage;
+                    let uncached = u.prompt_tokens - u.cached_tokens;
+                    (uncached as f64 * p.input
+                        + u.cached_tokens as f64 * p.cache_read
+                        + u.completion_tokens as f64 * p.output)
                         / 1_000_000.0
                 });
             // `off`/empty mean disabled and are not shown.
@@ -1368,11 +1393,20 @@ fn model_detail(model: &ModelInfo) -> String {
         parts.push("thinking".into());
     }
     if let (Some(input), Some(output)) = (model.input_price_per_mtok, model.output_price_per_mtok) {
-        parts.push(format!(
-            "${} · ${} /Mtok",
-            format_price(input),
-            format_price(output)
-        ));
+        if let Some(cache) = model.cache_read_price_per_mtok {
+            parts.push(format!(
+                "${} cached · ${} in · ${} out /Mtok",
+                format_price(cache),
+                format_price(input),
+                format_price(output)
+            ));
+        } else {
+            parts.push(format!(
+                "${} · ${} /Mtok",
+                format_price(input),
+                format_price(output)
+            ));
+        }
     }
     parts.join(" · ")
 }
@@ -1526,6 +1560,7 @@ mod tests {
             supports_text_generation: Some(true),
             input_price_per_mtok: Some(0.4),
             output_price_per_mtok: Some(1.2),
+            cache_read_price_per_mtok: None,
         }]);
         let picker = picker_for(&models);
         assert_eq!(picker.title(), "model");
@@ -1601,6 +1636,7 @@ mod tests {
                 supports_text_generation: None,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
+                cache_read_price_per_mtok: None,
             }),
             ""
         );
@@ -1613,6 +1649,7 @@ mod tests {
                 supports_text_generation: Some(true),
                 input_price_per_mtok: Some(0.09),
                 output_price_per_mtok: Some(0.18),
+                cache_read_price_per_mtok: None,
             }),
             "Model · ctx 4096 · thinking · $0.09 · $0.18 /Mtok"
         );
@@ -1626,6 +1663,7 @@ mod tests {
                 supports_text_generation: None,
                 input_price_per_mtok: Some(2.0),
                 output_price_per_mtok: Some(1.5),
+                cache_read_price_per_mtok: None,
             }),
             "$2 · $1.50 /Mtok"
         );
@@ -1641,6 +1679,7 @@ mod tests {
             supports_text_generation: text,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
+            cache_read_price_per_mtok: None,
         };
         let filtered = text_generation_models(&[
             model("chat/model", Some(true)),

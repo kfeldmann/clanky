@@ -64,6 +64,7 @@ impl Handler for ScriptedProvider {
             usage: Some(Usage {
                 prompt_tokens: Some(3),
                 completion_tokens: Some(2),
+                cached_tokens: None,
             }),
         })
     }

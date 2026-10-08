@@ -47,8 +47,9 @@ pub struct Status<'a> {
     pub thinking: Option<&'a str>,
     /// Display name of the current session file, when one exists.
     pub session: Option<&'a str>,
-    /// Estimated session cost in dollars (catalog pricing × cumulative
-    /// token totals); `None` when no pricing is known.
+    /// Estimated session cost in dollars (catalog pricing × billed token
+    /// totals, per-round usage reports summed); `None` when no pricing is
+    /// known.
     pub cost: Option<f64>,
     /// Model context window (catalog hint); `None` when unknown, in which
     /// case no context percentage is shown.
@@ -404,8 +405,7 @@ fn status_line(
             Style::new().fg(Color::Yellow),
         ));
     }
-    let has_usage =
-        app.last_usage.is_some() || estimated_prompt > 0 || estimated_completion > 0;
+    let has_usage = app.last_usage.is_some() || estimated_prompt > 0 || estimated_completion > 0;
     if let Some(window) = status.context_window
         && window > 0
         && has_usage
@@ -934,6 +934,7 @@ mod tests {
                         usage: Some(clanky_protocol::Usage {
                             prompt_tokens: Some(17255),
                             completion_tokens: Some(796),
+                            cached_tokens: None,
                         }),
                     }));
                 }
@@ -1141,6 +1142,7 @@ mod tests {
         app.last_usage = Some(clanky_protocol::Usage {
             prompt_tokens: Some(120),
             completion_tokens: Some(80),
+            cached_tokens: None,
         });
         let line = status_line(&app, &status(), 40, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
@@ -1210,6 +1212,7 @@ mod tests {
             usage: clanky_protocol::Usage {
                 prompt_tokens: Some(17255),
                 completion_tokens: Some(796),
+                cached_tokens: None,
             },
         });
 

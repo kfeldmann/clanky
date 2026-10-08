@@ -114,6 +114,37 @@ enum OpenKind {
     Thinking,
 }
 
+/// Token counts a provider has actually billed for during the session,
+/// fed by per-round usage reports (see [`App::on_turn_event`]).
+///
+/// Every chat round is its own billed request: a round's prompt report is
+/// the full prompt that request charged for, not a cumulative session
+/// figure, so summing reports across rounds and turns is what the
+/// provider bills (each turn re-sends and re-bills the whole context).
+/// `cached_tokens` is the part served from the provider's prompt cache
+/// and billed at the cheaper cache-read rate instead of the input rate;
+/// it is a subset of the prompt count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BilledUsage {
+    /// Prompt tokens billed, all rounds and turns (each round's request
+    /// is charged its full restated prompt).
+    pub prompt_tokens: u64,
+    /// Completion tokens billed, all rounds and turns (always fresh).
+    pub completion_tokens: u64,
+    /// Portion of `prompt_tokens` served from the provider's prompt
+    /// cache, billed at the cache-read rate instead of the input rate.
+    pub cached_tokens: u64,
+}
+
+impl BilledUsage {
+    /// Fold one round's usage report.
+    fn add_round(&mut self, prompt: u64, cached: u64, completion: u64) {
+        self.prompt_tokens += prompt;
+        self.completion_tokens += completion;
+        self.cached_tokens += cached.min(prompt);
+    }
+}
+
 /// Everything the TUI needs to know between frames.
 pub struct App {
     pub entries: Vec<Entry>,
@@ -129,11 +160,10 @@ pub struct App {
     /// the status line: its prompt tokens are what the next request
     /// re-sends, so they drive the ctx % display.
     pub last_usage: Option<Usage>,
-    /// Session totals across all completed turns (prompt tokens are
-    /// re-billed every turn, so the cumulative sum is what the cost display
-    /// needs). Restored from a resumed session's usage records.
-    pub total_prompt_tokens: u64,
-    pub total_completion_tokens: u64,
+    /// Token counts the provider has actually billed for, across all
+    /// completed turns and the current one (see [`BilledUsage`]). Restored
+    /// from a resumed session's usage records.
+    pub billed_usage: BilledUsage,
     /// The complete conversation (system context first): what is passed
     /// to the next turn. Updated after each turn, restored on resume (M4).
     pub history: Vec<ChatMessage>,
@@ -180,8 +210,7 @@ impl App {
             busy: false,
             pending: None,
             last_usage: None,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
+            billed_usage: BilledUsage::default(),
             completion: None,
             printed_entries: 0,
             printed: Vec::new(),
@@ -239,8 +268,11 @@ impl App {
             // as prompt tokens, which is what the ctx % should show.
             TurnEvent::Usage { usage } => {
                 self.last_usage = Some(usage);
-                self.total_prompt_tokens += usage.prompt_tokens.unwrap_or(0);
-                self.total_completion_tokens += usage.completion_tokens.unwrap_or(0);
+                self.billed_usage.add_round(
+                    usage.prompt_tokens.unwrap_or(0),
+                    usage.cached_tokens.unwrap_or(0),
+                    usage.completion_tokens.unwrap_or(0),
+                );
                 // The report covers everything sent and received so far:
                 // live values switch to billed-only until new content lands.
                 self.estimate_reset();
@@ -264,7 +296,8 @@ impl App {
     }
 
     /// Finalize the turn: surface the error, if any. Usage was already
-    /// applied round-by-round via [`TurnEvent::Usage`].
+    /// applied round-by-round via [`TurnEvent::Usage`]; this closes the
+    /// turn's billing (one full charge for the final round's prompt).
     pub fn on_turn_done(&mut self, result: &Result<TurnOutput>) {
         self.busy = false;
         self.open = None;
@@ -347,8 +380,7 @@ impl App {
         self.printed_entries = 0;
         self.printed.clear();
         self.last_usage = None;
-        self.total_prompt_tokens = 0;
-        self.total_completion_tokens = 0;
+        self.billed_usage = BilledUsage::default();
         self.estimate_reset();
         self.open = None;
         for record in records {
@@ -379,9 +411,13 @@ impl App {
                     self.last_usage = Some(Usage {
                         prompt_tokens: *prompt_tokens,
                         completion_tokens: *completion_tokens,
+                        cached_tokens: None,
                     });
-                    self.total_prompt_tokens += prompt_tokens.unwrap_or(0);
-                    self.total_completion_tokens += completion_tokens.unwrap_or(0);
+                    self.billed_usage.add_round(
+                        prompt_tokens.unwrap_or(0),
+                        0,
+                        completion_tokens.unwrap_or(0),
+                    );
                 }
             }
         }
@@ -850,26 +886,34 @@ mod tests {
     }
 
     #[test]
-    fn usage_accumulates_per_round_and_done_surfaces_errors() {
+    fn billed_usage_accumulates_per_round_and_done_surfaces_errors() {
         let mut app = App::new();
         app.busy = true;
         let round1 = Usage {
             prompt_tokens: Some(10),
             completion_tokens: Some(3),
+            cached_tokens: None,
         };
+        // Round 2's report restates the whole prompt: only the 2 new
+        // prompt tokens are an added charge.
         let round2 = Usage {
             prompt_tokens: Some(12),
             completion_tokens: Some(4),
+            cached_tokens: None,
         };
-        // A two-round turn: usage lands as each round completes.
+        // A two-round turn: usage lands as each round completes. Each
+        // round is its own billed request, so reports sum directly.
         app.on_turn_event(TurnEvent::Usage { usage: round1 });
         app.on_turn_event(TurnEvent::Usage { usage: round2 });
         assert_eq!(app.last_usage, Some(round2), "last round's own usage");
-        assert_eq!(app.total_prompt_tokens, 22, "rounds sum into the total");
-        assert_eq!(app.total_completion_tokens, 7);
+        assert_eq!(
+            app.billed_usage.prompt_tokens, 22,
+            "each round's request is billed its full prompt"
+        );
+        assert_eq!(app.billed_usage.completion_tokens, 7);
 
         // done only ends the turn; usage was already applied.
-        let before = (app.total_prompt_tokens, app.total_completion_tokens);
+        let before = app.billed_usage;
         app.on_turn_done(&Ok(TurnOutput {
             text: "hi".into(),
             finish_reason: clanky_protocol::FinishReason::Stop,
@@ -877,16 +921,45 @@ mod tests {
         }));
         assert!(!app.busy);
         assert_eq!(app.last_usage, Some(round2));
-        assert_eq!(
-            (app.total_prompt_tokens, app.total_completion_tokens),
-            before,
-            "done must not re-add usage"
-        );
+        assert_eq!(app.billed_usage, before, "done must not re-add usage");
 
         app.busy = true;
         app.on_turn_done(&Err(crate::error::Error::NoModel));
         assert!(!app.busy);
         assert!(matches!(app.entries.last(), Some(Entry::Error(_))));
+    }
+
+    #[test]
+    fn cached_tokens_track_the_cache_served_prompt_portion() {
+        let mut app = App::new();
+        // 1000 prompt tokens, 800 from cache, 50 completion.
+        app.on_turn_event(TurnEvent::Usage {
+            usage: Usage {
+                prompt_tokens: Some(1000),
+                completion_tokens: Some(50),
+                cached_tokens: Some(800),
+            },
+        });
+        assert_eq!(
+            app.billed_usage,
+            BilledUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 50,
+                cached_tokens: 800,
+            }
+        );
+        // A cached count larger than the prompt is clamped (defensive:
+        // providers should not report it, but a bad number must not
+        // price negative input tokens).
+        app.on_turn_event(TurnEvent::Usage {
+            usage: Usage {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                cached_tokens: Some(999),
+            },
+        });
+        assert_eq!(app.billed_usage.prompt_tokens, 1010);
+        assert_eq!(app.billed_usage.cached_tokens, 810, "clamped to the prompt");
     }
 
     #[test]
@@ -914,11 +987,12 @@ mod tests {
             usage: Usage {
                 prompt_tokens: Some(100),
                 completion_tokens: Some(50),
+                cached_tokens: None,
             },
         });
         assert_eq!(app.estimated_tokens(), (0, 0));
-        assert_eq!(app.total_prompt_tokens, 100);
-        assert_eq!(app.total_completion_tokens, 50);
+        assert_eq!(app.billed_usage.prompt_tokens, 100);
+        assert_eq!(app.billed_usage.completion_tokens, 50);
 
         // Streaming again starts from a clean estimate.
         app.on_turn_event(TurnEvent::Text {
@@ -946,10 +1020,11 @@ mod tests {
             usage: Usage {
                 prompt_tokens: Some(500),
                 completion_tokens: Some(20),
+                cached_tokens: None,
             },
         });
         assert_eq!(app.estimated_tokens(), (0, 0));
-        assert_eq!(app.total_prompt_tokens, 500);
+        assert_eq!(app.billed_usage.prompt_tokens, 500);
     }
 
     #[test]
@@ -1261,6 +1336,15 @@ mod tests {
             "user, assistant, call, result, assistant"
         );
         assert_eq!(app.last_usage.and_then(|u| u.completion_tokens), Some(2));
+        assert_eq!(
+            app.billed_usage,
+            BilledUsage {
+                prompt_tokens: 9,
+                completion_tokens: 2,
+                cached_tokens: 0,
+            },
+            "resume rebuilds the billed totals from the usage records"
+        );
         assert_eq!(history.len(), 4, "user, assistant+call, tool, assistant");
 
         let lines = app.transcript_lines(80);

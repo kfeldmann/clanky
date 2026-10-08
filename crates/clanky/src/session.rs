@@ -75,7 +75,11 @@ pub enum Record {
     Assistant { text: String, calls: Vec<ToolCall> },
     /// A tool result fed back to the model.
     ToolResult { name: String, output: String },
-    /// Token usage of one turn.
+    /// Token usage of one completed chat round. Every chat round is its
+    /// own billed request (its `prompt_tokens` restates that request's
+    /// whole prompt, and a turn re-sends the conversation every round),
+    /// so usage records simply sum across rounds and turns. A turn with
+    /// multiple model rounds writes one record per round.
     Usage {
         #[serde(default)]
         prompt_tokens: Option<u64>,
@@ -451,7 +455,9 @@ pub fn history_from_records(records: &[Record]) -> Vec<ChatMessage> {
     messages
 }
 
-/// Convenience: token usage as a record (clamps `None`s for the file).
+/// Convenience: one chat round's usage as a record (clamps `None`s for
+/// the file). Called per [`crate::turn::TurnEvent::Usage`], i.e. once per
+/// round, so a multi-round turn writes one record per round.
 pub fn usage_record(usage: Usage) -> Record {
     Record::Usage {
         prompt_tokens: usage.prompt_tokens,
