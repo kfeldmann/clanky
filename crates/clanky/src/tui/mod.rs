@@ -823,16 +823,26 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                                     }
                                 }
                                 Action::Submit(prompt) => {
-                                    app.push_user(&prompt);
-                                    state.record(
-                                        &mut app,
-                                        session::Record::User {
-                                            text: prompt.clone(),
-                                        },
-                                    );
                                     if app.busy {
-                                        app.pending = Some(prompt);
+                                        // The message is NOT in the context
+                                        // yet: show a queued placeholder and
+                                        // wait for the turn to end. The real
+                                        // user entry, session record and
+                                        // estimate are applied at dispatch
+                                        // (below), when the prompt is
+                                        // actually sent.
+                                        app.entries.push(app::Entry::Queued {
+                                            preview: queued_preview(&prompt),
+                                        });
+                                        app.pending.push(prompt);
                                     } else {
+                                        app.push_user(&prompt);
+                                        state.record(
+                                            &mut app,
+                                            session::Record::User {
+                                                text: prompt.clone(),
+                                            },
+                                        );
                                         app.busy = true;
                                         spawn_turn(
                                             app.history.clone(),
@@ -911,7 +921,14 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                 },
             }
         }
-        if let (true, Some(prompt)) = (turn_finished, app.pending.take()) {
+        // Only consume the queued message when a turn actually finished;
+        // taking it unconditionally would drop it whenever the turn was
+        // still running.
+        if let Some(prompt) = take_queued(turn_finished, &mut app.pending) {
+            // The queued prompt now enters the context: print it in full
+            // at its real place in the history (the placeholder above it
+            // stays printed — terminal history cannot be rewritten),
+            // record it, and count it into the estimate.
             app.push_user(&prompt);
             state.record(
                 &mut app,
@@ -1545,6 +1562,28 @@ fn pressed(key: KeyEvent) -> Option<KeyEvent> {
     }
 }
 
+/// Consume the queued message, but only when the running turn has ended:
+/// a prompt typed mid-turn must survive every event-loop iteration until
+/// the `Done` event frees the turn slot. (`Option::take` inside an `if let`
+/// scrutinee would instead drop it the moment the turn was still busy.)
+/// Truncated single-line preview of a queued prompt, for the
+/// placeholder shown while the message waits for the turn to end.
+fn queued_preview(prompt: &str) -> String {
+    let single = prompt.lines().collect::<Vec<_>>().join("\u{21aa}");
+    if let Some((cut, _)) = single.char_indices().nth(48) {
+        return format!("{}\u{2026}", &single[..cut]);
+    }
+    single
+}
+
+fn take_queued(turn_finished: bool, pending: &mut Vec<String>) -> Option<String> {
+    if turn_finished && !pending.is_empty() {
+        Some(pending.remove(0))
+    } else {
+        None
+    }
+}
+
 fn handle_key(
     app: &mut app::App,
     state: &mut SessionState,
@@ -1698,6 +1737,34 @@ mod tests {
                 app::Entry::Thinking("three".into()),
             ]
         );
+    }
+
+    #[test]
+    fn queued_prompts_survive_until_the_turn_finishes() {
+        let mut pending = vec!["second".to_string()];
+        // The turn is still running: the queue must not be touched.
+        assert_eq!(take_queued(false, &mut pending), None);
+        assert_eq!(pending, vec!["second"]);
+        // The turn ended: one prompt leaves the queue per finished turn,
+        // in the order they were typed.
+        pending.push("third".into());
+        assert_eq!(take_queued(true, &mut pending).as_deref(), Some("second"));
+        assert_eq!(pending, vec!["third"]);
+        assert_eq!(take_queued(true, &mut pending).as_deref(), Some("third"));
+        assert!(pending.is_empty());
+        // Nothing queued: a finished turn dispatches nothing.
+        assert_eq!(take_queued(true, &mut pending), None);
+    }
+
+    #[test]
+    fn queued_preview_is_one_line_and_truncated() {
+        assert_eq!(queued_preview("short"), "short");
+        let long = "x".repeat(200);
+        let preview = queued_preview(&long);
+        assert!(preview.ends_with('\u{2026}'), "{preview}");
+        assert!(preview.chars().count() <= 49, "{}", preview.chars().count());
+        // Newlines never reach the placeholder (LF would break the row).
+        assert_eq!(queued_preview("a\nb\nc"), "a\u{21aa}b\u{21aa}c");
     }
 
     #[test]

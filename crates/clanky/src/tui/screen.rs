@@ -390,7 +390,7 @@ fn status_line(
     // window the last turn consumed (the next request re-sends those
     // prompt tokens, so they are what accumulates toward the limit).
     let mut right = Vec::new();
-    if app.pending.is_some() {
+    if !app.pending.is_empty() {
         right.push(Span::styled(
             "○ queued".to_string(),
             Style::new().fg(Color::Yellow),
@@ -1159,7 +1159,7 @@ mod tests {
         assert_eq!(text.chars().count(), 40, "padded to the full width");
 
         app.busy = false;
-        app.pending = Some("x".into());
+        app.pending = vec!["x".into()];
         let line = status_line(&app, &status(), 40, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("○ queued"), "{text}");

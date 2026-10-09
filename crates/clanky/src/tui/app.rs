@@ -60,6 +60,14 @@ pub enum Entry {
     /// A UI-only note (command feedback, etc.); not sent to the model
     /// and not recorded in the session file.
     Info(String),
+    /// A prompt typed while a turn was running: shown queued (with a
+    /// truncated preview) until the turn ends and the full prompt is
+    /// printed as [`Entry::User`] at its real place in the history.
+    /// UI-only: not sent, not recorded, and not counted toward the
+    /// context estimate — the message is not in the context yet.
+    Queued {
+        preview: String,
+    },
     /// One part of the assembled system prompt, shown verbatim by
     /// `/system` (UI-only): not sent, not recorded.
     SystemPart {
@@ -160,8 +168,8 @@ pub struct App {
     pub cursor: usize,
     /// A turn is running in the worker thread.
     pub busy: bool,
-    /// A prompt typed while busy, sent when the turn finishes.
-    pub pending: Option<String>,
+    /// Prompts typed while busy, sent one per turn as turns finish.
+    pub pending: Vec<String>,
     /// Usage of the most recently completed chat round (not turn), for
     /// the status line: its prompt tokens are what the next request
     /// re-sends, so they drive the ctx % display.
@@ -219,7 +227,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             busy: false,
-            pending: None,
+            pending: Vec::new(),
             last_usage: None,
             billed_usage: BilledUsage::default(),
             completion: None,
@@ -842,6 +850,15 @@ impl App {
                 lines.extend(markdown::wrap_text(
                     &format!("· {message}"),
                     Style::new().fg(Color::DarkGray),
+                    width,
+                ));
+                lines.push(Line::default());
+            }
+            Entry::Queued { preview } => {
+                let style = Style::new().fg(Color::Yellow);
+                lines.extend(markdown::wrap_text(
+                    &format!("○ queued: {preview}"),
+                    style,
                     width,
                 ));
                 lines.push(Line::default());
