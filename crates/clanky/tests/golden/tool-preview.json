@@ -1,0 +1,32 @@
+{
+  "rows": [
+    "❯ long input",
+    "",
+    "● fake {\"input\":\"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll",
+    "mmmm nnnn oooo pppp qqqq rrrr ssss tttt\"}",
+    "",
+    "  └─ fake: fake ran with input=aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj",
+    "kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt",
+    "",
+    "● fake {\"input\":\"word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word … (+1 more lines)",
+    "",
+    "  └─ fake: fake ran with input=word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word word word word word",
+    "word word word word word word word word word word word word wo… (+18 more lines)",
+    "",
+    "done",
+    ""
+  ]
+}

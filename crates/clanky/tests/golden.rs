@@ -319,6 +319,79 @@ fn bash_tool_transcript_matches_golden() {
     compare_or_update("bash-tool", &transcript);
 }
 
+/// Tool-call and tool-result previews pinned as text so the visual
+/// contract of the transcript (how a call and its result render at a
+/// given width, including the post-wrap line cap) is caught on change.
+/// `Line`/`Span` are not `Serialize`, so the rows are compared as plain
+/// strings.
+#[test]
+fn tool_preview_rendering_matches_golden() {
+    // The fake tool with a long input: the cut call preview must keep
+    // its shape, and the wide result exercises the cap.
+    let script = vec![
+        ScriptedTurn {
+            chunks: tool_call_chunks(
+                "call_1",
+                "fake",
+                r#"{"input": "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mmmm nnnn oooo pppp qqqq rrrr ssss tttt"}"#,
+            ),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                prompt_tokens: Some(12),
+                completion_tokens: Some(9),
+                cached_tokens: None,
+            }),
+        },
+        // A second call whose echoed result wraps into many rows at
+        // transcript width, exercising the post-wrap cap.
+        ScriptedTurn {
+            chunks: tool_call_chunks(
+                "call_2",
+                "fake",
+                &format!(r#"{{"input": "{}"}}"#, "word ".repeat(400)),
+            ),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                prompt_tokens: Some(30),
+                completion_tokens: Some(9),
+                cached_tokens: None,
+            }),
+        },
+        text_turn("done"),
+    ];
+    let (provider, _requests) = ScriptedProvider::new(script);
+    let mut messages = vec![ChatMessage::user("long input")];
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let sink = events.clone();
+    run_turn(
+        Box::new(provider),
+        &fake_tools(),
+        &mut messages,
+        &config(),
+        &mut |event| sink.borrow_mut().push(event),
+    )
+    .unwrap();
+
+    let mut app = clanky::tui::App::new();
+    app.push_user("long input");
+    for event in events.borrow().iter() {
+        app.on_turn_event(event.clone());
+    }
+
+    // Each entry's rows at transcript width, as plain strings.
+    let rows: Vec<String> = (0..app.entries.len())
+        .flat_map(|i| app.entry_lines(i, 80))
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect::<String>()
+        })
+        .collect();
+    let transcript = json!({ "rows": rows });
+    compare_or_update("tool-preview", &transcript);
+}
+
 #[test]
 fn sampling_and_thinking_are_plumbed_through_every_round() {
     // Same script as the tool loop; the transcript assertions already pin

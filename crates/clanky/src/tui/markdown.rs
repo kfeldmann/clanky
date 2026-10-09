@@ -11,7 +11,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthChar as _;
+use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 /// Render assistant text as styled lines (not yet wrapped).
 pub fn render(text: &str, base: Style) -> Vec<Line<'static>> {
@@ -44,9 +44,38 @@ pub fn render(text: &str, base: Style) -> Vec<Line<'static>> {
 /// separate source lines before wrapping (raw `\n` characters must never
 /// reach the terminal buffer: the cursor moves down without returning to
 /// column 0, producing a staircase of increasingly indented lines).
+///
+/// Unbounded: a very long source line wraps into many rows. Preview
+/// entries (tool calls and results) use [`wrap_capped`] instead, so the
+/// transcript height stays predictable no matter what a tool printed.
 pub fn wrap(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
+    wrap_impl(lines, width, None, Style::new())
+}
+
+/// Word-wrap styled lines and cap the output at `max_lines` rows, adding
+/// a note with the hidden count. Wrapping happens first, truncation
+/// second: the result is exactly `min(wrapped, max_lines)` rows, which
+/// the screen renderer's scroll math depends on. The note is appended
+/// (dimmed) to the last visible row, replacing that row's trailing
+/// spaces; hidden content that ends in a blank row loses it, which
+/// matters only for whitespace.
+pub fn wrap_capped(
+    lines: &[Line<'static>],
+    width: u16,
+    max_lines: usize,
+    note_style: Style,
+) -> Vec<Line<'static>> {
+    wrap_impl(lines, width, Some(max_lines), note_style)
+}
+
+fn wrap_impl(
+    lines: &[Line<'static>],
+    width: u16,
+    max_lines: Option<usize>,
+    note_style: Style,
+) -> Vec<Line<'static>> {
     let width = width.max(1) as usize;
-    let mut out = Vec::new();
+    let mut out: Vec<Line<'static>> = Vec::new();
     for line in lines {
         let chars: Vec<(char, Style)> = line
             .spans
@@ -66,7 +95,54 @@ pub fn wrap(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
             }
         }
     }
-    out
+    match max_lines {
+        None => out,
+        Some(max_lines) => cap_lines(out, max_lines, width, note_style),
+    }
+}
+
+/// Truncate already-wrapped rows to `max_lines`, appending a
+/// `… (+N more lines)` note to the last visible row. The caller wraps
+/// first, so the result is exactly `min(wrapped, max_lines)` rows. The
+/// note replaces the end of the last row: its content is cut (from the
+/// left; leading alignment spaces survive) to however many columns fit
+/// before the note, so the note is always visible.
+fn cap_lines(
+    wrapped: Vec<Line<'static>>,
+    max_lines: usize,
+    width: usize,
+    note_style: Style,
+) -> Vec<Line<'static>> {
+    if wrapped.len() <= max_lines {
+        return wrapped;
+    }
+    let hidden = wrapped.len() - max_lines;
+    let mut shown: Vec<Line<'static>> = wrapped.into_iter().take(max_lines).collect();
+    let note = format!("… (+{hidden} more lines)");
+    let note_width = note.width();
+    // Too narrow for content plus note: the renderer hard-truncates
+    // rows to `width` anyway, so keep the row as it is.
+    if note_width >= width {
+        return shown;
+    }
+    let budget = width - note_width;
+    let tail = &mut shown[max_lines - 1];
+    let mut piece = String::new();
+    let mut piece_width = 0usize;
+    for (c, _style) in tail.spans.iter().flat_map(|s| {
+        let span_style = s.style.patch(tail.style);
+        s.content.chars().map(move |c| (c, span_style))
+    }) {
+        let cw = c.width().unwrap_or(0);
+        if piece_width + cw > budget {
+            break;
+        }
+        piece_width += cw;
+        piece.push(c);
+    }
+    piece.push_str(&note);
+    *tail = Line::from(Span::styled(piece, note_style));
+    shown
 }
 
 /// Split styled chars at newlines into segments. `"a\n\nb"` becomes
@@ -533,6 +609,45 @@ mod tests {
         let wrapped = wrap(&lines, 10);
         let texts: Vec<String> = wrapped.iter().map(|l| span_text(&l.spans)).collect();
         assert_eq!(texts, ["aaa"]);
+    }
+
+    #[test]
+    fn wrap_capped_truncates_after_wrapping() {
+        let lines = vec![Line::raw("word ".repeat(200) + "end")];
+        let uncapped = wrap(&lines, 40);
+        let capped = wrap_capped(&lines, 40, 3, Style::new());
+        assert_eq!(capped.len(), 3);
+        assert!(uncapped.len() > 3, "{}", uncapped.len());
+        let texts: Vec<String> = capped.iter().map(|l| span_text(&l.spans)).collect();
+        assert!(texts[2].contains("… ("), "{texts:?}");
+        assert!(texts[2].contains("more lines)"), "{texts:?}");
+        // The visible rows above the note are untouched by the cap.
+        let uncapped_texts: Vec<String> = uncapped.iter().map(|l| span_text(&l.spans)).collect();
+        assert_eq!(texts[0], uncapped_texts[0]);
+        assert_eq!(texts[1], uncapped_texts[1]);
+    }
+
+    #[test]
+    fn wrap_capped_keeps_everything_under_the_cap() {
+        let lines = vec![Line::raw("aaa bbb"), Line::raw("ccc")];
+        let capped = wrap_capped(&lines, 20, 3, Style::new());
+        assert_eq!(capped.len(), 2);
+        assert!(!span_text(&capped[1].spans).contains("more lines"));
+    }
+
+    /// The note lands on the last visible row, never on an extra row:
+    /// the renderer's row-count math depends on the exact count. The
+    /// last row's content is cut from the left to make room.
+    #[test]
+    fn wrap_capped_note_shares_the_last_row() {
+        // One oversized word hard-breaks into 40-column rows.
+        let lines = vec![Line::raw("x".repeat(100))];
+        let capped = wrap_capped(&lines, 40, 2, Style::new());
+        let texts: Vec<String> = capped.iter().map(|l| span_text(&l.spans)).collect();
+        assert_eq!(capped.len(), 2, "{texts:?}");
+        assert_eq!(texts[0], "x".repeat(40));
+        // 23 columns of content + the 17-column note = 40.
+        assert_eq!(texts[1], format!("{}… (+1 more lines)", "x".repeat(23)));
     }
 
     #[test]

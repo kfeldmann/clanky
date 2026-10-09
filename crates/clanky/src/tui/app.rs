@@ -771,7 +771,15 @@ impl App {
                         Style::new().fg(Color::DarkGray),
                     )));
                 }
-                lines.extend(markdown::wrap(&src, width));
+                // Capped: the arguments preview keeps the transcript
+                // height bounded when the cut text still wraps widely
+                // (prettified JSON with many short lines).
+                lines.extend(markdown::wrap_capped(
+                    &src,
+                    width,
+                    TOOL_PREVIEW_LINES,
+                    Style::new().fg(Color::DarkGray),
+                ));
                 lines.push(Line::default());
             }
             Entry::ToolResult { name, output } => {
@@ -808,7 +816,15 @@ impl App {
                         preview_style,
                     )));
                 }
-                lines.extend(markdown::wrap(&src, width));
+                // Capped: the line count of the preview is bounded even
+                // when a single output line wraps into many rows, so the
+                // entry's height stays predictable for the scroll math.
+                lines.extend(markdown::wrap_capped(
+                    &src,
+                    width,
+                    TOOL_PREVIEW_LINES,
+                    style,
+                ));
                 lines.push(Line::default());
             }
             // Error/info text may contain newlines; route it through
@@ -1422,15 +1438,26 @@ mod tests {
             arguments: json!({"command": long, "timeout_seconds": 90}).to_string(),
         });
 
-        // The transcript shows the cut with the timeout kept.
-        let lines = app.transcript_lines(80);
+        // Wide enough that the cut call fits under the cap: the cut
+        // note and the re-attached timeout are both visible.
+        let lines = app.entry_lines(0, 1_000);
         let shown: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
         assert!(shown.contains("… (truncated)"), "{shown}");
         assert!(shown.contains("timeout_seconds\":90"), "{shown}");
-        assert!(shown.len() < 2_000, "display is shorter: {}", shown.len());
+
+        // At transcript width the call wraps past the preview cap, so
+        // the entry's row count is bounded (8 rows + the separator).
+        let lines = app.transcript_lines(80);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(texts.len(), TOOL_PREVIEW_LINES + 1, "{texts:?}");
+        let shown: String = texts.concat();
+        assert!(shown.len() < 1_000, "display is short: {}", shown.len());
 
         // The entry keeps the full text so resume restores it verbatim.
         let full = match &app.entries[0] {

@@ -63,7 +63,22 @@ done
 
 fn spawn(tag: &str, body: &str) -> ProcessTransport {
     let path = fake_plugin(tag, body);
-    ProcessTransport::spawn(ProcessOptions::new(path.to_str().unwrap())).expect("spawn plugin")
+    // Executing a freshly written file can race the kernel's overlay
+    // bookkeeping in containers (`Text file busy`); a short retry
+    // settles it. Any other error fails immediately.
+    let mut attempt = 0;
+    loop {
+        match ProcessTransport::spawn(ProcessOptions::new(path.to_str().unwrap())) {
+            Ok(transport) => return transport,
+            Err(Error::Io(e))
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 20 =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("spawn plugin: {e}"),
+        }
+    }
 }
 
 fn hello() -> Message {
@@ -278,9 +293,11 @@ on_cancel() {{ :; }}
     let started = Instant::now();
     // Cancel from another thread while the chat is being read (the iterator
     // borrows the transport, so cancellation goes through the handle).
+    // `send` must come first: it clears a stale cancel deadline, so a
+    // cancel that lands before it would be silently dropped.
     let cancel = transport.cancel_handle();
-    let cancel_thread = std::thread::spawn(move || cancel.cancel(1).unwrap());
     let mut responses = transport.send(chat(1), &mut sink).unwrap();
+    let cancel_thread = std::thread::spawn(move || cancel.cancel(1).unwrap());
     cancel_thread.join().unwrap();
     // The iterator's next call blocks up to CANCEL_TIMEOUT, then kills the
     // process and reports the death.

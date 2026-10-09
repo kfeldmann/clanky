@@ -55,6 +55,7 @@
 //! │ ●❯ input line │
 
 mod app;
+pub use app::App;
 mod commands;
 mod completion;
 mod editor;
