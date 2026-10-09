@@ -157,10 +157,12 @@ Notes:
 
 - **The model list is whatever your key can see.** `/v1/models` is
   key-scoped, and the richer metadata (context window, pricing, reasoning and
-  tool support) comes from `/v1/model/info`. That endpoint is *not* one of
-  the LLM API routes, so a virtual key may be denied it (403); the plugin
-  then falls back to the plain catalog and simply omits the hints — a listing
-  never fails because of it.
+  tool support) comes from `/model/info`. That endpoint is *not* one of the
+  LLM API routes, so a virtual key may be denied it (403); the plugin then
+  falls back to the plain catalog and simply omits the hints — a listing
+  never fails because of it. (The plugin calls the bare `/model/info` path,
+  not the `/v1/model/info` alias: LiteLLM's virtual-key route allowlist names
+  the bare form, so a restricted key can be denied the alias with a 403.)
 - **Thinking maps to `reasoning_effort`.** Clanky's `--thinking <budget>` is
   translated onto LiteLLM's effort ladder (`none`/`minimal`/`low`/`medium`/
   `high`/`xhigh`/`max`); `--thinking off` omits the field. Because the proxy

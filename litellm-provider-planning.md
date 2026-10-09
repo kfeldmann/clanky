@@ -128,7 +128,13 @@ decisions above were resolved as follows:
 4. **`/model/info` degrades gracefully.** A 403 (route not allowed for the
    virtual key) or a malformed body yields the plain `/v1/models` catalog with
    the hints omitted; a listing never fails because of it.
-5. **README + crate docs** (no separate `docs/` tree).
+5. **`/model/info` is called bare, not as `/v1/model/info`.** The handler is
+   aliased, but a virtual key's route allowlist names the bare form
+   (`['llm_api_routes', '/model/info']`); the alias is not in the
+   `llm_api`/info route groups, so a restricted key gets 403 for exactly the
+   `/v1/` path (as built: this bit us — cost/context metadata silently
+   vanished while the same key could curl the bare path successfully).
+6. **README + crate docs** (no separate `docs/` tree).
 
 Captures from `./reference/` are checked in as test fixtures
 (`crates/clanky-provider-litellm/tests/fixtures/`): the catalog,

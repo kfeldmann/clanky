@@ -130,9 +130,24 @@ impl<B: Backend> LiteLlmProvider<B> {
     /// (with or without a trailing slash) is not doubled, so both
     /// `http://host:4000` and `http://host:4000/v1` work.
     fn url(&self, path: &str) -> String {
+        format!("{}/v1/{path}", self.base_root())
+    }
+
+    /// Join a path onto the base URL *without* the `/v1` prefix, for
+    /// LiteLLM management routes. `/model/info` is served both bare and
+    /// under `/v1`, but a virtual key's route allowlist names it bare
+    /// (`llm_api_routes, '/model/info'`): the `/v1/` alias is registered on
+    /// the same handler yet is not itself in the `llm_api`/info route
+    /// groups, so a restricted key gets a 403 for exactly the path this
+    /// plugin used to call. The bare form is the canonical one.
+    fn root_url(&self, path: &str) -> String {
+        format!("{}/{path}", self.base_root())
+    }
+
+    /// The base URL, trimmed and with any `/v1` suffix removed.
+    fn base_root(&self) -> &str {
         let base = self.base_url.trim_end_matches('/');
-        let base = base.strip_suffix("/v1").unwrap_or(base);
-        format!("{base}/v1/{path}")
+        base.strip_suffix("/v1").unwrap_or(base)
     }
 }
 
@@ -216,7 +231,7 @@ impl<B: Backend> LiteLlmProvider<B> {
     /// failure or malformed body yields an empty map — the catalog and chat
     /// keep working, only the metadata hints are omitted.
     fn fetch_hints(&self) -> HashMap<String, ModelHints> {
-        match self.backend.get_status(&self.url("model/info")) {
+        match self.backend.get_status(&self.root_url("model/info")) {
             Ok((_, body)) => parse_model_info(&body),
             Err(err) => {
                 eprintln!(
@@ -496,7 +511,7 @@ impl ModelHints {
     }
 }
 
-/// Parse `GET /v1/model/info` into a `model_name → hints` map. Load-balanced
+/// Parse `GET /model/info` into a `model_name → hints` map. Load-balanced
 /// groups repeat a `model_name` (one row per deployment), so the first row
 /// wins — mirroring the Pi extension's `if (name in map) continue`. A
 /// malformed body yields an empty map (the caller degrades gracefully).
@@ -759,7 +774,7 @@ mod tests {
     const STREAM_TOOLS: &str = include_str!("../tests/fixtures/stream_tools.txt");
 
     /// Records requests and replays canned responses. `/v1/models` and
-    /// `/v1/model/info` are configured independently so a test can make the
+    /// `/model/info` are configured independently so a test can make the
     /// optional metadata endpoint fail.
     #[derive(Default)]
     struct MockBackend {
@@ -907,7 +922,7 @@ mod tests {
             provider.backend.gets.borrow().as_slice(),
             [
                 "http://localhost:4000/v1/models",
-                "http://localhost:4000/v1/model/info"
+                "http://localhost:4000/model/info"
             ]
         );
 
@@ -942,6 +957,32 @@ mod tests {
         assert_eq!(sonnet.display_name.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(sonnet.context_window, None);
         assert_eq!(sonnet.supports_thinking, None);
+    }
+
+    #[test]
+    fn model_info_uses_the_bare_path_a_restricted_key_is_allowed() {
+        // Regression: the plugin used to call `/v1/model/info`. The handler
+        // is aliased, but a virtual key whose `allowed_routes` name
+        // `['llm_api_routes', '/model/info']` (LiteLLM's own error message
+        // spells the allowlist out) is denied the `/v1/` alias with a 403 —
+        // which silently dropped every model's cost/context metadata. The
+        // bare `/model/info` path is in the allowlist, so it must be the one
+        // the plugin calls.
+        let mut provider = provider(CATALOG, MODEL_INFO, Vec::new());
+        let models = provider.list_models().unwrap();
+        assert_eq!(
+            provider.backend.gets.borrow().as_slice(),
+            [
+                "http://localhost:4000/v1/models",
+                "http://localhost:4000/model/info"
+            ],
+            "`/model/info` must be requested bare, not under `/v1`"
+        );
+        // And the metadata actually arrives (nothing degraded).
+        assert_eq!(
+            find(&models, "claude-sonnet-4-6").input_price_per_mtok,
+            Some(3.0)
+        );
     }
 
     #[test]
@@ -1281,7 +1322,7 @@ mod tests {
         );
         assert_eq!(
             provider.backend.gets.borrow().as_slice(),
-            ["http://localhost:4000/v1/model/info"],
+            ["http://localhost:4000/model/info"],
             "only `/model/info` is fetched lazily, not the catalog"
         );
     }
@@ -1319,6 +1360,9 @@ mod tests {
 
     #[test]
     fn route_denial_detail_is_unwrapped() {
+        // Real 403 body from a proxy whose virtual key was allowed
+        // `llm_api_routes` + `/model/info` but denied the `/v1/model/info`
+        // alias — the reason `fetch_hints` calls the bare path.
         let body = r#"{"detail":"Virtual key is not allowed to call this route. Only allowed to call routes: ['llm_api_routes', '/model/info']. Tried to call route: /v1/model/info"}"#;
         let mut provider = provider(CATALOG, MODEL_INFO, Vec::new());
         provider.backend.post_error = Some(BackendError::new(Some(403), body));

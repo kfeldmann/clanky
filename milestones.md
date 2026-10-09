@@ -130,7 +130,8 @@ Architectural decisions already made:
   clanky-provider-litellm`): the proxy's OpenAI-compatible `/v1` surface,
   pinned to captures from a live gateway (`tests/fixtures/`). Reads
   `LITELLM_API_KEY` / `LITELLM_BASE_URL` / `LITELLM_MODEL`; metadata
-  (`/model/info`) is optional and degrades to the plain `/v1/models` catalog
+  (`/model/info`, called bare — the `/v1/` alias can be denied a virtual
+  key) is optional and degrades to the plain `/v1/models` catalog
   when a key is denied it; `reasoning_effort` and `tools` are filtered per
   model from that metadata so a heterogeneous proxy does not 400. No built-in
   default model (the catalog is arbitrary), so `LITELLM_MODEL` or an explicit
