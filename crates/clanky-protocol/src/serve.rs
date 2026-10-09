@@ -13,8 +13,10 @@
 //! which runs the handler synchronously — one chat in flight per connection
 //! (spec §6).
 
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::handler::{CancelFlag, ChatDone, ChatRequest, Handler};
@@ -128,6 +130,12 @@ pub fn serve(
 
     let (tx, rx) = mpsc::channel::<Message>();
     let reader_cancel = cancel.clone();
+    // `cancel` may be observed and reset out of order against the dispatch
+    // loop: the reader can flip the flag for a request the dispatch loop has
+    // not started yet, and `reset` (before each chat) would then wipe it.
+    // Remember the cancelled ids so the flag can be restored for that chat.
+    let cancelled_ids = Arc::new(Mutex::new(HashSet::new()));
+    let reader_ids = Arc::clone(&cancelled_ids);
     let reader_thread = thread::Builder::new()
         .name("clanky-plugin-reader".into())
         .spawn(move || {
@@ -139,7 +147,10 @@ pub fn serve(
                 match crate::messages::parse_message(&line) {
                     // Cancel is advisory and out of band: flip the flag
                     // immediately, no queueing.
-                    Ok(Some(Message::Cancel { .. })) => reader_cancel.cancel(),
+                    Ok(Some(Message::Cancel { request_id })) => {
+                        reader_cancel.cancel();
+                        reader_ids.lock().unwrap().insert(request_id);
+                    }
                     Ok(Some(msg)) => {
                         if tx.send(msg).is_err() {
                             break;
@@ -154,7 +165,7 @@ pub fn serve(
             // Dropping `tx` closes the channel, ending the dispatch loop.
         })?;
 
-    let outcome = dispatch_loop(handler, &cancel, &rx, writer);
+    let outcome = dispatch_loop(handler, &cancel, &cancelled_ids, &rx, writer);
     // The reader thread ends when stdin reaches EOF. If we stopped early
     // (fatal error) it may still be blocked reading; detach rather than
     // join so `serve` returns promptly. `Drop` for the process handles it.
@@ -165,6 +176,7 @@ pub fn serve(
 fn dispatch_loop(
     handler: &mut dyn Handler,
     cancel: &CancelFlag,
+    cancelled_ids: &Mutex<HashSet<u64>>,
     rx: &mpsc::Receiver<Message>,
     writer: &mut dyn Write,
 ) -> Result<(), Error> {
@@ -211,6 +223,11 @@ fn dispatch_loop(
                 thinking,
             } => {
                 cancel.reset();
+                // Restore a cancel that raced ahead of this chat's dispatch
+                // (see `cancelled_ids` in `serve`).
+                if cancelled_ids.lock().unwrap().remove(&id) {
+                    cancel.cancel();
+                }
                 let request = ChatRequest {
                     model,
                     messages,
@@ -448,6 +465,7 @@ mod tests {
             &mut out,
         )
         .unwrap();
+        println!("OUT={}", String::from_utf8_lossy(&out));
         let lines: Vec<Message> = String::from_utf8(out)
             .unwrap()
             .lines()
