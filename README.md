@@ -127,6 +127,58 @@ The provider's default model (used when neither settings nor `--model` name
 one) is advertised by the plugin at handshake, so Clanky keeps no hardcoded
 per-provider table.
 
+### Built-in providers
+
+| Provider | Binary | Credentials |
+| --- | --- | --- |
+| DeepInfra | `clanky-provider-deepinfra` | `DEEPINFRA_API_KEY` (or `DEEPINFRA_TOKEN`), optional `DEEPINFRA_URL` |
+| LiteLLM proxy | `clanky-provider-litellm` | `LITELLM_API_KEY`, optional `LITELLM_BASE_URL`, optional `LITELLM_MODEL` |
+
+Both ship from this workspace:
+
+```sh
+cargo install clanky clanky-provider-deepinfra clanky-provider-litellm
+```
+
+### LiteLLM
+
+The LiteLLM plugin talks to a [LiteLLM proxy](https://docs.litellm.ai/)'s
+OpenAI-compatible `/v1` surface, so one key reaches every model the proxy is
+configured to serve.
+
+```sh
+export LITELLM_BASE_URL=https://your-gateway.example.com   # default: http://localhost:4000
+export LITELLM_API_KEY=sk-...                              # required
+export LITELLM_MODEL=claude-sonnet-4-6                     # optional default model
+clanky --provider litellm -p "say hi"
+```
+
+Notes:
+
+- **The model list is whatever your key can see.** `/v1/models` is
+  key-scoped, and the richer metadata (context window, pricing, reasoning and
+  tool support) comes from `/v1/model/info`. That endpoint is *not* one of
+  the LLM API routes, so a virtual key may be denied it (403); the plugin
+  then falls back to the plain catalog and simply omits the hints — a listing
+  never fails because of it.
+- **Thinking maps to `reasoning_effort`.** Clanky's `--thinking <budget>` is
+  translated onto LiteLLM's effort ladder (`none`/`minimal`/`low`/`medium`/
+  `high`/`xhigh`/`max`); `--thinking off` omits the field. Because the proxy
+  is heterogeneous, the plugin drops `reasoning_effort` (and `tools`) for a
+  model whose `/model/info` says it does not support them, instead of
+  provoking a 400.
+- **No built-in default model.** The proxy's catalog is arbitrary, so unless
+  `LITELLM_MODEL` is set you must name a model (`model` in settings or
+  `--model`). Clanky still defaults to the `deepinfra` provider, so a
+  LiteLLM-only setup also sets `provider = "litellm"` in `settings.toml` (or
+  passes `--provider litellm`).
+- **Reasoning is shown as thinking.** The proxy returns reasoning in
+  `delta.reasoning_content`, which the plugin surfaces as Clanky's thinking
+  stream. (If the proxy is configured with
+  `merge_reasoning_content_in_choices: true`, reasoning is instead merged into
+  the visible content and cannot be separated — the plugin does not attempt
+  to split it.)
+
 ### Writing a provider plugin
 
 A plugin is a program that:

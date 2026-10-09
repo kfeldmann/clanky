@@ -126,6 +126,15 @@ Architectural decisions already made:
 - Error messages, logging, docs, packaging (crates.io / release binaries)
 - Example provider plugin in the repo (hello-world, Python) — already added
   in M8 (`examples/hello-world-provider/`), so M10 only needs to link it
+- **LiteLLM provider plugin** (`clanky-provider-litellm`, `crates/
+  clanky-provider-litellm`): the proxy's OpenAI-compatible `/v1` surface,
+  pinned to captures from a live gateway (`tests/fixtures/`). Reads
+  `LITELLM_API_KEY` / `LITELLM_BASE_URL` / `LITELLM_MODEL`; metadata
+  (`/model/info`) is optional and degrades to the plain `/v1/models` catalog
+  when a key is denied it; `reasoning_effort` and `tools` are filtered per
+  model from that metadata so a heterogeneous proxy does not 400. No built-in
+  default model (the catalog is arbitrary), so `LITELLM_MODEL` or an explicit
+  `model`/`--model` is required. Design notes: `litellm-provider-planning.md`.
 - TUI quality-of-life: `↑`/`↓` prompt recall, `/system` (view the assembled
   system prompt); fix: fresh TUI sessions now seed the system context like
   pipe mode

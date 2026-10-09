@@ -1,0 +1,22 @@
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hi","role":"assistant"}}],"provider_specific_fields":{}}
+
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" there! "}}],"provider_specific_fields":{}}
+
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"👋 How"}}],"provider_specific_fields":{}}
+
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" are"}}],"provider_specific_fields":{}}
+
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" you doing?"}}],"provider_specific_fields":{}}
+
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" Is"}}],"provider_specific_fields":{}}
+
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" there something"}}],"provider_specific_fields":{}}
+
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" I can help you with today?"}}],"provider_specific_fields":{}}
+
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"finish_reason":"stop","index":0,"delta":{}}],"provider_specific_fields":{}}
+
+data: {"id":"chatcmpl-199087e0-8c6d-40fa-a68f-3177d1e64973","created":1791502214,"model":"claude-sonnet-4-6","object":"chat.completion.chunk","choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":25,"prompt_tokens":9,"total_tokens":34,"completion_tokens_details":{"reasoning_tokens":0,"text_tokens":25},"prompt_tokens_details":{"cached_tokens":0,"text_tokens":9,"cache_creation_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+
+data: [DONE]
+

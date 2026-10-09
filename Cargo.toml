@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/clanky", "crates/clanky-protocol", "crates/clanky-provider-deepinfra"]
+members = [
+    "crates/clanky",
+    "crates/clanky-protocol",
+    "crates/clanky-provider-deepinfra",
+    "crates/clanky-provider-litellm",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -3,9 +3,10 @@
 # script with `docker/` as the build context (so the files copied from
 # `binaries/` below are the release binaries staged there by build-runner).
 #
-# Both `clanky` and `clanky-provider-deepinfra` land in /usr/local/bin, which
-# is on PATH, so Clanky's PATH-based plugin discovery finds the provider with
-# zero configuration (M8).
+# The release binaries (`clanky`, `clanky-provider-deepinfra`, and
+# `clanky-provider-litellm`) land in /usr/local/bin, which is on PATH, so
+# Clanky's PATH-based plugin discovery finds the providers with zero
+# configuration (M8).
 FROM alpine:3.24
 
 ARG EXTRA_PACKAGES=""

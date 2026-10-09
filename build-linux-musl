@@ -32,4 +32,4 @@ docker run --rm \
   -v "${PWD}:/project" \
   -w /project \
   clanky-build:latest \
-  sh -c 'cargo test && cargo build --release && strip target/release/clanky target/release/clanky-provider-deepinfra'
+  sh -c 'cargo test && cargo build --release && strip target/release/clanky target/release/clanky-provider-deepinfra target/release/clanky-provider-litellm'

@@ -145,6 +145,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "clanky-provider-litellm"
+version = "0.1.0"
+dependencies = [
+ "clanky-protocol",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

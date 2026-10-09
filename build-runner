@@ -27,10 +27,15 @@ if [ ! -x target/release/clanky-provider-deepinfra ]; then
   echo "ERROR: target/release/clanky-provider-deepinfra not found. Run ./build-linux-musl first." >&2
   exit 1
 fi
+if [ ! -x target/release/clanky-provider-litellm ]; then
+  echo "ERROR: target/release/clanky-provider-litellm not found. Run ./build-linux-musl first." >&2
+  exit 1
+fi
 test -d docker/binaries || mkdir docker/binaries
 cp target/release/clanky docker/binaries/clanky
 cp target/release/clanky-provider-deepinfra docker/binaries/clanky-provider-deepinfra
-chmod 755 docker/binaries/clanky docker/binaries/clanky-provider-deepinfra
+cp target/release/clanky-provider-litellm docker/binaries/clanky-provider-litellm
+chmod 755 docker/binaries/clanky docker/binaries/clanky-provider-deepinfra docker/binaries/clanky-provider-litellm
 
 if [ -f ~/.vimrc ]
 then
