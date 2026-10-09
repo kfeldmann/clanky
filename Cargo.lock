@@ -134,6 +134,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "clanky-provider-anthropic"
+version = "0.1.0"
+dependencies = [
+ "clanky-protocol",
+ "dirs",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "clanky-provider-deepinfra"
 version = "0.1.0"
 dependencies = [

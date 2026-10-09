@@ -1,0 +1,61 @@
+{
+  "model": "claude-haiku-4-5",
+  "max_tokens": 256,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude."
+    },
+    {
+      "type": "text",
+      "text": "You are terse."
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "count the files in /tmp using the bash tool"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01BhVetyfKsqmX56rNskCQuh",
+          "name": "bash",
+          "input": {
+            "command": "ls -1 /tmp | wc -l"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01BhVetyfKsqmX56rNskCQuh",
+          "content": "42"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "bash",
+      "description": "Run a shell command and return its output",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The shell command to run"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    }
+  ]
+}

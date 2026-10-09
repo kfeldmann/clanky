@@ -1,0 +1,20 @@
+{
+  "model": "claude-haiku-4-5",
+  "max_tokens": 256,
+  "system": [
+    {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+    {"type": "text", "text": "You are terse."}
+  ],
+  "messages": [{"role": "user", "content": "count the files in /tmp using the bash tool"}],
+  "tools": [
+    {
+      "name": "bash",
+      "description": "Run a shell command and return its output",
+      "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string", "description": "The shell command to run"}},
+        "required": ["command"]
+      }
+    }
+  ]
+}

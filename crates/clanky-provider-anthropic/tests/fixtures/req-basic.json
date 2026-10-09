@@ -1,0 +1,9 @@
+{
+  "model": "claude-haiku-4-5",
+  "max_tokens": 64,
+  "system": [
+    {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+    {"type": "text", "text": "You are terse."}
+  ],
+  "messages": [{"role": "user", "content": "say hi"}]
+}

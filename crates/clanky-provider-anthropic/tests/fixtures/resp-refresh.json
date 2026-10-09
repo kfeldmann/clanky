@@ -1,0 +1,8 @@
+{
+  "token_type": "Bearer",
+  "access_token": "sk-ant-oat01-j...9mNQAA",
+  "expires_in": 28800,
+  "refresh_token": "sk-ant-ort01-b...NRywAA",
+  "scope": "user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code",
+  "refresh_token_expires_in": 1782413
+}

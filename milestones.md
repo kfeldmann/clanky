@@ -157,6 +157,76 @@ Architectural decisions already made:
   text and was removed.)
 - Done when: a stranger can `cargo install` and use it.
 
+## ☐ M11 — Anthropic provider plugin (OAuth)
+New provider plugin `crates/clanky-provider-anthropic` (Anthropic Messages
+API), driven exclusively by OAuth — our enterprise tenant has no API keys.
+Split into a/b/c, each shippable and testable on its own. Design notes,
+confirmed flow parameters, and the spike checklist:
+`anthropic-provider-planning.md`. The OAuth client is not a published
+Anthropic surface, but the flow is already proven on our tenant: the Pi
+coding agent (github.com/earendil-works/pi, MIT) performs it against this
+account, so its source is our reference implementation — see the
+planning file for the extracted constants (client_id, endpoints, beta
+headers, identity system block, tool-name mapping).
+
+Architectural constraint: the plugin's stdin/stdout *are* the protocol
+channel, so the no-browser flow cannot prompt the user mid-session. It lives
+in an offline `login` subcommand on the plugin binary (PKCE, print authorize
+URL, read pasted code from stdin, token exchange, store credentials). Same
+shape as `ant auth login --no-browser`; needs no protocol change (protocol
+§1 already assigns auth material to the plugin, never to core).
+
+Ordering note: OAuth is scheduled **before** streaming on purpose — it is
+independent of the wire adapter (the login subcommand and credential store
+don't care how the chat path streams; only the bearer-vs-`x-api-key` header
+mode couples them) — so M11b's streaming work is live-testable against the
+real tenant.
+
+### ☐ M11a — Confirm-and-capture spike, then OAuth + minimal non-streaming chat
+- **Spike first, before any workspace code:** one live capture of the full
+  dance — PKCE authorize URL → pasted code → token exchange → one
+  non-streaming `/v1/messages` call with `Authorization: Bearer`. Downgraded
+  from go/no-go to confirm-and-capture: the flow is already proven on this
+  tenant by the Pi coding agent, whose source is the reference (see
+  `anthropic-provider-planning.md` for the extracted parameters). The spike
+  still gates — it confirms the constants hold for us and records what Pi
+  cannot: org/workspace scoping enforcement, token + refresh-token
+  lifetimes, the exact beta header string, and whether our own tool names
+  pass through or need Claude Code case-normalization. Capture fixtures
+  seed the later test suites. Fallbacks (only if something breaks): reuse an
+  `ant` CLI profile's stored credentials (`~/.config/anthropic`), or get the
+  supported client path confirmed with Anthropic.
+- `login` subcommand (PKCE S256, paste flow) + credential store
+  (`access_token` / `refresh_token` / `expires_at`) under
+  `~/.clanky/providers/anthropic/`
+- Automatic refresh before expiry; on failure a clear `auth` error: "login
+  expired — run `clanky-provider-anthropic login`" (refresh-token lifetime is
+  finite; this will be the most common failure mode, keep it actionable)
+- Serving process: handshake + non-streaming chat over the bearer path;
+  basic `tool_use`/`tool_result` mapping included (non-streaming works for
+  tools) so M11b is a delta-mapping problem only, not a structure problem
+  discovered mid-stream
+- Done when: `clanky -p "say hi" --provider anthropic` works on the
+  enterprise account, headless (SSH/container), with no key.
+
+### ☐ M11b — Streaming + agentic fidelity
+- SSE → protocol chunks: `content_block_delta` text/thinking deltas →
+  `kind: "text"` / `kind: "thinking"`; `input_json_delta` →
+  `toolCallArgs`; finish-reason and usage mapping
+- Pinned live-capture fixtures (the LiteLLM M10 pattern); golden transcripts
+- Live-testable against the real tenant: bash tool loop end to end
+- Done when: `clanky -p "count files in /tmp" --provider anthropic` runs
+  bash and answers, streamed.
+
+### ☐ M11c — API-key fallback + polish
+- `x-api-key` request mode beside bearer (the two auth modes differ only in
+  headers) — covers any tenant/user that *does* have a key
+- Actionable-error polish, README section,
+  `provider-protocol.md` note recommending the login-subcommand pattern for
+  OAuth-based plugins
+- Done when: an `ANTHROPIC_API_KEY` user gets identical behavior through the
+  same adapter.
+
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming
    granularity, cancellation semantics, how `list-models` interacts with

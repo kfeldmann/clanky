@@ -5,6 +5,7 @@ members = [
     "crates/clanky-protocol",
     "crates/clanky-provider-deepinfra",
     "crates/clanky-provider-litellm",
+    "crates/clanky-provider-anthropic",
 ]
 
 [workspace.package]
