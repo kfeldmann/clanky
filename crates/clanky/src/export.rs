@@ -10,10 +10,11 @@
 //!
 //! Record types are opt-in through [`ExportOptions`]: by default only the
 //! user and visible assistant text is written, and `--thinking`/`--tools`
-//! add the rest (or `--all`, which is both). Assistant text keeps its own
-//! Markdown (it is the model's answer); thinking and tool output — raw,
-//! machine-produced text — are wrapped in fenced code blocks, so nothing
-//! in them can break the document structure.
+//! add the rest (or `--all`, which is both). Authored text — user prompts
+//! and assistant answers — is written verbatim: it is Markdown and must
+//! keep rendering as itself, code blocks included. Thinking and tool
+//! output — raw, machine-produced text — are wrapped in fenced code
+//! blocks, so nothing in them can leak into the surrounding document.
 
 use clanky_protocol::Usage;
 
@@ -84,14 +85,14 @@ pub fn render(
         match record {
             Record::User { text } => {
                 out.push_str("## User\n\n");
-                out.push_str(&text_block(text));
+                out.push_str(&verbatim(text));
                 out.push('\n');
                 wrote_anything = true;
             }
             Record::Assistant { text, calls } => {
                 if !text.trim().is_empty() {
                     out.push_str("## Assistant\n\n");
-                    out.push_str(&text_block(text));
+                    out.push_str(&verbatim(text));
                     out.push('\n');
                     wrote_anything = true;
                 }
@@ -124,7 +125,7 @@ pub fn render(
             }
             Record::Error { message } => {
                 out.push_str("## Error\n\n");
-                out.push_str(&text_block(message));
+                out.push_str(&fence(message, ""));
                 out.push('\n');
                 wrote_anything = true;
             }
@@ -193,15 +194,12 @@ fn format_options(options: ExportOptions) -> String {
     parts.join(", ")
 }
 
-/// A text body: emitted as-is so assistant Markdown keeps rendering, but
-/// fenced when the text itself carries a fence (which would otherwise let
-/// it escape the document structure).
-fn text_block(text: &str) -> String {
-    if text.contains("```") {
-        fence(text, "")
-    } else {
-        format!("{}\n", text.trim_end())
-    }
+/// An authored text body: written as-is. User prompts and assistant
+/// answers are Markdown — code blocks, headings, lists included — and a
+/// fenced block inside them is balanced by its own closing fence, so it
+/// needs no wrapping to render in place.
+fn verbatim(text: &str) -> String {
+    format!("{}\n", text.trim_end())
 }
 
 /// Wrap `text` in a code fence, lengthening the fence when the content
@@ -366,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn a_body_carrying_a_fence_is_fenced_itself() {
+    fn a_body_carrying_a_fence_is_kept_verbatim() {
         let records = vec![Record::Assistant {
             text: "here:\n```sh\nls\n```".into(),
             calls: vec![],
@@ -377,7 +375,29 @@ mod tests {
             &records,
             ExportOptions::default(),
         );
-        assert!(doc.contains("````\nhere:\n```sh\nls\n```\n````"), "{doc}");
+        assert!(doc.contains("```sh\nls\n```"), "{doc}");
+        assert!(!doc.contains("````"), "{doc}");
+    }
+
+    #[test]
+    fn user_text_with_a_code_block_is_verbatim_too() {
+        let records = vec![
+            Record::User {
+                text: "why does this fail?\n```sh\nls\n```".into(),
+            },
+            Record::Assistant {
+                text: "because ls lists files.".into(),
+                calls: vec![],
+            },
+        ];
+        let doc = render(
+            Some("session-a"),
+            &header(),
+            &records,
+            ExportOptions::default(),
+        );
+        assert!(doc.contains("```sh\nls\n```"), "{doc}");
+        assert!(!doc.contains("````"), "{doc}");
     }
 
     #[test]

@@ -252,7 +252,13 @@ add the rest, and combine freely:
 A filename may be given on the command line; without one, a modal asks
 for it (`Esc` cancels, `Enter` confirms). Relative paths resolve against
 the working directory, parent directories are created as needed, and an
-existing file is overwritten. For example:
+existing file is overwritten.
+
+Authored text — user prompts and assistant answers — is exported
+verbatim, so its Markdown (code blocks, headings, lists) renders exactly
+as it did in the conversation. Thinking and tool output is raw
+machine-produced text and is wrapped in fenced code blocks instead. For
+example:
 
 ```text
 /md session.md

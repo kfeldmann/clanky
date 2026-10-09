@@ -710,9 +710,18 @@ impl App {
                     src.push(Line::from(Span::styled("❯ ", prompt)));
                 }
                 lines.extend(markdown::wrap(&src, width));
+                lines.push(Line::default());
             }
+            // Assistant text: internal blank lines (paragraph breaks) are
+            // kept, but trailing newlines in the raw text would stack with
+            // the separator blank line below, so trim them first: the
+            // entry always ends with exactly one blank line.
             Entry::Assistant(text) => {
-                lines.extend(markdown::wrap(&markdown::render(text, Style::new()), width));
+                let trimmed = text.trim_end_matches(['\n', '\r']);
+                lines.extend(markdown::wrap(
+                    &markdown::render(trimmed, Style::new()),
+                    width,
+                ));
                 lines.push(Line::default());
             }
             Entry::Thinking(text) => {
@@ -763,6 +772,7 @@ impl App {
                     )));
                 }
                 lines.extend(markdown::wrap(&src, width));
+                lines.push(Line::default());
             }
             Entry::ToolResult { name, output } => {
                 let failed = crate::tools::is_failed_result(output);
@@ -799,6 +809,7 @@ impl App {
                     )));
                 }
                 lines.extend(markdown::wrap(&src, width));
+                lines.push(Line::default());
             }
             // Error/info text may contain newlines; route it through
             // `wrap_text` so they split into separate rows (see the
@@ -809,6 +820,7 @@ impl App {
                     Style::new().fg(Color::Red),
                     width,
                 ));
+                lines.push(Line::default());
             }
             Entry::Info(message) => {
                 lines.extend(markdown::wrap_text(
@@ -816,6 +828,7 @@ impl App {
                     Style::new().fg(Color::DarkGray),
                     width,
                 ));
+                lines.push(Line::default());
             }
             // Show the part exactly as it is sent to the model: the
             // content already carries its own provenance heading.
@@ -871,6 +884,53 @@ mod tests {
             delta: "llo".into(),
         });
         assert_eq!(app.entries, vec![Entry::Assistant("hello".into())]);
+    }
+
+    /// Every entry ends with exactly one blank separator line; trailing
+    /// newlines in the assistant text itself are trimmed first, so they
+    /// never stack with the separator into 2-3 blank rows.
+    #[test]
+    fn each_entry_ends_with_one_blank_line() {
+        let mut app = App::new();
+        app.push_user("hi");
+        app.on_turn_event(TurnEvent::Text {
+            delta: "answer\n\n\n".into(),
+        });
+        app.on_turn_event(TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: "{}".into(),
+        });
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "out".into(),
+        });
+        app.entries.push(Entry::Error("boom".into()));
+        app.entries.push(Entry::Info("note".into()));
+        app.entries.push(Entry::SystemPart {
+            content: "part".into(),
+        });
+
+        for (index, label) in [
+            (0, "user"),
+            (1, "assistant"),
+            (2, "tool call"),
+            (3, "tool result"),
+            (4, "error"),
+            (5, "info"),
+            (6, "system part"),
+        ] {
+            let lines = app.entry_lines(index, 80);
+            let last = lines.last().unwrap_or_else(|| panic!("{label}: no lines"));
+            assert!(
+                last.spans.is_empty() && last.style == Style::new(),
+                "{label}: last line is not blank: {last:?}"
+            );
+        }
+
+        // The assistant entry specifically: no blank rows between the
+        // last content row and the separator (trailing newlines trimmed).
+        let lines = app.entry_lines(1, 80);
+        assert_eq!(lines.len(), 2, "content row + one blank: {lines:?}");
     }
 
     #[test]

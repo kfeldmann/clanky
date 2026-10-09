@@ -131,19 +131,22 @@ fn print_event(event: TurnEvent) {
                 delay.as_secs_f64()
             );
         }
+        // Activity entries end with a blank line so consecutive tool
+        // rounds and the following answer text breathe, matching the
+        // TUI transcript's one-blank-line-per-entry spacing.
         TurnEvent::ToolCall { name, arguments } => {
             let preview = clanky::tools::truncate_call_arguments(
                 &arguments,
                 clanky::tools::CALL_PREVIEW_CHARS,
             );
-            eprintln!("\n● {name} {preview}");
+            eprintln!("● {name} {preview}\n");
         }
         TurnEvent::ToolResult { name, output } => {
             let preview = clanky::tools::truncate_for_display(&output, 4_000);
             if clanky::tools::is_failed_result(&output) {
-                eprintln!("  ✗ {name}: {preview}");
+                eprintln!("  ✗ {name}: {preview}\n");
             } else {
-                eprintln!("  └─ {name}: {preview}");
+                eprintln!("  └─ {name}: {preview}\n");
             }
         }
     }

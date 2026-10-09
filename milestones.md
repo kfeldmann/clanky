@@ -147,6 +147,13 @@ Architectural decisions already made:
   to the normal buffer (no alternate screen, no mouse capture), so native
   scrolling and selection work and history persists after quitting; replaced
   the ratatui viewport, mouse drag selection, and OSC 52 copy entirely
+  As built: `/md` exports authored text (user prompts, assistant answers)
+  verbatim — it is Markdown, and a fenced code block inside it is balanced
+  by its own closing fence, so no wrapping is needed. Only machine output
+  (thinking, tool results/args, errors) is fenced. (Earlier builds wrapped
+  any assistant message containing triple backticks in a longer fence;
+  that degraded the common case — an answer with a code block — to literal
+  text and was removed.)
 - Done when: a stranger can `cargo install` and use it.
 
 ## Open Questions
