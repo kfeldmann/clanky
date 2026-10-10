@@ -8,10 +8,6 @@
 //!   results are sent as a `user` message of `tool_result` blocks.
 //! - `thinking` budget → `thinking: {type: "enabled", budget_tokens}`;
 //!   `temperature` is dropped whenever thinking is on (spike-confirmed 400).
-//! - `max_tokens` defaults to a model-agnostic cap (the backend clamps to
-//!   the model's own limit and says so in `usage.output_tokens.64k…` — the
-//!   spike-confirmed 400 message names the model's maximum, so clients can
-//!   react; we just default smaller).
 
 use clanky_protocol::{ChatMessage, FinishReason, Sampling, Thinking, Tool, Usage};
 use serde_json::{Value, json};
@@ -21,9 +17,8 @@ use serde_json::{Value, json};
 /// Claude Code — visible in the captured fixtures).
 pub const IDENTITY_SYSTEM_TEXT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// `max_tokens` used when the request carries none. Generous but well under
-/// the smallest model cap in the live catalog (64 000).
-pub const DEFAULT_MAX_TOKENS: u32 = 8_192;
+/// `max_tokens` used when the request carries none.
+pub const DEFAULT_MAX_TOKENS: u32 = 64_000;
 
 /// Serialize protocol chat messages into an Anthropic `/v1/messages` body.
 ///
@@ -92,9 +87,15 @@ pub fn build_request_body(
         }
     }
 
+    // Use the user-provided max_tokens as-is; fall back to the default if
+    // none was supplied.
+    let max_tokens = sampling
+        .and_then(|s| s.max_tokens)
+        .unwrap_or(DEFAULT_MAX_TOKENS);
+
     let mut body = json!({
         "model": model,
-        "max_tokens": sampling.and_then(|s| s.max_tokens).unwrap_or(DEFAULT_MAX_TOKENS),
+        "max_tokens": max_tokens,
         "messages": conversation,
         "system": system_blocks,
     });
@@ -102,13 +103,16 @@ pub fn build_request_body(
     if let Some(tools) = tools.filter(|t| !t.is_empty()) {
         body["tools"] = Value::Array(tools.iter().map(anthropic_tool).collect());
     }
-    if let Some(t) = thinking.filter(|t| t.budget_tokens.is_some_and(|n| n > 0)) {
-        body["thinking"] = json!({
-            "type": "enabled",
-            "budget_tokens": t.budget_tokens.expect("checked"),
-        });
-        // Spike-confirmed: temperature may only be 1 when thinking is on.
-        // Drop the parameter entirely instead of clamping.
+    if let Some(thinking) = thinking {
+        // Only send thinking if a positive budget was provided.
+        if let Some(budget) = thinking.budget_tokens.filter(|&n| n > 0) {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+            // Spike-confirmed: temperature may only be 1 when thinking is on.
+            // Drop the parameter entirely instead of clamping.
+        }
     } else if let Some(temperature) = sampling.and_then(|s| s.temperature) {
         body["temperature"] = json!(temperature);
     }
@@ -297,7 +301,7 @@ mod tests {
         assert_eq!(body["model"], fixture["model"]);
         assert_eq!(body["system"], fixture["system"]);
         assert_eq!(body["messages"], fixture["messages"]);
-        assert_eq!(body["max_tokens"], 8192, "default max_tokens");
+        assert_eq!(body["max_tokens"], 64_000, "default max_tokens");
         assert!(body.get("tools").is_none());
         assert!(body.get("temperature").is_none());
     }
