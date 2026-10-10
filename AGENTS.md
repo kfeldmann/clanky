@@ -32,7 +32,7 @@ implementation. Check them before redesigning something.
 
 ## Project invariants
 
-- **User-provided values are authoritative.** Never silently rewrite, clamp,
+- **User-provided values are authoritative.** NEVER silently rewrite, clamp,
   coerce, or drop a value the user supplied (settings file, CLI flag, or other
   option). Pass provided values through exactly as given, and compute defaults
   only for values the user did not provide.
