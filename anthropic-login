@@ -29,5 +29,5 @@ docker run \
   ${INTERACTIVE_FLAGS} --rm \
   -v "$HOME/.clanky:/home/clanky/.clanky" \
   -w /work \
-  --entrypoint ["/usr/local/bin/clanky-provider-anthropic", "login"]
-  clanky-runner:latest
+  --entrypoint /usr/local/bin/clanky-provider-anthropic \
+  clanky-runner:latest login
