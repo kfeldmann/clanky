@@ -332,6 +332,8 @@ real tenant.
        model session-name $x.xxxx ctx xx%
        model think xxxx session-name $x.xxxx ctx xx%
        provider model think xxxx session-name $x.xxxx ctx xx%  <-- current status line
+4. Muli-line input (produced via $EDITOR) is displayed in the input field with each line starting directly below the end of the previous (stair-step)
+5. In `--help`, it says "piped stdin is picked up in M1". Update that message now that piped stdin is a stable feature.
 
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming
