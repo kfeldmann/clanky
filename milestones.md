@@ -145,14 +145,13 @@ Architectural decisions already made:
 - DONE - **LiteLLM provider plugin** (`clanky-provider-litellm`, `crates/
   clanky-provider-litellm`): the proxy's OpenAI-compatible `/v1` surface,
   pinned to captures from a live gateway (`tests/fixtures/`). Reads
-  `LITELLM_API_KEY` / `LITELLM_BASE_URL` / `LITELLM_MODEL`; metadata
+  `LITELLM_API_KEY` / `LITELLM_BASE_URL`; metadata
   (`/model/info`, called bare — the `/v1/` alias can be denied a virtual
   key) is optional and degrades to the plain `/v1/models` catalog
   when a key is denied it; the metadata curates the model list (the picker
   hides tool-less models via the `supportsTools` hint) while `tools` and
-  `reasoning_effort` pass through to the proxy unconditionally. No built-in
-  default model (the catalog is arbitrary), so `LITELLM_MODEL` or an explicit
-  `model`/`--model` is required. Design notes: `litellm-provider-planning.md`.
+  `reasoning_effort` pass through to the proxy unconditionally. The built-in default model is
+  `claude-haiku-4-5` (overridable with `model`/`--model`). Design notes: `litellm-provider-planning.md`.
   As built (revised after review): an earlier build filtered `reasoning_effort`
   and `tools` out of the request per model ("so a heterogeneous proxy does
   not 400"), which silently ignored user intent and pre-empted the proxy's

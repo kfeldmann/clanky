@@ -358,8 +358,8 @@ fn retry_delay(attempt: u32, hint: Option<Duration>) -> Duration {
     // ×1.25 per step as integer ×5/4 on whole nanoseconds, truncating
     // at each step; stopping early at the cap keeps any attempt count
     // overflow-free.
-    let cap = u128::from(MAX_RETRY_DELAY.as_nanos());
-    let mut nanos = u128::from(BASE_RETRY_DELAY.as_nanos());
+    let cap = MAX_RETRY_DELAY.as_nanos();
+    let mut nanos = BASE_RETRY_DELAY.as_nanos();
     for _ in 1..attempt {
         if nanos >= cap {
             break;

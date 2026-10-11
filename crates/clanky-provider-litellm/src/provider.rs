@@ -43,10 +43,9 @@ pub const DEFAULT_BASE_URL: &str = "http://localhost:4000";
 pub const ENV_API_KEY: &str = "LITELLM_API_KEY";
 /// Optional base URL override.
 pub const ENV_BASE_URL: &str = "LITELLM_BASE_URL";
-/// Optional default model advertised at handshake. The proxy's catalog is
-/// arbitrary, so there is no built-in default; when this is unset the plugin
-/// advertises none and Clanky requires an explicit `model`/`--model`.
-pub const ENV_DEFAULT_MODEL: &str = "LITELLM_MODEL";
+/// The built-in default model advertised at handshake, used when neither
+/// settings nor `--model` names one.
+pub const DEFAULT_MODEL: &str = "claude-haiku-4-5";
 
 /// Dollars-per-token → dollars-per-million-tokens.
 const PER_MTOK: f64 = 1_000_000.0;
@@ -57,7 +56,7 @@ const PER_MTOK: f64 = 1_000_000.0;
 pub struct LiteLlmProvider<B: Backend> {
     backend: B,
     base_url: String,
-    /// Advertised default model (from `LITELLM_MODEL`), if any.
+    /// Advertised default model ([`DEFAULT_MODEL`]).
     default_model: Option<String>,
     /// Set by the plugin runtime (spec §7); checked between SSE events so a
     /// cancel stops generation at the next event boundary. A cancel during a
@@ -77,22 +76,11 @@ impl LiteLlmProvider<crate::backend::UreqBackend> {
             .ok()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_BASE_URL.into());
-        Ok(
-            Self::new(crate::backend::UreqBackend::new(api_key), base_url)
-                .with_default_model(default_model_from_env()),
-        )
+        Ok(Self::new(
+            crate::backend::UreqBackend::new(api_key),
+            base_url,
+        ))
     }
-}
-
-/// The default model named by `LITELLM_MODEL`, if any. Read separately from
-/// [`LiteLlmProvider::from_env`] so the plugin can still advertise it on the
-/// handshake when the key is missing (the auth failure then surfaces on the
-/// first request instead of a "no model" error).
-pub fn default_model_from_env() -> Option<String> {
-    std::env::var(ENV_DEFAULT_MODEL)
-        .ok()
-        .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
 }
 
 fn missing_key_error() -> Error {
@@ -109,15 +97,9 @@ impl<B: Backend> LiteLlmProvider<B> {
         Self {
             backend,
             base_url: base_url.into(),
-            default_model: None,
+            default_model: Some(DEFAULT_MODEL.into()),
             cancel: CancelFlag::default(),
         }
-    }
-
-    /// Advertise `model` as the handshake default (from `LITELLM_MODEL`).
-    pub fn with_default_model(mut self, model: Option<String>) -> Self {
-        self.default_model = model;
-        self
     }
 
     /// Join a path onto the base URL. A base that already ends in `/v1`
@@ -879,18 +861,7 @@ mod tests {
         assert!(info.capabilities.list_models);
         assert!(info.capabilities.thinking);
         assert!(info.capabilities.tools);
-        // The proxy's catalog is arbitrary: no built-in default.
-        assert_eq!(info.default_model, None);
-    }
-
-    #[test]
-    fn handshake_advertises_an_optional_default_model() {
-        let provider = provider(CATALOG, MODEL_INFO, Vec::new())
-            .with_default_model(Some("claude-sonnet-4-6".into()));
-        assert_eq!(
-            provider.info().default_model.as_deref(),
-            Some("claude-sonnet-4-6")
-        );
+        assert_eq!(info.default_model.as_deref(), Some("claude-haiku-4-5"));
     }
 
     // --- catalog + metadata ----------------------------------------------

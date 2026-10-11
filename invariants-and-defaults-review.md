@@ -44,7 +44,7 @@
 |---|---|---|---|
 | Provider | `deepinfra` | `clanky/src/provider.rs:28` | `provider` / `--provider` |
 | DeepInfra model | `zai-org/GLM-5.3-Flash` | `clanky-provider-deepinfra/src/provider.rs:15` | `model` / `--model` |
-| LiteLLM model | **none** — requires `LITELLM_MODEL` or `--model` (loud `NoModel` error) | `clanky-provider-litellm/src/provider.rs:49` | yes |
+| LiteLLM model | `claude-haiku-4-5` | `clanky-provider-litellm/src/provider.rs:49` | yes |
 | Anthropic model | **none** (same) | `clanky-provider-anthropic` | yes |
 | Max tool rounds per turn | `0` = **unlimited** (deliberate: user judges runaway turns) | `clanky/src/turn.rs:28` | `max_tool_rounds` / `--max-tool-rounds` |
 | Max retries | `5` (`0` = never) | `clanky/src/turn.rs:36` | `max_retries` / `--max-retries` |

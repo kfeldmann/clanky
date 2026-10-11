@@ -8,16 +8,15 @@
 //! Auth: the provider reads its own credentials from the environment —
 //! `LITELLM_API_KEY`. Clanky core never touches provider keys. The base URL
 //! comes from `LITELLM_BASE_URL` and defaults to `http://localhost:4000`.
-//! `LITELLM_MODEL` optionally names the default model advertised at
-//! handshake; the proxy's catalog is arbitrary, so there is no built-in one.
+//! The built-in default model advertised at handshake is
+//! `claude-haiku-4-5`.
 
 mod backend;
 mod provider;
 
 pub use backend::{Backend, BackendError, UreqBackend};
 pub use provider::{
-    DEFAULT_BASE_URL, ENV_API_KEY, ENV_BASE_URL, ENV_DEFAULT_MODEL, LiteLlmProvider, PROVIDER_NAME,
-    default_model_from_env,
+    DEFAULT_BASE_URL, DEFAULT_MODEL, ENV_API_KEY, ENV_BASE_URL, LiteLlmProvider, PROVIDER_NAME,
 };
 
 /// The concrete provider used by Clanky: LiteLLM over a blocking HTTP

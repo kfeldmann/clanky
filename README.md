@@ -161,7 +161,7 @@ per-provider table.
 | Provider | Binary | Credentials |
 | --- | --- | --- |
 | DeepInfra | `clanky-provider-deepinfra` | `DEEPINFRA_API_KEY` (or `DEEPINFRA_TOKEN`), optional `DEEPINFRA_URL` |
-| LiteLLM proxy | `clanky-provider-litellm` | `LITELLM_API_KEY`, optional `LITELLM_BASE_URL`, optional `LITELLM_MODEL` |
+| LiteLLM proxy | `clanky-provider-litellm` | `LITELLM_API_KEY`, optional `LITELLM_BASE_URL` |
 
 Both ship from this workspace:
 
@@ -178,7 +178,6 @@ configured to serve.
 ```sh
 export LITELLM_BASE_URL=https://your-gateway.example.com   # default: http://localhost:4000
 export LITELLM_API_KEY=sk-...                              # required
-export LITELLM_MODEL=claude-sonnet-4-6                     # optional default model
 clanky --provider litellm -p "say hi"
 ```
 
@@ -202,11 +201,10 @@ Notes:
   instead: the `/model` picker hides models whose `/model/info` says they
   cannot call tools (a deal breaker for the agentic loop), though `--model`
   can still name one and gets the server's answer.
-- **No built-in default model.** The proxy's catalog is arbitrary, so unless
-  `LITELLM_MODEL` is set you must name a model (`model` in settings or
-  `--model`). Clanky still defaults to the `deepinfra` provider, so a
-  LiteLLM-only setup also sets `provider = "litellm"` in `settings.toml` (or
-  passes `--provider litellm`).
+- **Built-in default model.** The default model is `claude-haiku-4-5`,
+  overridable with `model` in settings or `--model`. Clanky still defaults to
+  the `deepinfra` provider, so a LiteLLM-only setup also sets
+  `provider = "litellm"` in `settings.toml` (or passes `--provider litellm`).
 - **Reasoning is shown as thinking.** The proxy returns reasoning in
   `delta.reasoning_content`, which the plugin surfaces as Clanky's thinking
   stream. (If the proxy is configured with

@@ -7,8 +7,8 @@
 //!
 //! Auth stays here, never in core: the API key is read from
 //! `LITELLM_API_KEY`, the base URL from `LITELLM_BASE_URL` (default
-//! `http://localhost:4000`), and an optional default model from
-//! `LITELLM_MODEL`. When no key is set, the plugin still starts and
+//! `http://localhost:4000`); the built-in default model is
+//! `claude-haiku-4-5`. When no key is set, the plugin still starts and
 //! handshakes, so the failure surfaces as a normal `auth` error on the first
 //! turn ("no API key: set LITELLM_API_KEY") instead of a dead process.
 
@@ -19,7 +19,7 @@ use clanky_protocol::{
     PluginInfo, serve_stdio,
 };
 
-use clanky_provider_litellm::{LiteLlm, PROVIDER_NAME, default_model_from_env};
+use clanky_provider_litellm::{DEFAULT_MODEL, LiteLlm, PROVIDER_NAME};
 
 /// A provider that could not be built (usually a missing API key): it
 /// handshakes like LiteLLM and reports the stored error for every request.
@@ -85,7 +85,7 @@ fn main() -> ExitCode {
         Ok(provider) => Box::new(provider),
         Err(error) => Box::new(Unavailable {
             error,
-            default_model: default_model_from_env(),
+            default_model: Some(DEFAULT_MODEL.into()),
         }),
     };
     match serve_stdio(&mut *handler) {

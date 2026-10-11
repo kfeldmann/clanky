@@ -76,7 +76,7 @@ The `litellm.ts` reference covers the metadata mapping well; the two things it h
 ## 3. Design decisions I need from you
 
 1. **Rust crate vs. Python plugin.** My recommendation: a Rust crate `crates/clanky-provider-litellm` mirroring `clanky-provider-deepinfra`. `clanky_protocol::serve` already implements every wire rule (handshake, cancel out-of-band, one-chat-in-flight, stderr isolation, EOF exit), so the binary is ~30 lines of glue plus an adapter — and the DeepInfra SSE/tool-call code is directly reusable. Python would work but would re-implement framing that's already solved and tested here.
-2. **Provider name / default model.** `name: "litellm"`; I'd advertise **no** `defaultModel` (the proxy's catalog is arbitrary), unless you'd rather have the plugin read an optional `LITELLM_MODEL` env var. Note core still defaults to `deepinfra`, so selecting litellm means `--provider litellm` or `provider = "litellm"` in settings.
+2. **Provider name / default model.** `name: "litellm"`; the plugin advertises the built-in default model `claude-haiku-4-5`. Note core still defaults to `deepinfra`, so selecting litellm means `--provider litellm` or `provider = "litellm"` in settings.
 3. **Thinking mapping.** clanky's `thinking.budgetTokens` is a token budget; LiteLLM wants `reasoning_effort` (a ladder) or Anthropic-style `thinking: {type: enabled, budget_tokens}`. Options: (a) map budget → `reasoning_effort` ladder (works for every reasoning model, lossy), (b) pass `thinking` through verbatim (exact budgets, Anthropic-backed models only), or (c) map to `reasoning_effort` and fall back to `thinking` on a 400. I lean (a) with the full LiteLLM ladder, plus (c)'s fallback only if your captures show it's needed.
 4. **`/model/info` failure policy.** Should the plugin degrade gracefully (catalog from `/v1/models` alone, metadata omitted) when `/model/info` is forbidden for the key, or fail loudly? I'd degrade gracefully.
 5. **Do you want a repo-level doc** (`docs/` or a README section) for the LiteLLM plugin, or just the crate?
@@ -84,7 +84,7 @@ The `litellm.ts` reference covers the metadata mapping well; the two things it h
 ## 4. Mapping sketch (for you to sanity-check)
 
 - **Endpoints:** `GET {base}/v1/models`, `GET {base}/v1/model/info`, `POST {base}/v1/chat/completions` with `stream: true` + `stream_options.include_usage: true`.
-- **Env:** `LITELLM_BASE_URL`, `LITELLM_API_KEY` (inherited, read by the plugin only — core never sees it), optional `LITELLM_MODEL`. Base URL normalized so both `http://host:4000` and `http://host:4000/v1` work.
+- **Env:** `LITELLM_BASE_URL`, `LITELLM_API_KEY` (inherited, read by the plugin only — core never sees it). Base URL normalized so both `http://host:4000` and `http://host:4000/v1` work.
 - **ModelInfo:** `id` = `model_name`; dedupe by `model_name` (load-balanced groups repeat it — the reference's `if (name in map) continue` is right); `displayName` = `model_info.display_name`; `contextWindow` = `max_input_tokens ?? max_tokens`; `supportsThinking` = `supports_reasoning`; `supportsTools` = `supports_function_calling`; `supportsTextGeneration` = `mode == "chat"`; prices × 1e6 (`input_cost_per_token`, `output_cost_per_token`, `cache_read_input_token_cost`).
 - **Errors:** 401/403 → `auth`; 429 → `rateLimit` retryable (+ `retry-after` header); 400/404/422 → `invalidRequest`; 5xx/timeout → `backend` retryable.
 - **finish_reason:** `stop|length|tool_calls|function_call|content_filter`; unknown → `stop`.
@@ -117,9 +117,8 @@ decisions above were resolved as follows:
 1. **Rust crate**, not a Python plugin — it reuses the protocol crate's
    `serve_stdio`, the blocking-`ureq` + SSE backend, and the DeepInfra
    adapter's delta/tool-call assembly almost verbatim.
-2. **Name `litellm`; no built-in default model.** An optional `LITELLM_MODEL`
-   is advertised at handshake when set; otherwise Clanky requires an explicit
-   `model`/`--model`.
+2. **Name `litellm`; built-in default model `claude-haiku-4-5`**, advertised at
+   handshake.
 3. **Thinking → `reasoning_effort`**, mapped onto the full LiteLLM ladder
    (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), with `off`
    omitting the field. No `thinking` passthrough or 400-fallback: the captures
