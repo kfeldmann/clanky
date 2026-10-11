@@ -14,7 +14,7 @@ use clanky::session::{self, Record, SessionWriter};
 use clanky::turn::{TurnConfig, TurnEvent, run_turn};
 use clanky_protocol::{
     Capabilities, ChatDone, ChatMessage, ChatRequest, ChunkPayload, Error as ProtocolError,
-    FinishReason, Handler, PluginInfo, Usage,
+    ErrorCode, FinishReason, Handler, PluginInfo, Usage,
 };
 use serde_json::{Value, json};
 
@@ -406,6 +406,131 @@ fn markdown_export_covers_the_session_and_honors_its_flags() {
     assert_eq!(history.len(), 4, "user, assistant+call, tool, assistant");
     assert_eq!(history[0].content(), "count files");
     assert_eq!(history[3].content(), "42 files.");
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Streams half a reply (thinking and text) and dies mid-round: the
+/// `provider error: backend: timed out reading response` failure mode.
+struct HalfStream;
+
+impl Handler for HalfStream {
+    fn info(&self) -> PluginInfo {
+        PluginInfo {
+            name: "half".into(),
+            capabilities: Capabilities {
+                list_models: false,
+                thinking: true,
+                tools: true,
+            },
+            default_model: None,
+        }
+    }
+
+    fn list_models(&mut self) -> Result<Vec<clanky_protocol::ModelInfo>, ProtocolError> {
+        Ok(Vec::new())
+    }
+
+    fn chat(
+        &mut self,
+        _request: &ChatRequest,
+        sink: &mut dyn FnMut(ChunkPayload),
+    ) -> Result<ChatDone, ProtocolError> {
+        sink(ChunkPayload::Thinking {
+            text: "let me thi".into(),
+        });
+        sink(ChunkPayload::Text {
+            text: "The an".into(),
+        });
+        Err(ProtocolError::provider(
+            ErrorCode::Backend,
+            "timed out reading response",
+            true,
+        ))
+    }
+}
+
+/// A turn ended by an error keeps everything streamed so far: the partial
+/// round is consolidated onto disk, the live conversation keeps it, and a
+/// resumed session continues with the full chat.
+#[test]
+fn an_interrupted_turn_keeps_the_partial_round_on_disk() {
+    let dir = temp_dir("interrupted");
+    let path = dir.join("session.jsonl");
+    let mut recorder = Recorder::new(path.clone());
+    let tools: clanky::tools::ToolSet = vec![Box::new(EchoTool)];
+    let mut messages = vec![
+        ChatMessage::system("Be terse."),
+        ChatMessage::user("run it"),
+    ];
+    recorder
+        .writer
+        .append(&Record::User {
+            text: "run it".into(),
+        })
+        .unwrap();
+
+    // The provider dies mid-round, after streaming thinking and text.
+    let result = run_turn(
+        Box::new(HalfStream),
+        &tools,
+        &mut messages,
+        &config(),
+        &mut |event| recorder.on_turn_event(&event),
+    );
+    assert!(result.is_err());
+    recorder.on_done(&result);
+
+    // The partial round is on disk, consolidated like a completed one.
+    drop(recorder);
+    let data = session::load(&path).unwrap();
+    assert_eq!(
+        data.records,
+        vec![
+            Record::User {
+                text: "run it".into()
+            },
+            Record::Thinking {
+                text: "let me thi".into()
+            },
+            Record::Assistant {
+                text: "The an".into(),
+                calls: vec![]
+            },
+        ]
+    );
+
+    // The live conversation kept it too: "please continue" in the same
+    // session sends everything the terminal showed.
+    assert_eq!(messages.len(), 3, "system, user, partial assistant");
+    assert_eq!(messages[2].content(), "The an");
+
+    // /resume rebuilds the same conversation the live turn holds…
+    let rebuilt = session::history_from_records(&data.records);
+    assert_eq!(rebuilt, messages[1..]);
+
+    // …and the next request carries the full chat.
+    let provider_requests = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let provider2 = ScriptedProvider {
+        requests: std::rc::Rc::clone(&provider_requests),
+        script: RefCell::new(VecDeque::from(vec![text_round("Continuing.")])),
+    };
+    let mut messages2 = vec![ChatMessage::system("Be terse.")];
+    messages2.extend(rebuilt);
+    messages2.push(ChatMessage::user("please continue"));
+    let output2 = run_turn(
+        Box::new(provider2),
+        &tools,
+        &mut messages2,
+        &config(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(output2.text, "Continuing.");
+    let requests = provider_requests.borrow().clone();
+    let sent = &requests[0].messages;
+    assert_eq!(sent.len(), 4, "system, user, partial assistant, user");
+    assert_eq!(sent[2].content(), "The an");
 
     std::fs::remove_dir_all(dir).ok();
 }

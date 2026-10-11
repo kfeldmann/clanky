@@ -3,8 +3,10 @@
 //! A session is one JSONL file in `./.clanky/sessions/`, one record per
 //! line. The first line is a versioned header; every later line is one
 //! [`Record`] describing an event of the conversation. The format is
-//! append-only (autosave writes each record as it happens, so killing the
-//! TUI loses at most the event in flight) and forward-compatible (unknown
+//! append-only (autosave writes each record as it happens, and a turn cut
+//! short by an error or ctrl+c consolidates and writes its streamed deltas
+//! before the process exits, so killing the TUI loses at most the event in
+//! flight) and forward-compatible (unknown
 //! record types are skipped on load, mirroring the provider protocol's
 //! versioning policy).
 //!
@@ -68,10 +70,13 @@ pub struct Header {
 pub enum Record {
     /// The user's prompt.
     User { text: String },
-    /// The complete thinking text of one assistant round.
+    /// The complete thinking text of one assistant round. A round cut
+    /// short carries whatever had streamed when it was cut.
     Thinking { text: String },
     /// The complete visible text of one assistant round plus its parsed
-    /// tool calls (empty when the round made none).
+    /// tool calls (empty when the round made none). A round cut short by
+    /// an error or quit carries whatever had streamed when it was cut,
+    /// with no tool calls.
     Assistant { text: String, calls: Vec<ToolCall> },
     /// A tool result fed back to the model.
     ToolResult { name: String, output: String },

@@ -14,7 +14,7 @@ README section "Writing a provider plugin".
 import json
 import sys
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 DEFAULT_MODEL = "hello-world/tiny"
 
 
@@ -92,7 +92,7 @@ def main():
             # A real streaming plugin would stop and emit
             # `finishReason: "cancelled"`.
             pass
-        # Unknown types are ignored (protocol v1 is additive).
+        # Unknown types are ignored (the protocol is additive).
 
 
 if __name__ == "__main__":

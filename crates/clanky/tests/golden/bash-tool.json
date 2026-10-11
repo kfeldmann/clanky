@@ -9,9 +9,9 @@
       ],
       "model": "mock/model",
       "sampling": {
-        "maxTokens": 4096,
+        "max_tokens": 4096,
         "temperature": 0.7,
-        "topP": 0.9
+        "top_p": 0.9
       },
       "thinking": {
         "budgetTokens": 2048
@@ -27,8 +27,7 @@
                 "type": "string"
               },
               "timeout_seconds": {
-                "description": "Optional per-call timeout override in seconds",
-                "maximum": 600,
+                "description": "Optional per-call timeout override in seconds (commands run unbounded without it)",
                 "minimum": 1,
                 "type": "integer"
               }
@@ -68,9 +67,9 @@
       ],
       "model": "mock/model",
       "sampling": {
-        "maxTokens": 4096,
+        "max_tokens": 4096,
         "temperature": 0.7,
-        "topP": 0.9
+        "top_p": 0.9
       },
       "thinking": {
         "budgetTokens": 2048
@@ -86,8 +85,7 @@
                 "type": "string"
               },
               "timeout_seconds": {
-                "description": "Optional per-call timeout override in seconds",
-                "maximum": 600,
+                "description": "Optional per-call timeout override in seconds (commands run unbounded without it)",
                 "minimum": 1,
                 "type": "integer"
               }

@@ -17,7 +17,7 @@ const PLUGIN: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
     *'"hello"'*)
-      printf '%s\n' '{"type":"hello","protocolVersion":1,"name":"hello-world","capabilities":{"listModels":true},"defaultModel":"hello-world/tiny"}'
+      printf '%s\n' '{"type":"hello","protocolVersion":2,"name":"hello-world","capabilities":{"listModels":true},"defaultModel":"hello-world/tiny"}'
       ;;
     *'"listModels"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use clap::Parser;
+use serde_json::Value;
 
 use crate::settings::SamplingParams;
 
@@ -22,12 +23,15 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Thinking budget or level (overrides settings).
+    /// Thinking budget in tokens, or `off` (overrides settings).
     #[arg(long)]
     pub thinking: Option<String>,
 
     /// Sampling parameters as comma-separated key=value pairs,
-    /// e.g. --sampling "temperature=0.7,top_p=0.9" (overrides settings).
+    /// e.g. --sampling "temperature=0.7,top_p=0.9". Keys given here win
+    /// over the same key in settings; keys not given are kept.
+    /// Keys and values are passed to the provider verbatim; the backend
+    /// validates them.
     #[arg(long, value_parser = parse_sampling)]
     pub sampling: Option<SamplingParams>,
 
@@ -74,7 +78,9 @@ impl Cli {
     }
 }
 
-/// Parse `key=value,key=value` into an ordered map of strings.
+/// Parse `key=value,key=value` into an ordered map. Values are kept as
+/// raw strings here; they are decoded for the wire in `turn::sampling_from`
+/// (and validated by the provider backend, never locally).
 fn parse_sampling(raw: &str) -> Result<SamplingParams, String> {
     let mut params = BTreeMap::new();
     for pair in raw.split(',') {
@@ -87,7 +93,7 @@ fn parse_sampling(raw: &str) -> Result<SamplingParams, String> {
         if key.is_empty() {
             return Err(format!("invalid sampling parameter `{pair}`: empty key"));
         }
-        params.insert(key.to_string(), value.to_string());
+        params.insert(key.to_string(), Value::String(value.to_string()));
     }
     Ok(params)
 }
@@ -99,7 +105,7 @@ mod tests {
     fn sampling(pairs: &[(&str, &str)]) -> SamplingParams {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
             .collect()
     }
 

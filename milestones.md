@@ -52,6 +52,22 @@ Architectural decisions already made:
 - Agentic loop: tool calls parsed, executed via `Tool`, results fed back
 - Mock provider for tests; golden-file session transcripts
 - Thinking budget + sampling params plumbed through
+  As built (revised with protocol v2): sampling is a pure pass-through —
+  `[sampling]`/`--sampling` accept any backend parameter (`seed`,
+  `repetition_penalty`, `reasoning_effort`, …) and the backend validates it,
+  per the project invariants (no local whitelist, no local value checks).
+  Protocol v2 replaced the closed `temperature`/`topP`/`maxTokens` struct
+  with an open map keyed by backend parameter names; the handshake rejects
+  v1 plugins loudly instead of silently dropping parameters. Settings
+  values may be any TOML value; untyped strings decode as JSON when they
+  parse as JSON (`temperature = "0.7"` = `temperature = 0.7`). Provider
+  plugins merge `sampling` into the backend request verbatim, fill required
+  or derived knobs (Anthropic `max_tokens`, `thinking` → `reasoning_effort`)
+  only when the user did not set the key, and own the request's structural
+  fields (`model`, `messages`, `tools`, `stream`, …). Across layers
+  (user file, project file, `--sampling`) the map merges per key: later
+  layers win key-by-key and keys set only in a lower layer are kept — no
+  supplied value is silently dropped.
 - Done when: `clanky -p "count files in /tmp"` runs bash and answers.
 
 ## ✔ M3 — TUI basics
@@ -132,10 +148,21 @@ Architectural decisions already made:
   `LITELLM_API_KEY` / `LITELLM_BASE_URL` / `LITELLM_MODEL`; metadata
   (`/model/info`, called bare — the `/v1/` alias can be denied a virtual
   key) is optional and degrades to the plain `/v1/models` catalog
-  when a key is denied it; `reasoning_effort` and `tools` are filtered per
-  model from that metadata so a heterogeneous proxy does not 400. No built-in
+  when a key is denied it; the metadata curates the model list (the picker
+  hides tool-less models via the `supportsTools` hint) while `tools` and
+  `reasoning_effort` pass through to the proxy unconditionally. No built-in
   default model (the catalog is arbitrary), so `LITELLM_MODEL` or an explicit
   `model`/`--model` is required. Design notes: `litellm-provider-planning.md`.
+  As built (revised after review): an earlier build filtered `reasoning_effort`
+  and `tools` out of the request per model ("so a heterogeneous proxy does
+  not 400"), which silently ignored user intent and pre-empted the proxy's
+  own validation (project invariants 1 and 2). Now the request is never
+  edited: thinking/tools are sent unconditionally and the proxy's error is
+  surfaced unchanged (it tells the user to set thinking off / that tools are
+  not supported); the `/model/info` hints instead carry `supportsTools` per
+  model (new optional protocol hint, additive in v2) and the `/model` picker
+  hides tool-less models. `--model` bypasses the picker, so such a model is
+  still reachable and answers with the proxy's error.
 - TUI quality-of-life: `↑`/`↓` prompt recall, `/system` (view the assembled
   system prompt); fix: fresh TUI sessions now seed the system context like
   pipe mode
@@ -155,6 +182,26 @@ Architectural decisions already made:
   any assistant message containing triple backticks in a longer fence;
   that degraded the common case — an answer with a code block — to literal
   text and was removed.)
+- Interrupted turns lose nothing streamed: when a turn is cut short by a
+  provider error mid-stream or by ctrl+c quitting mid-stream, the
+  accumulated deltas are consolidated and written to the session (for
+  thinking and text; partial tool calls/results are not kept), so
+  `/resume` shows the same conversation the terminal did and "please
+  continue" sends the full chat as context
+  As built: the turn loop flushes the in-flight round as one `Round` event
+  when a round dies with streamed content (also appending the partial text
+  to `messages`), and the TUI accumulates deltas not yet consolidated into
+  a round record; `record_done` and the quit path (after draining the
+  events the worker already sent) flush that accumulator — a completed
+  round supersedes it, so nothing is written twice.
+- Timeouts removed — unbounded by design: the 600 s HTTP request timeout in
+  all three provider backends and the 600 s default bash command timeout are
+  gone. Requests/streams are never killed mid-answer and commands run until
+  they finish; the 15 s connect timeout stays. A voluntary per-call
+  `timeout_seconds` is the only command deadline — accepted range is any
+  positive integer (schema `minimum: 1`, no `maximum`; 0 or non-integer →
+  error). Trade-off accepted: a stuck upstream or hanging command holds the
+  turn indefinitely (ctrl+c is the escape hatch).
 - Done when: a stranger can `cargo install` and use it.
 
 ## ☐ M11 — Anthropic provider plugin (OAuth)
@@ -182,7 +229,7 @@ don't care how the chat path streams; only the bearer-vs-`x-api-key` header
 mode couples them) — so M11b's streaming work is live-testable against the
 real tenant.
 
-### ☐ M11a — Confirm-and-capture spike, then OAuth + minimal non-streaming chat
+### ✔ M11a — Confirm-and-capture spike, then OAuth + minimal non-streaming chat
 - **Spike first, before any workspace code:** one live capture of the full
   dance — PKCE authorize URL → pasted code → token exchange → one
   non-streaming `/v1/messages` call with `Authorization: Bearer`. Downgraded

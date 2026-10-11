@@ -297,7 +297,7 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
             &request.model,
             &request.messages,
             request.tools.as_deref(),
-            request.sampling,
+            request.sampling.as_ref(),
             request.thinking,
         )?;
         let raw = self
@@ -342,6 +342,8 @@ fn parse_model_list(body: &str) -> Result<Vec<ModelInfo>, Error> {
                     .map(str::to_string),
                 context_window,
                 supports_thinking,
+                // Every Messages API model supports tool use.
+                supports_tools: Some(true),
                 supports_text_generation: Some(true),
                 input_price_per_mtok: pricing.map(|(_, i, _)| *i),
                 output_price_per_mtok: pricing.map(|(_, _, o)| *o),

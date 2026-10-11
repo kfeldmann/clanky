@@ -55,23 +55,28 @@ pub fn default_tools() -> ToolSet {
 
 /// The built-in `bash` tool: run a shell command, return stdout and stderr.
 pub struct BashTool {
-    timeout: Duration,
+    /// Default deadline for commands; `None` (the default) runs them
+    /// unbounded. A voluntary `timeout_seconds` on the call is the only
+    /// deadline.
+    timeout: Option<Duration>,
     max_output_chars: usize,
 }
 
 impl Default for BashTool {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(600),
+            timeout: None,
             max_output_chars: 20_000,
         }
     }
 }
 
 impl BashTool {
+    /// A `bash` tool with an explicit default deadline (used by tests);
+    /// [`BashTool::default`] is unbounded.
     pub fn new(timeout: Duration, max_output_chars: usize) -> Self {
         Self {
-            timeout,
+            timeout: Some(timeout),
             max_output_chars,
         }
     }
@@ -96,9 +101,8 @@ impl Tool for BashTool {
                 },
                 "timeout_seconds": {
                     "type": "integer",
-                    "description": "Optional per-call timeout override in seconds",
-                    "minimum": 1,
-                    "maximum": 600
+                    "description": "Optional per-call timeout override in seconds (commands run unbounded without it)",
+                    "minimum": 1
                 }
             },
             "required": ["command"]
@@ -118,19 +122,18 @@ impl Tool for BashTool {
                 let Some(seconds) = value.as_u64() else {
                     return Err(ToolError::InvalidArguments {
                         tool: self.name().into(),
-                        message: "expected an integer field `timeout_seconds`".into(),
+                        message: "expected a positive integer field `timeout_seconds`".into(),
                     });
                 };
-                if seconds == 0 || seconds > self.timeout.as_secs() {
+                // Any positive value is a legitimate voluntary timeout;
+                // only zero is rejected.
+                if seconds == 0 {
                     return Err(ToolError::InvalidArguments {
                         tool: self.name().into(),
-                        message: format!(
-                            "`timeout_seconds` must be between 1 and {}",
-                            self.timeout.as_secs()
-                        ),
+                        message: "`timeout_seconds` must be at least 1".into(),
                     });
                 }
-                Duration::from_secs(seconds)
+                Some(Duration::from_secs(seconds))
             }
         };
         self.run_with_timeout(command, timeout)
@@ -138,7 +141,11 @@ impl Tool for BashTool {
 }
 
 impl BashTool {
-    fn run_with_timeout(&self, command: &str, timeout: Duration) -> Result<String, ToolError> {
+    fn run_with_timeout(
+        &self,
+        command: &str,
+        timeout: Option<Duration>,
+    ) -> Result<String, ToolError> {
         let mut child = Command::new("bash")
             .arg("-c")
             .arg(command)
@@ -158,17 +165,19 @@ impl BashTool {
         let stdout_reader = std::thread::spawn(move || read_to_bytes(stdout_pipe));
         let stderr_reader = std::thread::spawn(move || read_to_bytes(stderr_pipe));
 
-        let deadline = Instant::now() + timeout;
+        // `None` (or a deadline past `Instant`'s range) runs the command
+        // unbounded: only a voluntary timeout ever kills it.
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         let status = loop {
             match child.wait_timeout(Duration::from_millis(100)) {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => {
-                    if Instant::now() >= deadline {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         let _ = child.kill();
                         let _ = child.wait();
                         break Err(format!(
                             "command exceeded its {}s timeout and was killed",
-                            timeout.as_secs()
+                            timeout.map_or(0, |timeout| timeout.as_secs())
                         ));
                     }
                 }
@@ -412,17 +421,24 @@ mod tests {
     }
 
     #[test]
+    fn default_command_timeout_is_unbounded() {
+        // No default deadline: a command runs until it finishes; only a
+        // voluntary `timeout_seconds` can kill it.
+        let output = run("sleep 1; echo done");
+        assert_eq!(output, "done");
+    }
+
+    #[test]
     fn per_call_timeout_extends_or_shortens_deadline() {
-        // A per-call override longer than needed succeeds even though it
-        // could exceed nothing here; a short one kills the same sleep.
+        // A per-call override is honored on top of the unbounded default:
+        // a short one kills a hanging sleep.
         let tool = BashTool::default();
         let ok = tool
             .execute(&json!({"command": "true", "timeout_seconds": 5}))
             .unwrap();
         assert_eq!(ok, "(no output)");
 
-        let short = BashTool::new(Duration::from_secs(600), 20_000);
-        let err = short
+        let err = tool
             .execute(&json!({"command": "sleep 30", "timeout_seconds": 1}))
             .unwrap_err();
         assert!(err.to_string().contains("timeout"), "{err}");
@@ -431,17 +447,25 @@ mod tests {
     #[test]
     fn per_call_timeout_is_validated() {
         let tool = BashTool::default();
-        for bad in [0u64, 601, u64::MAX] {
+        // Zero is the only rejected value: any positive second count is a
+        // legitimate voluntary timeout, however large.
+        let err = tool
+            .execute(&json!({"command": "true", "timeout_seconds": 0}))
+            .unwrap_err();
+        assert!(err.to_string().contains("`timeout_seconds`"), "{err}");
+        for ok in [1u64, 601, 86_400, u64::MAX] {
+            let out = tool
+                .execute(&json!({"command": "true", "timeout_seconds": ok}))
+                .unwrap();
+            assert_eq!(out, "(no output)");
+        }
+        for bad in [json!("ten"), json!(-5), json!(1.5)] {
             let err = tool
                 .execute(&json!({"command": "true", "timeout_seconds": bad}))
                 .unwrap_err();
-            assert!(err.to_string().contains("`timeout_seconds`"), "{err}");
+            assert!(err.to_string().contains("integer"), "{err}");
         }
-        let err = tool
-            .execute(&json!({"command": "true", "timeout_seconds": "ten"}))
-            .unwrap_err();
-        assert!(err.to_string().contains("integer"), "{err}");
-        // Absent and explicit null both fall back to the tool default.
+        // Absent and explicit null both fall back to the unbounded default.
         assert!(tool.execute(&json!({"command": "true"})).is_ok());
         assert!(
             tool.execute(&json!({"command": "true", "timeout_seconds": null}))

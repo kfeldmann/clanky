@@ -13,14 +13,14 @@
 //! - **Capabilities are per model, not per plugin.** The proxy is
 //!   heterogeneous: one key may expose reasoning and non-reasoning, tool and
 //!   non-tool models side by side. The handshake therefore advertises
-//!   `thinking`/`tools` for the plugin as a whole, and the adapter filters the
-//!   request per model using the metadata it cached from `/model/info` (drop
-//!   `reasoning_effort` unless `supports_reasoning`, drop `tools` unless
-//!   `supports_function_calling`). When metadata is unavailable the request is
-//!   sent unchanged — LiteLLM's `drop_params`/`supported_openai_params`
-//!   machinery is then the safety net.
+//!   `thinking`/`tools` for the plugin as a whole. The per-model hints curate
+//!   the *model list* only — a model whose `supports_function_calling` is
+//!   false is flagged (`supportsTools: false`) so Clanky's picker hides it —
+//!   never the request: `tools` and the derived `reasoning_effort` are sent
+//!   unconditionally, and when the proxy rejects them its own validation
+//!   error is surfaced unchanged (project invariants: user values are
+//!   authoritative, the server validates).
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use clanky_protocol::{
@@ -63,11 +63,6 @@ pub struct LiteLlmProvider<B: Backend> {
     /// cancel stops generation at the next event boundary. A cancel during a
     /// single blocked read is covered by the client's kill fallback.
     cancel: CancelFlag,
-    /// Per-model hints cached from `/model/info` on the first `listModels`,
-    /// used to filter `reasoning_effort`/`tools` per model. `None` until a
-    /// successful listing; `Some(empty)` when `/model/info` was unavailable
-    /// (so the request is left unfiltered rather than refetched each turn).
-    metadata: RefCell<Option<HashMap<String, ModelHints>>>,
 }
 
 impl LiteLlmProvider<crate::backend::UreqBackend> {
@@ -116,7 +111,6 @@ impl<B: Backend> LiteLlmProvider<B> {
             base_url: base_url.into(),
             default_model: None,
             cancel: CancelFlag::default(),
-            metadata: RefCell::new(None),
         }
     }
 
@@ -180,7 +174,6 @@ impl<B: Backend> Handler for LiteLlmProvider<B> {
                 hint.apply(model);
             }
         }
-        *self.metadata.borrow_mut() = Some(hints);
         Ok(models)
     }
 
@@ -189,13 +182,6 @@ impl<B: Backend> Handler for LiteLlmProvider<B> {
         request: &ChatRequest,
         sink: &mut dyn FnMut(ChunkPayload),
     ) -> Result<ChatDone, Error> {
-        // Per-model filtering needs `/model/info`, which `list_models`
-        // normally loads. A client that never lists models (Clanky's pipe
-        // mode) still gets it: fetch the hints once, lazily, before the first
-        // request that can be filtered.
-        if request.tools.is_some() || request.thinking.is_some() {
-            self.ensure_metadata();
-        }
         let body = self.build_request_body(request)?;
         let payloads = self
             .backend
@@ -245,53 +231,46 @@ impl<B: Backend> LiteLlmProvider<B> {
         }
     }
 
-    /// Load the per-model hints once, on demand (see [`Self::chat`]).
-    fn ensure_metadata(&mut self) {
-        if self.metadata.borrow().is_none() {
-            let hints = self.fetch_hints();
-            *self.metadata.borrow_mut() = Some(hints);
-        }
-    }
-
     /// Build the OpenAI-compatible request body for a chat request.
     /// Streaming-first: SSE deltas come back as OpenAI-style chunks.
     ///
-    /// `reasoning_effort` and `tools` are filtered per model using the
-    /// `/model/info` hints, because the proxy mixes reasoning and
-    /// non-reasoning, tool and non-tool models behind one key.
+    /// `sampling` entries pass through to the backend verbatim (spec §5):
+    /// arbitrary backend parameters work and the backend validates them.
+    /// The request's own structural fields belong to the protocol and are
+    /// set here afterwards, so they cannot be overridden through `sampling`.
+    ///
+    /// `tools` and the derived `reasoning_effort` are sent unconditionally —
+    /// even for a model whose `/model/info` hints say it supports neither.
+    /// Dropping them would silently ignore what the user asked for and
+    /// pre-empt the proxy's own validation; the hints curate the model list
+    /// (see [`Self::list_models`]), not the request. If the model truly
+    /// cannot handle them, the proxy's error is the actionable answer.
     fn build_request_body(&self, request: &ChatRequest) -> Result<String, Error> {
-        let hints = self.metadata.borrow();
-        let hint = hints.as_ref().and_then(|map| map.get(&request.model));
-
-        let mut body = json!({
-            "model": request.model,
-            "messages": openai_messages(&request.messages)?,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
+        let mut body = json!({});
         let obj = body.as_object_mut().expect("object literal");
+        if let Some(sampling) = &request.sampling {
+            for (key, value) in sampling.iter() {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        obj.insert("model".into(), json!(request.model));
+        obj.insert(
+            "messages".into(),
+            Value::Array(openai_messages(&request.messages)?),
+        );
+        obj.insert("stream".into(), json!(true));
+        obj.insert("stream_options".into(), json!({"include_usage": true}));
 
-        let supports_tools = hint.and_then(|h| h.supports_tools).unwrap_or(true);
-        if supports_tools
-            && let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty())
-        {
+        if let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty()) {
             obj.insert("tools".into(), openai_tools(tools));
         }
 
-        if let Some(sampling) = request.sampling {
-            if let Some(t) = sampling.temperature {
-                obj.insert("temperature".into(), json!(t));
-            }
-            if let Some(p) = sampling.top_p {
-                obj.insert("top_p".into(), json!(p));
-            }
-            if let Some(m) = sampling.max_tokens {
-                obj.insert("max_tokens".into(), json!(m));
-            }
-        }
-
-        let supports_reasoning = hint.and_then(|h| h.supports_reasoning).unwrap_or(true);
-        if supports_reasoning && let Some(effort) = request.thinking.and_then(reasoning_effort) {
+        // The thinking → `reasoning_effort` mapping only fills the gap: a
+        // `reasoning_effort` the user set in `sampling` is never overwritten
+        // — pass-through means the backend decides about it.
+        if !obj.contains_key("reasoning_effort")
+            && let Some(effort) = request.thinking.and_then(reasoning_effort)
+        {
             obj.insert("reasoning_effort".into(), json!(effort));
         }
 
@@ -462,6 +441,7 @@ fn parse_catalog(body: &str) -> Result<Vec<ModelInfo>, Error> {
                 id,
                 context_window: None,
                 supports_thinking: None,
+                supports_tools: None,
                 supports_text_generation: None,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
@@ -504,6 +484,9 @@ impl ModelHints {
         }
         if self.supports_reasoning.is_some() {
             model.supports_thinking = self.supports_reasoning;
+        }
+        if self.supports_tools.is_some() {
+            model.supports_tools = self.supports_tools;
         }
         if self.supports_text_generation.is_some() {
             model.supports_text_generation = self.supports_text_generation;
@@ -766,6 +749,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use clanky_protocol::{Sampling, ToolCall};
+    use std::cell::RefCell;
 
     const CATALOG: &str = include_str!("../tests/fixtures/v1_models.json");
     const MODEL_INFO: &str = include_str!("../tests/fixtures/model_info.json");
@@ -932,6 +916,7 @@ mod tests {
         assert_eq!(sonnet.output_price_per_mtok, Some(15.0));
         assert_eq!(sonnet.cache_read_price_per_mtok, Some(0.3));
         assert_eq!(sonnet.supports_thinking, Some(true));
+        assert_eq!(sonnet.supports_tools, Some(true));
         assert_eq!(sonnet.supports_text_generation, Some(true));
 
         // `mode: "responses"` still generates text; `max_input_tokens` is the
@@ -1119,11 +1104,11 @@ mod tests {
             vec![r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#.into()],
         );
         let mut req = request("claude-sonnet-4-6");
-        req.sampling = Some(Sampling {
-            temperature: Some(0.5),
-            top_p: Some(0.9),
-            max_tokens: Some(256),
-        });
+        req.sampling = Some(Sampling::from_iter([
+            ("temperature".into(), json!(0.5)),
+            ("top_p".into(), json!(0.9)),
+            ("max_tokens".into(), json!(256)),
+        ]));
         req.tools = Some(vec![Tool {
             name: "bash".into(),
             description: Some("Run a shell command".into()),
@@ -1206,7 +1191,7 @@ mod tests {
         }
     }
 
-    // --- per-model capability filtering ----------------------------------
+    // --- thinking, tools, and sampling ---------------------------------
 
     #[test]
     fn thinking_budget_maps_to_the_reasoning_effort_ladder() {
@@ -1234,7 +1219,9 @@ mod tests {
     }
 
     #[test]
-    fn thinking_is_dropped_for_a_model_without_reasoning() {
+    fn thinking_maps_to_reasoning_effort_even_for_a_model_the_hints_call_non_reasoning() {
+        // The hints curate the picker; they never edit a request. If the
+        // model truly cannot reason, the proxy's own error is the answer.
         let info = json!({"data": [
             {"model_name": "plain", "model_info": {"mode": "chat", "supports_reasoning": false}}
         ]})
@@ -1248,17 +1235,14 @@ mod tests {
             budget_tokens: Some(4096),
         });
         run_chat(&mut provider, &req).1.unwrap();
-        assert!(
-            provider
-                .backend
-                .last_body()
-                .get("reasoning_effort")
-                .is_none()
-        );
+        assert_eq!(provider.backend.last_body()["reasoning_effort"], "low");
     }
 
     #[test]
-    fn tools_are_dropped_for_a_model_without_function_calling() {
+    fn tools_are_sent_even_for_a_model_the_hints_call_tool_less() {
+        // Tool-less models are hidden by Clanky's picker, but `--model` can
+        // still name one — and the request goes out as the user asked, so
+        // the proxy's own error is what they see.
         let info = json!({"data": [
             {"model_name": "plain", "model_info": {"mode": "chat", "supports_function_calling": false}}
         ]})
@@ -1274,16 +1258,55 @@ mod tests {
             parameters: None,
         }]);
         run_chat(&mut provider, &req).1.unwrap();
-        assert!(provider.backend.last_body().get("tools").is_none());
+        assert!(provider.backend.last_body().get("tools").is_some());
     }
 
     #[test]
-    fn a_model_absent_from_the_metadata_is_left_unfiltered() {
-        // The proxy did not describe this model, so there is nothing to
-        // filter on: send tools/thinking as-is and let the proxy's own
-        // `drop_params` machinery decide.
+    fn a_tool_less_model_is_flagged_for_the_picker_but_still_listed() {
+        // The hint feeds `supportsTools` so Clanky's `/model` picker hides
+        // the model; the listing itself stays complete — `--model` can still
+        // name it and the proxy's error answers.
+        let info = json!({"data": [
+            {"model_name": "plain", "model_info": {"mode": "chat", "supports_function_calling": false}}
+        ]})
+        .to_string();
+        let catalog = json!({"data": [{"id": "plain"}]}).to_string();
+        let mut provider = provider(&catalog, &info, Vec::new());
+        let models = provider.list_models().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].supports_tools, Some(false));
+    }
+
+    #[test]
+    fn user_sampling_wins_over_the_derived_reasoning_effort() {
+        // A `reasoning_effort` the user put in `sampling` is a user value,
+        // not the derived thinking mapping: it reaches the backend verbatim
+        // and the mapping never overwrites it.
         let mut provider = provider(CATALOG, MODEL_INFO, vec![r#"{"choices":[]}"#.into()]);
-        let mut req = request("not-in-model-info");
+        let mut req = request("claude-sonnet-4-6");
+        req.thinking = Some(Thinking {
+            budget_tokens: Some(8192),
+        });
+        req.sampling = Some(Sampling::from_iter([
+            ("reasoning_effort".into(), json!("high")),
+            ("repetition_penalty".into(), json!(1.1)),
+            ("seed".into(), json!(7)),
+        ]));
+        run_chat(&mut provider, &req).1.unwrap();
+        let body = provider.backend.last_body();
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["repetition_penalty"], 1.1);
+        assert_eq!(body["seed"], 7);
+    }
+
+    #[test]
+    fn chat_sends_tools_and_thinking_without_any_metadata_listing() {
+        // Clanky's pipe mode never calls `listModels`; nothing needs
+        // `/model/info` any more — the hints curate the catalog, never the
+        // request — so a chat goes straight out as asked.
+        let mut provider = provider(CATALOG, MODEL_INFO, vec![r#"{"choices":[]}"#.into()]);
+        // No `list_models()` here.
+        let mut req = request("claude-sonnet-4-6");
         req.thinking = Some(Thinking {
             budget_tokens: Some(1024),
         });
@@ -1296,34 +1319,9 @@ mod tests {
         let body = provider.backend.last_body();
         assert_eq!(body["reasoning_effort"], "low");
         assert!(body.get("tools").is_some());
-    }
-
-    #[test]
-    fn chat_fetches_metadata_lazily_without_a_prior_listing() {
-        // Clanky's pipe mode never calls `listModels`, so a chat carrying
-        // tools must still load `/model/info` to filter per model.
-        let info = json!({"data": [
-            {"model_name": "plain", "model_info": {"mode": "chat", "supports_function_calling": false}}
-        ]})
-        .to_string();
-        let catalog = json!({"data": [{"id": "plain"}]}).to_string();
-        let mut provider = provider(&catalog, &info, vec![r#"{"choices":[]}"#.into()]);
-        // No `list_models()` here.
-        let mut req = request("plain");
-        req.tools = Some(vec![Tool {
-            name: "bash".into(),
-            description: None,
-            parameters: None,
-        }]);
-        run_chat(&mut provider, &req).1.unwrap();
         assert!(
-            provider.backend.last_body().get("tools").is_none(),
-            "the lazy fetch must have filtered `tools`"
-        );
-        assert_eq!(
-            provider.backend.gets.borrow().as_slice(),
-            ["http://localhost:4000/model/info"],
-            "only `/model/info` is fetched lazily, not the catalog"
+            provider.backend.gets.borrow().is_empty(),
+            "no metadata fetches happen on the chat path"
         );
     }
 

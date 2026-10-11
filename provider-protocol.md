@@ -1,8 +1,8 @@
 # Clanky Provider Plugin Protocol
 
 Specification for the protocol between Clanky and provider plugins.
-Target protocol version: **1**. Implemented in-process from M1 (loopback
-transport); process transport arrives in M8.
+Target protocol version: **2** (v1 is superseded — see §9). Implemented
+in-process from M1 (loopback transport); process transport arrives in M8.
 
 Design goals, in order:
 
@@ -42,13 +42,13 @@ IDs are chosen by the client and unique per connection.
 Client → plugin, immediately on connect:
 
 ```json
-{"type": "hello", "protocolVersion": 1}
+{"type": "hello", "protocolVersion": 2}
 ```
 
 Plugin → client:
 
 ```json
-{"type": "hello", "protocolVersion": 1,
+{"type": "hello", "protocolVersion": 2,
  "name": "deepinfra",
  "capabilities": {"listModels": true, "thinking": true, "tools": true},
  "defaultModel": "deepseek-ai/DeepSeek-V3"}
@@ -84,11 +84,16 @@ Plugin → client:
              "displayName": "DeepSeek V3",
              "contextWindow": 128000,
              "supportsThinking": true,
+             "supportsTools": true,
              "inputPricePerMtok": 0.27,
              "outputPricePerMtok": 1.1}]}
 ```
 
 All model fields except `id` are optional hints for pickers and UI display.
+The `supports*` flags (`supportsThinking`, `supportsTools`,
+`supportsTextGeneration`) are tri-state: `false` marks a model that lacks the
+capability — clients may hide it in pickers — while absent means unknown and
+must be treated as usable. `supportsTools` is additive in v2.
 Only sent when `capabilities.listModels` is true. `inputPricePerMtok` /
 `outputPricePerMtok` are catalog prices in dollars per million tokens (the
 `metadata.pricing.{input,output}_tokens` fields on DeepInfra); clients use
@@ -115,7 +120,8 @@ Client → plugin:
             "parameters": {"type": "object",
                            "properties": {"command": {"type": "string"}},
                            "required": ["command"]}}],
- "sampling": {"temperature": 0.7, "topP": 1.0, "maxTokens": 4096},
+ "sampling": {"temperature": 0.7, "top_p": 1.0, "max_tokens": 4096,
+              "seed": 42},
  "thinking": {"budgetTokens": 2048}
 }
 ```
@@ -130,8 +136,21 @@ Field rules:
 - Tool results are `role: "tool"` messages with `toolCallId` + `content`.
 - `tools` uses JSON Schema for `parameters` (OpenAI-compatible; maps directly
   to DeepInfra/function calling).
-- `sampling` and `thinking` are optional; any field inside them may be omitted.
-  `thinking` only sent if `capabilities.thinking`.
+- `sampling` is an **open map, passed through verbatim**: its keys are the
+  backend's own parameter names (`temperature`, `top_p`, `max_tokens`,
+  `seed`, `reasoning_effort`, `repetition_penalty`, whatever the backend
+  accepts) and the plugin merges them unchanged into its backend request.
+  Neither Clanky nor the plugin renames, validates, or drops them — the
+  backend does, and its own error message is what the user sees. The one
+  caveat: the request's structural fields (`model`, `messages`, `system`,
+  `tools`, `stream`, …) belong to the protocol and are set by the plugin
+  afterwards; they cannot be overridden through `sampling`. Filling a
+  required knob the user did not set (e.g. Anthropic's `max_tokens`) is
+  fine; overwriting a key the user did set is not.
+- `sampling` and `thinking` are optional; `thinking` is only sent if
+  `capabilities.thinking`.
+- Any other top-level `chat` field is reserved for future versions; ignore
+  unknown fields.
 
 ## 6. Stream chunks and completion
 
@@ -165,7 +184,8 @@ Rules:
 - `usage` is optional; present it when the backend reports it.
 - **Ordering:** chunks for a given `requestId` arrive in order. **Only one chat
   may be in flight per plugin connection.** This removes all interleaving
-  complexity; parallel requests would need multiplexing we don't want in v1.
+  complexity; parallel requests would need multiplexing we don't want in
+  this protocol.
 
 ## 7. Cancellation
 
@@ -214,10 +234,19 @@ Plugin → client:
 
 ## 9. Versioning policy
 
-- `protocolVersion` is a single integer. **v1 allows only additive, optional
-  changes**; consumers must ignore unknown message types and unknown fields.
+- `protocolVersion` is a single integer. **A version allows only additive,
+  optional changes**; consumers must ignore unknown message types and unknown
+  fields.
 - Anything breaking (new required field, changed semantics, new in-flight
-  rules) bumps to 2, and the handshake decides compatibility.
+  rules) bumps the version, and the handshake decides compatibility.
+- Version history:
+  - **v1** — initial protocol. `sampling` was a closed struct
+    (`temperature`, `topP`, `maxTokens`): every other sampling parameter was
+    rejected or dropped, and two keys were renamed.
+  - **v2** — `sampling` is an open, verbatim pass-through map whose keys are
+    the backend's parameter names (e.g. `top_p`, `max_tokens`). Breaking for
+    v1 peers (renamed keys, changed semantics), so the handshake rejects
+    them loudly instead of silently dropping parameters.
 
 ## 10. M1 loopback transport
 
@@ -244,7 +273,7 @@ def main():
     for line in sys.stdin:
         msg = json.loads(line)
         if msg["type"] == "hello":
-            emit({"type": "hello", "protocolVersion": 1, "name": "hello-world",
+            emit({"type": "hello", "protocolVersion": 2, "name": "hello-world",
                   "capabilities": {}, "defaultModel": "hello-world/tiny"})
         elif msg["type"] == "chat":
             # ... call backend, translate each delta to a chunk event ...
@@ -259,8 +288,8 @@ if __name__ == "__main__":
 ## Appendix B: example transcript (tool call)
 
 ```
-> {"type":"hello","protocolVersion":1}
-< {"type":"hello","protocolVersion":1,"name":"deepinfra",
+> {"type":"hello","protocolVersion":2}
+< {"type":"hello","protocolVersion":2,"name":"deepinfra",
    "capabilities":{"listModels":true,"thinking":true,"tools":true},
    "defaultModel":"deepseek-ai/DeepSeek-V3"}
 > {"type":"listModels","id":7}

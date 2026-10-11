@@ -140,8 +140,9 @@ pub struct UreqBackend {
 impl UreqBackend {
     pub fn new(api_key: impl Into<String>) -> Self {
         let agent = ureq::AgentBuilder::new()
+            // Connect is bounded, but the request itself has no timeout:
+            // a long stream must never be killed mid-answer.
             .timeout_connect(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600))
             .build();
         Self {
             agent,

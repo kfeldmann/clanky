@@ -6,8 +6,12 @@
 //!   as Claude Code, and the model answers *as* Claude Code with it).
 //! - assistant `tool_calls` ⇄ `tool_use` content blocks; `role: "tool"`
 //!   results are sent as a `user` message of `tool_result` blocks.
-//! - `thinking` budget → `thinking: {type: "enabled", budget_tokens}`;
-//!   `temperature` is dropped whenever thinking is on (spike-confirmed 400).
+//! - `thinking` budget → `thinking: {type: "enabled", budget_tokens}`.
+//!   Sampling values pass through verbatim even when thinking is on:
+//!   Anthropic rejects `temperature` other than 1 in that combination
+//!   (spike-confirmed 400), and per the project invariants that provider
+//!   rejection is the actionable error we surface — the user's value is
+//!   never silently dropped.
 
 use clanky_protocol::{ChatMessage, FinishReason, Sampling, Thinking, Tool, Usage};
 use serde_json::{Value, json};
@@ -28,7 +32,7 @@ pub fn build_request_body(
     model: &str,
     messages: &[ChatMessage],
     tools: Option<&[Tool]>,
-    sampling: Option<Sampling>,
+    sampling: Option<&Sampling>,
     thinking: Option<Thinking>,
 ) -> Result<String, clanky_protocol::Error> {
     let mut system_blocks = vec![json!({"type": "text", "text": IDENTITY_SYSTEM_TEXT})];
@@ -87,37 +91,49 @@ pub fn build_request_body(
         }
     }
 
-    // Use the user-provided max_tokens as-is; fall back to the default if
-    // none was supplied.
-    let max_tokens = sampling
-        .and_then(|s| s.max_tokens)
-        .unwrap_or(DEFAULT_MAX_TOKENS);
-
-    let mut body = json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": conversation,
-        "system": system_blocks,
-    });
-
-    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-        body["tools"] = Value::Array(tools.iter().map(anthropic_tool).collect());
+    // Sampling entries pass through verbatim (spec §5): `temperature`,
+    // `top_p`, `top_k`, `stop_sequences`, … whatever the Messages API
+    // accepts. The user's values are sent as-is even when thinking is on —
+    // Anthropic rejects `temperature` other than 1 in that combination
+    // (spike-confirmed 400), and per the project invariants that provider
+    // rejection is the actionable error we surface, never a silent drop.
+    let mut body = json!({});
+    let obj = body.as_object_mut().expect("object literal");
+    if let Some(sampling) = sampling {
+        for (key, value) in sampling.iter() {
+            obj.insert(key.clone(), value.clone());
+        }
     }
-    if let Some(thinking) = thinking {
-        // Only send thinking if a positive budget was provided.
-        if let Some(budget) = thinking.budget_tokens.filter(|&n| n > 0) {
-            body["thinking"] = json!({
+
+    // `max_tokens` is required by the Messages API: the user's value is used
+    // as-is; the default fills the gap only when none was supplied.
+    obj.entry("max_tokens")
+        .or_insert_with(|| json!(DEFAULT_MAX_TOKENS));
+
+    // The conversation shape belongs to the protocol and cannot be
+    // overridden through `sampling`.
+    obj.insert("model".into(), json!(model));
+    obj.insert("messages".into(), conversation.into());
+    obj.insert("system".into(), system_blocks.into());
+    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+        obj.insert(
+            "tools".into(),
+            Value::Array(tools.iter().map(anthropic_tool).collect()),
+        );
+    }
+    // Derived thinking: only sent when a positive budget was provided, and
+    // only to fill the gap — a `thinking` block the user set in `sampling`
+    // wins over it.
+    if !obj.contains_key("thinking")
+        && let Some(budget) = thinking.and_then(|t| t.budget_tokens).filter(|&n| n > 0)
+    {
+        obj.insert(
+            "thinking".into(),
+            json!({
                 "type": "enabled",
                 "budget_tokens": budget,
-            });
-            // Spike-confirmed: temperature may only be 1 when thinking is on.
-            // Drop the parameter entirely instead of clamping.
-        }
-    } else if let Some(temperature) = sampling.and_then(|s| s.temperature) {
-        body["temperature"] = json!(temperature);
-    }
-    if let Some(top_p) = sampling.and_then(|s| s.top_p) {
-        body["top_p"] = json!(top_p);
+            }),
+        );
     }
 
     serde_json::to_string(&body)
@@ -403,19 +419,18 @@ mod tests {
     }
 
     #[test]
-    fn thinking_sets_budget_and_drops_temperature() {
+    fn thinking_sets_budget_and_passes_temperature_through() {
         let messages = vec![ChatMessage::user("hi")];
-        let sampling = Sampling {
-            temperature: Some(0.2),
-            top_p: Some(0.9),
-            max_tokens: None,
-        };
+        let sampling = Sampling::from_iter([
+            ("temperature".into(), json!(0.2)),
+            ("top_p".into(), json!(0.9)),
+        ]);
         let body: Value = serde_json::from_str(
             &build_request_body(
                 "m",
                 &messages,
                 None,
-                Some(sampling),
+                Some(&sampling),
                 Some(Thinking {
                     budget_tokens: Some(1024),
                 }),
@@ -427,11 +442,69 @@ mod tests {
             body["thinking"],
             json!({"type": "enabled", "budget_tokens": 1024})
         );
-        assert!(
-            body.get("temperature").is_none(),
-            "spike-confirmed 400 with temperature while thinking"
-        );
+        // The user's temperature goes out verbatim even with thinking on.
+        // Anthropic rejects anything but 1 in that combination (spike-
+        // confirmed 400) and that rejection is the actionable error we
+        // surface — the value must never be silently dropped.
+        assert_eq!(body["temperature"], json!(0.2));
         assert_eq!(body["top_p"], json!(0.9));
+    }
+
+    #[test]
+    fn thinking_zero_keeps_temperature() {
+        // Budget 0 means thinking is off on the wire; the user's temperature
+        // must still go out.
+        let messages = vec![ChatMessage::user("hi")];
+        let sampling = Sampling::from_iter([("temperature".into(), json!(0.2))]);
+        let body: Value = serde_json::from_str(
+            &build_request_body(
+                "m",
+                &messages,
+                None,
+                Some(&sampling),
+                Some(Thinking {
+                    budget_tokens: Some(0),
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["temperature"], json!(0.2));
+    }
+
+    #[test]
+    fn arbitrary_sampling_parameters_pass_through_verbatim() {
+        let messages = vec![ChatMessage::user("hi")];
+        let sampling = Sampling::from_iter([
+            ("top_k".into(), json!(40)),
+            ("stop_sequences".into(), json!(["\n\n"])),
+            ("max_tokens".into(), json!(123)),
+            // A `thinking` block the user sets themselves wins over the
+            // budget-derived one.
+            ("thinking".into(), json!({"type": "disabled"})),
+        ]);
+        let body: Value = serde_json::from_str(
+            &build_request_body(
+                "m",
+                &messages,
+                None,
+                Some(&sampling),
+                Some(Thinking {
+                    budget_tokens: Some(1024),
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["top_k"], json!(40));
+        assert_eq!(body["stop_sequences"], json!(["\n\n"]));
+        assert_eq!(
+            body["max_tokens"],
+            json!(123),
+            "the user's max_tokens as-is"
+        );
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
     }
 
     #[test]

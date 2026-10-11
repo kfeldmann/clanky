@@ -386,7 +386,7 @@ mod tests {
             r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
-    *'"hello"'*) printf '%s\n' '{"type":"hello","protocolVersion":1,"name":"'$0'","capabilities":{}}' ;;
+    *'"hello"'*) printf '%s\n' '{"type":"hello","protocolVersion":2,"name":"'$0'","capabilities":{}}' ;;
   esac
 done
 "#
@@ -435,7 +435,7 @@ done
 while IFS= read -r line; do
   case "$line" in
     *'"hello"'*)
-      printf '%s\n' '{"type":"hello","protocolVersion":2,"name":"future","capabilities":{}}'
+      printf '%s\n' '{"type":"hello","protocolVersion":3,"name":"future","capabilities":{}}'
       ;;
   esac
 done
@@ -459,10 +459,10 @@ done
         // A valid `hello` with a foreign version maps to a dedicated error
         // that names the plugin and both versions (plan §7).
         assert!(
-            message.contains("provider plugin `future` requires protocol v2"),
+            message.contains("provider plugin `future` requires protocol v3"),
             "{message}"
         );
-        assert!(message.contains("clanky speaks v1"), "{message}");
+        assert!(message.contains("clanky speaks v2"), "{message}");
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -477,7 +477,7 @@ done
             r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
-    *'"hello"'*) printf '%s\n' '{"type":"hello","protocolVersion":1,"name":"someone-else","capabilities":{}}' ;;
+    *'"hello"'*) printf '%s\n' '{"type":"hello","protocolVersion":2,"name":"someone-else","capabilities":{}}' ;;
   esac
 done
 "#,

@@ -1,14 +1,17 @@
-//! Protocol v1 message and payload types.
+//! Protocol v2 message and payload types.
 //!
 //! Serialized forms follow `provider-protocol.md`: every message is one JSON
 //! object with a `"type"` field, camelCase field names, and unknown fields
 //! ignored on deserialization.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// The protocol version this crate implements (see §9 of the spec).
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2 replaced the closed `Sampling` struct with an open, verbatim
+/// pass-through map — breaking for v1 peers, so the handshake rejects
+/// them loudly.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Every protocol message: one JSON object tagged with `"type"`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,6 +119,11 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_thinking: Option<bool>,
+    /// Whether the model can call tools (function calling). Providers that
+    /// know set this; `None` means unknown, and callers should treat unknown
+    /// as capable rather than filter it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_tools: Option<bool>,
     /// Whether the model can generate text (chat/LLM). Providers that
     /// classify their models set this; `None` means unknown, and callers
     /// should treat unknown as usable rather than filter it out.
@@ -220,16 +228,37 @@ pub struct Tool {
     pub parameters: Option<Value>,
 }
 
-/// Sampling parameters; every field optional.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Sampling {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
+/// Sampling parameters: an open map passed through verbatim (spec §5).
+///
+/// Keys are the backend's own parameter names — `temperature`, `top_p`,
+/// `max_tokens`, `seed`, `reasoning_effort`, `repetition_penalty`, whatever
+/// the backend accepts. Neither Clanky nor the plugin renames, validates,
+/// or drops them: the plugin merges the entries unchanged into its backend
+/// request, and the backend's own error is what the user sees. (v1 had a
+/// closed `temperature`/`topP`/`maxTokens` struct, which rejected every
+/// other parameter and renamed keys; v2 replaced it with this map.)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Sampling(pub Map<String, Value>);
+
+impl std::ops::Deref for Sampling {
+    type Target = Map<String, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Sampling {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl FromIterator<(String, Value)> for Sampling {
+    fn from_iter<I: IntoIterator<Item = (String, Value)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
 }
 
 /// Thinking/reasoning controls; every field optional.
@@ -478,11 +507,13 @@ mod tests {
                 description: Some("Run a shell command".into()),
                 parameters: Some(json!({"type": "object"})),
             }]),
-            sampling: Some(Sampling {
-                temperature: Some(0.7),
-                top_p: Some(1.0),
-                max_tokens: Some(4096),
-            }),
+            sampling: Some(Sampling::from_iter([
+                ("temperature".into(), json!(0.7)),
+                ("top_p".into(), json!(1.0)),
+                ("max_tokens".into(), json!(4096)),
+                // Backend-specific parameters pass through like any other.
+                ("seed".into(), json!(42)),
+            ])),
             thinking: Some(Thinking {
                 budget_tokens: Some(2048),
             }),
@@ -492,7 +523,8 @@ mod tests {
         assert_eq!(parsed, chat);
         assert!(line.contains("\"toolCalls\""));
         assert!(line.contains("\"toolCallId\""));
-        assert!(line.contains("\"topP\""));
+        assert!(line.contains("\"top_p\""));
+        assert!(line.contains("\"seed\":42"));
         assert!(line.contains("\"budgetTokens\""));
     }
 
@@ -500,9 +532,9 @@ mod tests {
     fn spec_examples_deserialize() {
         // Straight out of provider-protocol.md.
         for (line, expected_type) in [
-            (r#"{"type": "hello", "protocolVersion": 1}"#, "hello"),
+            (r#"{"type": "hello", "protocolVersion": 2}"#, "hello"),
             (
-                r#"{"type": "hello", "protocolVersion": 1, "name": "deepinfra",
+                r#"{"type": "hello", "protocolVersion": 2, "name": "deepinfra",
                     "capabilities": {"listModels": true, "thinking": true, "tools": true}}"#,
                 "hello",
             ),

@@ -44,7 +44,7 @@ const LOOP: &str = r#"
 while IFS= read -r line; do
   case "$line" in
     *'"hello"'*)
-      printf '%s\n' '{"type":"hello","protocolVersion":1,"name":"fake","capabilities":{"listModels":true,"thinking":true,"tools":true},"defaultModel":"fake/default"}'
+      printf '%s\n' '{"type":"hello","protocolVersion":2,"name":"fake","capabilities":{"listModels":true,"thinking":true,"tools":true},"defaultModel":"fake/default"}'
       ;;
     *'"listModels"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -83,7 +83,7 @@ fn spawn(tag: &str, body: &str) -> ProcessTransport {
 
 fn hello() -> Message {
     Message::Hello {
-        protocol_version: 1,
+        protocol_version: clanky_protocol::PROTOCOL_VERSION,
         name: None,
         capabilities: None,
         default_model: None,

@@ -85,7 +85,7 @@ The `litellm.ts` reference covers the metadata mapping well; the two things it h
 
 - **Endpoints:** `GET {base}/v1/models`, `GET {base}/v1/model/info`, `POST {base}/v1/chat/completions` with `stream: true` + `stream_options.include_usage: true`.
 - **Env:** `LITELLM_BASE_URL`, `LITELLM_API_KEY` (inherited, read by the plugin only — core never sees it), optional `LITELLM_MODEL`. Base URL normalized so both `http://host:4000` and `http://host:4000/v1` work.
-- **ModelInfo:** `id` = `model_name`; dedupe by `model_name` (load-balanced groups repeat it — the reference's `if (name in map) continue` is right); `displayName` = `model_info.display_name`; `contextWindow` = `max_input_tokens ?? max_tokens`; `supportsThinking` = `supports_reasoning`; `supportsTextGeneration` = `mode == "chat"`; prices × 1e6 (`input_cost_per_token`, `output_cost_per_token`, `cache_read_input_token_cost`).
+- **ModelInfo:** `id` = `model_name`; dedupe by `model_name` (load-balanced groups repeat it — the reference's `if (name in map) continue` is right); `displayName` = `model_info.display_name`; `contextWindow` = `max_input_tokens ?? max_tokens`; `supportsThinking` = `supports_reasoning`; `supportsTools` = `supports_function_calling`; `supportsTextGeneration` = `mode == "chat"`; prices × 1e6 (`input_cost_per_token`, `output_cost_per_token`, `cache_read_input_token_cost`).
 - **Errors:** 401/403 → `auth`; 429 → `rateLimit` retryable (+ `retry-after` header); 400/404/422 → `invalidRequest`; 5xx/timeout → `backend` retryable.
 - **finish_reason:** `stop|length|tool_calls|function_call|content_filter`; unknown → `stop`.
 
@@ -143,11 +143,15 @@ pins the adapter to the observed bytes.
 
 Pitfalls handled:
 
-- **Heterogeneous capabilities** — `reasoning_effort` is dropped unless
-  `supports_reasoning`, and `tools` unless `supports_function_calling`, using
-  the `/model/info` hints cached at listing time. When metadata is
-  unavailable the request is sent unchanged (the proxy's own `drop_params` is
-  the safety net).
+- **Heterogeneous capabilities** — originally the request was filtered per
+  model (`reasoning_effort` dropped unless `supports_reasoning`, `tools`
+  unless `supports_function_calling`). Superseded after review (project
+  invariants 1 and 2 — silently dropping user values, pre-empting the
+  proxy's validation): the request is never edited now, `tools` and the
+  derived `reasoning_effort` pass through unconditionally and the proxy's
+  error answers (it tells the user to set thinking off / that tools are not
+  supported); the `/model/info` hints instead flag tool-less models
+  (`supportsTools`) for Clanky's `/model` picker to hide.
 - **Legacy `function_call`** finish reason maps to `ToolCalls`.
 - **Error envelopes** — `{"error":{"message":…}}` and `{"detail":…}` are
   unwrapped into the user-facing message rather than passed through as raw

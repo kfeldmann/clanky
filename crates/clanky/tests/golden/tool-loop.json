@@ -22,9 +22,9 @@
       ],
       "model": "mock/model",
       "sampling": {
-        "maxTokens": 4096,
+        "max_tokens": 4096,
         "temperature": 0.7,
-        "topP": 0.9
+        "top_p": 0.9
       },
       "thinking": {
         "budgetTokens": 2048
@@ -78,9 +78,9 @@
       ],
       "model": "mock/model",
       "sampling": {
-        "maxTokens": 4096,
+        "max_tokens": 4096,
         "temperature": 0.7,
-        "topP": 0.9
+        "top_p": 0.9
       },
       "thinking": {
         "budgetTokens": 2048

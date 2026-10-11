@@ -169,24 +169,21 @@ event mapping too.
 Fixtures: pinned live captures in `tests/fixtures/` (the LiteLLM M10
 pattern), seeded by the spike.
 
-### As built: `max_tokens` ⇄ `thinking.budget_tokens` (M11a fix)
+### As built: `temperature` passes through with thinking on (invariant fix)
 
-Anthropic 400s unless `max_tokens` is **strictly greater than**
-`thinking.budget_tokens`. The two are therefore resolved together in
-`adapter::fit_thinking`:
+`temperature` is sent verbatim whether or not `thinking` is enabled —
+including the budget-`0` case. Anthropic 400s unless `temperature` is 1
+when thinking is on (spike-confirmed); per the project invariants that
+provider rejection *is* the actionable error, so the adapter never drops
+the user's value to dodge it. The 400 surfaces unchanged
+(`extract_error_message` → `map_backend_error`). Earlier this adapter
+silently omitted `temperature` whenever a thinking budget was present,
+which both violated "user-provided values are authoritative" and (via an
+`else if` on the outer `thinking` branch) dropped it even when thinking
+was off on the wire.
 
-- **Explicit `sampling.max_tokens`** describes the answer, so the budget
-  is added on top (`max_tokens = requested + budget`) — Pi's
-  `adjustMaxTokensForThinking` rule. The user's cap is untouched.
-- **No explicit cap** → the `DEFAULT_MAX_TOKENS` (8 192) default applies
-  and the *budget* gives way: it is capped to
-  `max − MIN_ANSWER_TOKENS` (1 024), so an answer always has room under
-  the shared ceiling. A budget larger than any possible answer (e.g. the
-  user's `thinking = "16384"` from a DeepInfra setup) cannot work as
-  written; sending the adjusted pair beats the provider's 400, and only
-  the room-making adjustment applies.
-- Budget `0` stays "off" (no `thinking` field, temperature passes through).
-
-The model's own output cap is still enforced by the backend (it clamps
-and names the limit), so the added room on the explicit-cap path is
-backend-validated rather than pre-validated locally.
+Later generalized with protocol v2: the adapter merges the whole open
+`sampling` map verbatim (`top_k`, `stop_sequences`, … whatever the
+Messages API accepts) and only fills gaps — the `max_tokens` default and
+the budget-derived `thinking` block are sent solely for keys the user did
+not set, so an explicit `thinking`/`max_tokens` in `[sampling]` wins.

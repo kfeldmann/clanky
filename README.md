@@ -34,7 +34,7 @@ resource:
 
 | Resource            | On a name clash                          |
 | ------------------- | ---------------------------------------- |
-| `settings.toml`     | project field wins (per-field overlay); CLI flags win over both |
+| `settings.toml`     | project field wins (per-field overlay; `[sampling]` merges per key); CLI flags win over both |
 | prompt templates    | project `prompts/<name>.md` shadows the user one |
 | skills              | project `skills/<name>.md` shadows the user one |
 | `SYSTEM.md`/`AGENTS.md` | additive: read user first, project second, so project text lands later in the context (most backends weight later system messages more) |
@@ -50,8 +50,8 @@ All fields are optional; unknown keys are rejected with a parse error.
 | ---------- | ---------------- | -------------------------------------------------- |
 | `provider` | string           | Provider name (e.g. `deepinfra`)                   |
 | `model`    | string           | Model identifier as known to the provider          |
-| `thinking` | string           | Thinking budget or level (`1024`, `low`, `off`)    |
-| `sampling` | table of strings | Sampling parameters, e.g. `temperature = "0.7"`    |
+| `thinking` | string           | Thinking budget in tokens (`1024`) or `off`        |
+| `sampling` | table           | Sampling parameters passed to the provider verbatim, e.g. `temperature = 0.7` |
 | `max_tool_rounds` | integer  | Cap on chat rounds per turn (`0` = unlimited)       |
 | `max_retries` | integer       | Retries for a retryable provider error (`0` = never retry; default `5`) |
 | `prompt`   | string           | Prompt text (mainly useful on the CLI, not in a file) |
@@ -64,14 +64,23 @@ model = "meta-llama/Llama-3.3-70B-Instruct"
 thinking = "off"
 
 [sampling]
-temperature = "0.7"
-top_p = "0.9"
+temperature = 0.7
+top_p = 0.9
+repetition_penalty = 1.1
 ```
 
 Notes:
 
-- Sampling values stay strings in the file; the provider validates and
-  coerces them, so an invalid value fails at call time, not load time.
+- Sampling keys and values are passed to the provider backend **verbatim**:
+  any parameter the backend accepts works here (`seed`,
+  `repetition_penalty`, `reasoning_effort`, `top_k`, …) and the backend
+  validates them, so an invalid value fails at call time with the server's
+  own error — Clanky never rejects or rewrites a sampling value itself.
+  Values may be any TOML value; a string that is JSON (e.g. `"0.7"`) is sent
+  as that JSON value, so `temperature = "0.7"` and `temperature = 0.7` mean
+  the same thing (a string like `"high"` stays a string). The request's
+  structural fields (`model`, `messages`, `tools`, `stream`, …) are set by
+  the provider and cannot be overridden through `sampling`.
 - `max_retries` covers transient provider failures — rate limits (429
   `Model busy`), backend errors, and network timeouts. Retries use
   exponential backoff (500 ms, 1 s, 2 s, 4 s, 8 s), honoring a server
@@ -80,12 +89,31 @@ Notes:
   never replayed, so a retry cannot duplicate output. Set it on the CLI
   with `--max-retries`.
 - Precedence is per field: CLI flag > project file > user file, and a
-  scope only overrides fields it actually sets.
+  scope only overrides fields it actually sets. For `[sampling]` the merge
+  is per key: keys set in a higher layer win, and keys set only in a lower
+  layer are kept — `--sampling "top_p=0.9"` never drops a `temperature`
+  from `settings.toml`.
+
+### The `bash` tool
+
+Commands run in the project directory with **no timeout**: they run until
+they finish. If the model wants a deadline it passes `timeout_seconds`
+(any positive number of seconds) on the call — that voluntary timeout is
+honored, and the command is killed when it expires. Output sent to the
+model is capped at 20 000 characters (then `… (output truncated)`).
 
 ### Session precedence note
 
 Sessions always live in the **project scope** (`./.clanky/sessions/`);
 there is no user-scope session store.
+
+Sessions autosave as the conversation happens. When a turn is cut short —
+a provider error mid-stream, or `ctrl+c` quitting while the answer is
+still streaming — the partially streamed round (thinking and text) is
+consolidated and written anyway, so no streamed content is lost:
+`/resume` restores exactly what the terminal showed, and continuing the
+conversation (e.g. "please continue") sends the full chat as context.
+Partial tool calls and tool results that never completed are not kept.
 
 The transcript is printed straight to the terminal — no alternate
 screen, no mouse capture — so scrolling and copy/paste are your
@@ -165,10 +193,14 @@ Notes:
   the bare form, so a restricted key can be denied the alias with a 403.)
 - **Thinking maps to `reasoning_effort`.** Clanky's `--thinking <budget>` is
   translated onto LiteLLM's effort ladder (`none`/`minimal`/`low`/`medium`/
-  `high`/`xhigh`/`max`); `--thinking off` omits the field. Because the proxy
-  is heterogeneous, the plugin drops `reasoning_effort` (and `tools`) for a
-  model whose `/model/info` says it does not support them, instead of
-  provoking a 400.
+  `high`/`xhigh`/`max`); `--thinking off` omits the field. Values pass
+  through unconditionally and the proxy validates them: asking a model for
+  thinking or tools it cannot handle surfaces the proxy's own error (which
+  tells you to turn thinking off, or that tools are not supported) — nothing
+  is silently dropped. The heterogeneous catalog is handled at the picker
+  instead: the `/model` picker hides models whose `/model/info` says they
+  cannot call tools (a deal breaker for the agentic loop), though `--model`
+  can still name one and gets the server's answer.
 - **No built-in default model.** The proxy's catalog is arbitrary, so unless
   `LITELLM_MODEL` is set you must name a model (`model` in settings or
   `--model`). Clanky still defaults to the `deepinfra` provider, so a

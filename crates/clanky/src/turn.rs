@@ -91,7 +91,9 @@ pub enum TurnEvent {
     /// One chat round completed: the round's final text and thinking plus
     /// its parsed tool calls. The TUI renders from deltas and ignores
     /// this event; the session recorder uses it to store the round as
-    /// one record (see `session::Record::Assistant`).
+    /// one record (see `session::Record::Assistant`). A round cut short by
+    /// an error is flushed the same way with whatever it streamed before
+    /// the failure (`calls` empty), so nothing shown to the user is lost.
     Round {
         text: String,
         thinking: String,
@@ -133,8 +135,9 @@ pub struct TurnOutput {
 /// `messages` is the complete conversation so far, ending with the new
 /// user prompt (system context first). It is mutated in place: the turn's
 /// assistant rounds and tool results are appended even when the turn ends
-/// with an error (e.g. the tool-loop limit), so the caller keeps the
-/// partial context and the conversation stays continuable.
+/// with an error (e.g. the tool-loop limit or a provider failure
+/// mid-stream — the partial round's streamed text is kept too), so the
+/// caller keeps the partial context and the conversation stays continuable.
 pub fn run_turn(
     handler: Box<dyn Handler>,
     tools: &ToolSet,
@@ -169,7 +172,7 @@ pub fn run_turn_with<T: Transport>(
     };
 
     let model = config.model.clone().ok_or(Error::NoModel)?;
-    let sampling = sampling_from(&config.sampling)?;
+    let sampling = sampling_from(&config.sampling);
     let thinking = thinking_from(&config.thinking)?;
 
     let mut text = String::new();
@@ -188,16 +191,16 @@ pub fn run_turn_with<T: Transport>(
             model: model.clone(),
             messages: messages.clone(),
             tools: wire_tools.clone(),
-            sampling,
+            sampling: sampling.clone(),
             thinking,
         };
         // One chat round, retried on retryable provider failures. The
         // stream is replayed from scratch on every attempt, so a retry is
         // only allowed while nothing has been streamed yet: once text or a
         // tool call reached the caller, replaying would duplicate it. A
-        // mid-stream timeout therefore only retries when it hit before the
+        // mid-stream failure therefore only retries when it hit before the
         // first chunk — the common case for DeepInfra's `Model busy` 429s
-        // and connect/read timeouts.
+        // and connect timeouts.
         let (assembler, done) = {
             let mut attempt: u32 = 0;
             loop {
@@ -227,6 +230,7 @@ pub fn run_turn_with<T: Transport>(
                     Ok(done) => break (assembler, done),
                     Err(err) => {
                         if !is_retryable(&err) || streamed || attempt >= max_retries {
+                            flush_partial_round(&assembler, messages, on_event);
                             return Err(err.into());
                         }
                         attempt += 1;
@@ -287,6 +291,36 @@ pub fn run_turn_with<T: Transport>(
             let output = execute_tool_call(tools, call, on_event);
             messages.push(ChatMessage::tool(call.id.clone(), output));
         }
+    }
+}
+
+/// Consolidate a round cut short by an error and keep what it streamed.
+/// The partial text and thinking are emitted as one [`TurnEvent::Round`],
+/// exactly the consolidation a completed round emits, and the partial
+/// text joins the conversation so a follow-up turn sends everything the
+/// user saw. Half-assembled tool calls are dropped (their arguments may
+/// be truncated and nothing executed them); a round that streamed
+/// nothing is not emitted at all.
+fn flush_partial_round(
+    assembler: &StreamAssembler,
+    messages: &mut Vec<ChatMessage>,
+    on_event: &mut dyn FnMut(TurnEvent),
+) {
+    let text = assembler.text().to_string();
+    let thinking = assembler.thinking().to_string();
+    if text.is_empty() && thinking.is_empty() {
+        return;
+    }
+    on_event(TurnEvent::Round {
+        text: text.clone(),
+        thinking,
+        calls: Vec::new(),
+    });
+    if !text.is_empty() {
+        messages.push(ChatMessage::Assistant {
+            content: text,
+            tool_calls: None,
+        });
     }
 }
 
@@ -378,41 +412,41 @@ fn tool_names(tools: &ToolSet) -> String {
         .join(", ")
 }
 
-/// Convert settings sampling parameters (string key/value pairs) into
-/// protocol sampling. Unknown keys are rejected so typos surface loudly.
-pub(crate) fn sampling_from(params: &Option<SamplingParams>) -> Result<Option<Sampling>> {
-    let Some(params) = params else {
-        return Ok(None);
-    };
-    let mut sampling = Sampling::default();
-    for (key, raw) in params {
-        match key.as_str() {
-            "temperature" => sampling.temperature = Some(parse_f64(raw, key)?),
-            "top_p" => sampling.top_p = Some(parse_f64(raw, key)?),
-            "max_tokens" => {
-                sampling.max_tokens = Some(raw.trim().parse().map_err(|_| {
-                    Error::InvalidSampling(format!("{key} must be an integer, got `{raw}`"))
-                })?)
-            }
-            other => {
-                return Err(Error::InvalidSampling(format!(
-                    "unknown sampling parameter `{other}`; supported: temperature, top_p, max_tokens"
-                )));
-            }
+/// Convert settings/CLI sampling parameters into protocol sampling.
+///
+/// Pure pass-through (project invariant: no local validation): every key
+/// and value reaches the provider unchanged — arbitrary backend parameters
+/// like `repetition_penalty`, `seed`, or `reasoning_effort` included — and
+/// the backend validates them. The only interpretation is decoding: values
+/// that arrive as untyped strings (settings strings, `--sampling`,
+/// `/sampling`) are parsed as JSON when they are JSON
+/// (`"0.7"` → `0.7`, `"[1, 2]"` → `[1, 2]`) and kept as strings otherwise
+/// (`"high"`), so `temperature = "0.7"` and `temperature = 0.7` mean the
+/// same thing.
+pub(crate) fn sampling_from(params: &Option<SamplingParams>) -> Option<Sampling> {
+    let params = params.as_ref()?;
+    Some(
+        params
+            .iter()
+            .map(|(key, value)| (key.clone(), decode_value(value)))
+            .collect(),
+    )
+}
+
+/// Decode one sampling value for the wire; see [`sampling_from`].
+fn decode_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(raw) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.clone()))
         }
+        other => other.clone(),
     }
-    Ok(Some(sampling))
 }
 
-fn parse_f64(raw: &str, key: &str) -> Result<f64> {
-    raw.trim()
-        .parse()
-        .map_err(|_| Error::InvalidSampling(format!("{key} must be a number, got `{raw}`")))
-}
-
-/// Interpret the `--thinking` value: `off` disables thinking; a non-negative
-/// integer is a token budget. Named levels map onto budgets in the provider
-/// adapter (M1 keeps the protocol shaped by budget).
+/// Interpret the `--thinking` value: `off` (or empty) disables thinking; a
+/// non-negative integer is a token budget. Named levels (e.g. `low`) are not
+/// accepted: the protocol carries only a token budget, and each provider
+/// adapter maps budgets onto its own vocabulary.
 fn thinking_from(value: &Option<String>) -> Result<Option<Thinking>> {
     match value.as_deref() {
         Some(raw) => parse_thinking(raw),
@@ -593,6 +627,7 @@ mod tests {
                 display_name: None,
                 context_window: None,
                 supports_thinking: None,
+                supports_tools: None,
                 supports_text_generation: None,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
@@ -1054,34 +1089,48 @@ mod tests {
             ("max_tokens", "512"),
         ]
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
         .collect();
-        let sampling = sampling_from(&Some(params)).unwrap().unwrap();
+        let sampling = sampling_from(&Some(params)).unwrap();
         assert_eq!(
             sampling,
-            Sampling {
-                temperature: Some(0.7),
-                top_p: Some(0.9),
-                max_tokens: Some(512)
-            }
+            Sampling::from_iter([
+                ("temperature".into(), json!(0.7)),
+                ("top_p".into(), json!(0.9)),
+                ("max_tokens".into(), json!(512)),
+            ])
         );
     }
 
     #[test]
-    fn sampling_rejects_unknown_keys_and_bad_values() {
-        let params: SamplingParams = [("foo", "1")]
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let err = sampling_from(&Some(params)).unwrap_err();
-        assert!(err.to_string().contains("unknown sampling parameter `foo`"));
+    fn sampling_passes_arbitrary_keys_and_values_through() {
+        // No whitelist, no value checks: whatever the user sets reaches the
+        // provider verbatim and the backend validates it. Unparsable strings
+        // stay strings; already-typed values pass through unchanged.
+        let params: SamplingParams = [
+            ("repetition_penalty", Value::String("1.1".into())),
+            ("reasoning_effort", Value::String("high".into())),
+            ("seed", Value::from(42)),
+            ("stop", Value::Array(vec![Value::String("\n\n".into())])),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let sampling = sampling_from(&Some(params)).unwrap();
+        assert_eq!(
+            sampling,
+            Sampling::from_iter([
+                ("reasoning_effort".into(), json!("high")),
+                ("repetition_penalty".into(), json!(1.1)),
+                ("seed".into(), json!(42)),
+                ("stop".into(), json!(["\n\n"])),
+            ])
+        );
+    }
 
-        let params: SamplingParams = [("temperature", "hot")]
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let err = sampling_from(&Some(params)).unwrap_err();
-        assert!(err.to_string().contains("must be a number"));
+    #[test]
+    fn sampling_from_none_is_none() {
+        assert_eq!(sampling_from(&None), None);
     }
 
     #[test]
@@ -1267,6 +1316,105 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TurnEvent::Retrying { .. }))
         );
+    }
+
+    #[test]
+    fn a_mid_stream_failure_flushes_the_partial_round() {
+        // A provider dying mid-round must keep what reached the user: the
+        // streamed thinking and text are consolidated into one `Round`
+        // event and the partial text joins the conversation, so the next
+        // turn sends the full chat. A half-assembled tool call is dropped.
+        struct DyingStream;
+        impl Handler for DyingStream {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "dying".into(),
+                    capabilities: Capabilities::default(),
+                    default_model: None,
+                }
+            }
+            fn list_models(
+                &mut self,
+            ) -> std::result::Result<Vec<ModelInfo>, clanky_protocol::Error> {
+                Ok(vec![])
+            }
+            fn chat(
+                &mut self,
+                _request: &ChatRequest,
+                sink: &mut dyn FnMut(ChunkPayload),
+            ) -> std::result::Result<ChatDone, clanky_protocol::Error> {
+                sink(ChunkPayload::Thinking {
+                    text: "reason".into(),
+                });
+                sink(ChunkPayload::Text {
+                    text: "partial".into(),
+                });
+                sink(ChunkPayload::ToolCallStart {
+                    index: 0,
+                    id: "call_1".into(),
+                    name: "echo_tool".into(),
+                });
+                sink(ChunkPayload::ToolCallArgs {
+                    index: 0,
+                    args_chunk: r#"{"input": "half"#.into(),
+                });
+                Err(retryable("backend: timed out reading response"))
+            }
+        }
+        let mut messages = vec![ChatMessage::system("Be terse."), ChatMessage::user("hi")];
+        let sink = RefCell::new(Vec::new());
+        let output = run_turn(
+            Box::new(DyingStream),
+            &toolset(),
+            &mut messages,
+            &config("mock/model"),
+            &mut |event| sink.borrow_mut().push(event),
+        );
+        assert!(output.is_err());
+        // The partial round is consolidated and emitted like a completed one.
+        assert_eq!(
+            sink.borrow().last(),
+            Some(&TurnEvent::Round {
+                text: "partial".into(),
+                thinking: "reason".into(),
+                calls: vec![],
+            })
+        );
+        // The partial text joined the conversation; the half tool call did not.
+        assert_eq!(messages.len(), 3, "system, user, partial assistant");
+        assert!(matches!(
+            &messages[2],
+            ChatMessage::Assistant {
+                content,
+                tool_calls: None,
+            } if content == "partial"
+        ));
+    }
+
+    #[test]
+    fn a_failure_before_the_first_chunk_flushes_nothing() {
+        // Nothing streamed, so there is nothing to consolidate; an empty
+        // round must not reach the session recorder or the history.
+        let handler = MockHandler::failing(retryable("429: Model busy"));
+        let mut messages = vec![ChatMessage::user("hi")];
+        let sink = RefCell::new(Vec::new());
+        let output = run_turn(
+            Box::new(handler),
+            &toolset(),
+            &mut messages,
+            &config("mock/model"),
+            &mut |event| sink.borrow_mut().push(event),
+        );
+        assert!(output.is_err());
+        assert!(
+            !sink
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Round { .. })),
+            "no round to flush: {:?}",
+            sink.borrow()
+        );
+        assert_eq!(messages.len(), 1, "nothing appended to the conversation");
     }
 
     #[test]

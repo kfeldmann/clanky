@@ -147,29 +147,34 @@ impl<B: Backend> Handler for DeepInfraProvider<B> {
 impl<B: Backend> DeepInfraProvider<B> {
     /// Build the OpenAI-compatible request body for a chat request.
     /// Streaming-first: SSE deltas come back as OpenAI-style chunks.
+    ///
+    /// `sampling` entries pass through to the backend verbatim (spec §5):
+    /// arbitrary backend parameters work and the backend validates them.
+    /// The request's own structural fields belong to the protocol and are
+    /// set here afterwards, so they cannot be overridden through `sampling`.
     fn build_request_body(&self, request: &ChatRequest) -> Result<String, Error> {
-        let mut body = json!({
-            "model": request.model,
-            "messages": openai_messages(&request.messages)?,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
-        let obj = body.as_object_mut().unwrap();
+        let mut body = json!({});
+        let obj = body.as_object_mut().expect("object literal");
+        if let Some(sampling) = &request.sampling {
+            for (key, value) in sampling.iter() {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        obj.insert("model".into(), json!(request.model));
+        obj.insert(
+            "messages".into(),
+            Value::Array(openai_messages(&request.messages)?),
+        );
+        obj.insert("stream".into(), json!(true));
+        obj.insert("stream_options".into(), json!({"include_usage": true}));
         if let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty()) {
             obj.insert("tools".into(), openai_tools(tools));
         }
-        if let Some(sampling) = request.sampling {
-            if let Some(t) = sampling.temperature {
-                obj.insert("temperature".into(), json!(t));
-            }
-            if let Some(p) = sampling.top_p {
-                obj.insert("top_p".into(), json!(p));
-            }
-            if let Some(m) = sampling.max_tokens {
-                obj.insert("max_tokens".into(), json!(m));
-            }
-        }
-        if let Some(effort) = request.thinking.and_then(reasoning_effort) {
+        // The thinking → `reasoning_effort` mapping only fills the gap: a
+        // `reasoning_effort` the user set in `sampling` wins over it.
+        if !obj.contains_key("reasoning_effort")
+            && let Some(effort) = request.thinking.and_then(reasoning_effort)
+        {
             obj.insert("reasoning_effort".into(), json!(effort));
         }
         serde_json::to_string(&body)
@@ -337,6 +342,7 @@ fn parse_models(body: &str) -> Result<Vec<ModelInfo>, Error> {
                 display_name,
                 context_window,
                 supports_thinking: None,
+                supports_tools: None,
                 supports_text_generation,
                 input_price_per_mtok: price("input_tokens"),
                 output_price_per_mtok: price("output_tokens"),
@@ -601,11 +607,11 @@ mod tests {
                 ChatMessage::user("say hi"),
             ],
             tools: None,
-            sampling: Some(Sampling {
-                temperature: Some(0.5),
-                top_p: Some(0.9),
-                max_tokens: Some(256),
-            }),
+            sampling: Some(Sampling::from_iter([
+                ("temperature".into(), json!(0.5)),
+                ("top_p".into(), json!(0.9)),
+                ("max_tokens".into(), json!(256)),
+            ])),
             thinking: None,
         }
     }
@@ -710,6 +716,59 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "say hi");
+    }
+
+    #[test]
+    fn arbitrary_sampling_parameters_pass_through_verbatim() {
+        let mut provider = DeepInfraProvider::new(
+            MockBackend::new(vec![done_chunk("stop")], "[]"),
+            "https://x.invalid",
+        );
+        let mut request = simple_request();
+        request.sampling = Some(Sampling::from_iter([
+            ("repetition_penalty".into(), json!(1.1)),
+            ("seed".into(), json!(42)),
+            ("reasoning_effort".into(), json!("high")),
+            // Structural fields belong to the protocol and cannot be
+            // overridden through `sampling`.
+            ("stream".into(), json!(false)),
+        ]));
+        provider.chat(&request, &mut |_| {}).unwrap();
+        let body: Value = serde_json::from_str(&provider.backend.posts.borrow()[0].1).unwrap();
+        assert_eq!(body["repetition_penalty"], 1.1);
+        assert_eq!(body["seed"], 42);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn thinking_fills_reasoning_effort_only_when_unset() {
+        let thinking = Thinking {
+            budget_tokens: Some(1024),
+        };
+        let mut provider = DeepInfraProvider::new(
+            MockBackend::new(vec![done_chunk("stop"), done_chunk("stop")], "[]"),
+            "https://x.invalid",
+        );
+
+        let mut request = simple_request();
+        request.thinking = Some(thinking);
+        provider.chat(&request, &mut |_| {}).unwrap();
+        let body: Value = serde_json::from_str(&provider.backend.posts.borrow()[0].1).unwrap();
+        assert_eq!(body["reasoning_effort"], "low", "derived from the budget");
+
+        let mut request = simple_request();
+        request.thinking = Some(thinking);
+        request.sampling = Some(Sampling::from_iter([(
+            "reasoning_effort".into(),
+            json!("none"),
+        )]));
+        provider.chat(&request, &mut |_| {}).unwrap();
+        let body: Value = serde_json::from_str(&provider.backend.posts.borrow()[1].1).unwrap();
+        assert_eq!(
+            body["reasoning_effort"], "none",
+            "a user-set `reasoning_effort` wins over the derived mapping"
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@
 //! 3. CLI flags
 //!
 //! Layering is per-field: a scope only overrides fields it actually sets.
+//! The `sampling` map merges per key: a higher layer wins key-by-key and
+//! keys it does not set are kept from lower layers.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -15,10 +17,12 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::error::{Error, Result};
 
-/// Sampling parameters as `key -> raw value` strings
-/// (e.g. `"temperature" -> "0.7"`). Values stay strings for now; the
-/// provider validates and coerces them (M1/M2).
-pub type SamplingParams = BTreeMap<String, String>;
+/// Sampling parameters as `key -> value` pairs, e.g. `"temperature" ->
+/// 0.7`. Values may be any TOML value and are passed to the provider
+/// verbatim (the backend validates them); untyped strings are decoded as
+/// JSON when they parse as JSON (see `turn::sampling_from`), so
+/// `temperature = "0.7"` and `temperature = 0.7` mean the same thing.
+pub type SamplingParams = BTreeMap<String, serde_json::Value>;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -27,9 +31,10 @@ pub struct Settings {
     pub provider: Option<String>,
     /// Model identifier as known to the provider.
     pub model: Option<String>,
-    /// Thinking budget or level (e.g. `1024`, `low`, `off`).
+    /// Thinking budget in tokens (e.g. `1024`) or `off`.
     pub thinking: Option<String>,
-    /// Sampling parameters.
+    /// Sampling parameters. Merged per key across layers: keys set in a
+    /// higher layer (project file, then CLI) win; other keys are kept.
     pub sampling: Option<SamplingParams>,
     /// Tool-loop round cap for one turn (`0` = unlimited). Unset means the
     /// built-in default.
@@ -85,6 +90,8 @@ impl Settings {
     }
 
     /// Overlay `over` on top of `self`: fields set in `over` win.
+    /// `sampling` merges per key rather than wholesale, so a key supplied
+    /// in only one layer is never dropped.
     pub fn overlay(&mut self, over: Settings) {
         if over.provider.is_some() {
             self.provider = over.provider;
@@ -95,8 +102,11 @@ impl Settings {
         if over.thinking.is_some() {
             self.thinking = over.thinking;
         }
-        if over.sampling.is_some() {
-            self.sampling = over.sampling;
+        if let Some(over_sampling) = over.sampling {
+            match &mut self.sampling {
+                Some(base) => base.extend(over_sampling),
+                None => self.sampling = Some(over_sampling),
+            }
         }
         if over.max_tool_rounds.is_some() {
             self.max_tool_rounds = over.max_tool_rounds;
@@ -117,7 +127,7 @@ mod tests {
     fn sampling(pairs: &[(&str, &str)]) -> SamplingParams {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect()
     }
 
@@ -155,7 +165,7 @@ mod tests {
         assert_eq!(merged.model.as_deref(), Some("project-model"));
         assert_eq!(
             merged.sampling.as_ref().unwrap().get("temperature"),
-            Some(&"0.7".to_string())
+            Some(&serde_json::Value::String("0.7".into()))
         );
 
         std::fs::remove_file(user).unwrap();
@@ -193,7 +203,71 @@ mod tests {
         assert_eq!(settings.model.as_deref(), Some("cli-model"));
         assert_eq!(
             settings.sampling.as_ref().unwrap().get("temperature"),
-            Some(&"0.5".to_string())
+            Some(&serde_json::Value::String("0.5".into()))
         );
+    }
+
+    #[test]
+    fn sampling_merges_per_key_across_scopes() {
+        // Keys supplied in only one scope must survive the merge; only the
+        // key set in both is taken from the later scope.
+        let tmp = std::env::temp_dir();
+        let user = write_temp_settings(
+            &tmp.join("clanky-test-sampling-merge-user"),
+            "[sampling]\ntemperature = \"0.7\"\nseed = 42\n",
+        );
+        let project = write_temp_settings(
+            &tmp.join("clanky-test-sampling-merge-project"),
+            "[sampling]\ntop_p = \"0.9\"\nseed = 7\n",
+        );
+        let merged = Settings::load_from_paths(&[user.clone(), project.clone()]).unwrap();
+        let sampling = merged.sampling.as_ref().unwrap();
+
+        assert_eq!(sampling["temperature"], serde_json::json!("0.7"));
+        assert_eq!(sampling["top_p"], serde_json::json!("0.9"));
+        assert_eq!(sampling["seed"], serde_json::json!(7));
+
+        std::fs::remove_file(user).unwrap();
+        std::fs::remove_file(project).unwrap();
+    }
+
+    #[test]
+    fn sampling_merges_per_key_from_cli() {
+        let mut settings = Settings {
+            sampling: Some(sampling(&[("temperature", "0.7"), ("seed", "42")])),
+            ..Settings::default()
+        };
+        settings.overlay(Settings {
+            sampling: Some(sampling(&[("top_p", "0.9"), ("seed", "7")])),
+            ..Settings::default()
+        });
+        let sampling = settings.sampling.as_ref().unwrap();
+
+        assert_eq!(sampling["temperature"], serde_json::json!("0.7"));
+        assert_eq!(sampling["top_p"], serde_json::json!("0.9"));
+        assert_eq!(sampling["seed"], serde_json::json!("7"));
+    }
+
+    #[test]
+    fn sampling_values_of_any_toml_type_load() {
+        // Numbers, booleans, arrays, tables: whatever the user writes in
+        // `[sampling]` is accepted as-is — validation is the backend's job.
+        let tmp = std::env::temp_dir().join("clanky-test-sampling-types");
+        let path = write_temp_settings(
+            &tmp,
+            "[sampling]\n\
+             temperature = 0.7\n\
+             seed = 42\n\
+             stop = [\"\\n\\n\"]\n\
+             repetition_penalty = 1.1\n",
+        );
+        let merged = Settings::load_from_paths(std::slice::from_ref(&path)).unwrap();
+        let sampling = merged.sampling.as_ref().unwrap();
+        assert_eq!(sampling["temperature"], serde_json::json!(0.7));
+        assert_eq!(sampling["seed"], serde_json::json!(42));
+        assert_eq!(sampling["stop"], serde_json::json!(["\n\n"]));
+        assert_eq!(sampling["repetition_penalty"], serde_json::json!(1.1));
+
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -72,6 +72,7 @@ use std::time::Duration;
 use clanky_protocol::{ChatMessage, ModelInfo};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use serde_json::Value;
 
 use crate::error::Result;
 use crate::export::{self, ExportOptions};
@@ -501,6 +502,18 @@ fn picker_for(kind: &PickerKind) -> picker::Picker {
     picker::Picker::new(title, items)
 }
 
+/// Streamed deltas of the chat round currently in flight. Deltas are
+/// shown as they arrive but only recorded once the round completes (as
+/// one consolidated record), so this accumulator is what an interrupted
+/// turn — a provider error, or ctrl+c mid-stream — consolidates and
+/// writes to make sure nothing shown on screen is lost (see
+/// [`SessionState::flush_partial`]).
+#[derive(Debug, Default)]
+struct PartialRound {
+    thinking: String,
+    text: String,
+}
+
 /// Autosave state: the open session file, lazily created on the first
 /// record. All file access happens on the UI thread; the worker only
 /// streams events over the channel.
@@ -510,6 +523,8 @@ struct SessionState {
     writer: Option<SessionWriter>,
     /// Name requested via `/name` before any file exists yet.
     pending_name: Option<String>,
+    /// Streamed deltas not yet consolidated into a round record.
+    partial: PartialRound,
 }
 
 impl SessionState {
@@ -519,6 +534,7 @@ impl SessionState {
             launch,
             writer: None,
             pending_name: None,
+            partial: PartialRound::default(),
         }
     }
 
@@ -541,6 +557,48 @@ impl SessionState {
         {
             app.entries
                 .push(app::Entry::Error(format!("session not saved: {err}")));
+        }
+    }
+
+    /// Accumulate one streamed delta into the in-flight round.
+    fn accumulate(&mut self, delta: &str, thinking: bool) {
+        let slot = if thinking {
+            &mut self.partial.thinking
+        } else {
+            &mut self.partial.text
+        };
+        slot.push_str(delta);
+    }
+
+    /// The round completed and its records were written; they supersede
+    /// the deltas accumulated for the same content.
+    fn clear_partial(&mut self) {
+        self.partial = PartialRound::default();
+    }
+
+    /// Consolidate the in-flight round's accumulated deltas into the same
+    /// records a completed round writes (thinking first, then text), so a
+    /// turn cut short by an error or ctrl+c loses nothing. Writes nothing
+    /// when the last round completed normally. Partial tool calls are not
+    /// kept: they never reached the screen and nothing executed them.
+    fn flush_partial(&mut self, app: &mut app::App) {
+        let partial = std::mem::take(&mut self.partial);
+        if !partial.thinking.is_empty() {
+            self.record(
+                app,
+                session::Record::Thinking {
+                    text: partial.thinking,
+                },
+            );
+        }
+        if !partial.text.is_empty() {
+            self.record(
+                app,
+                session::Record::Assistant {
+                    text: partial.text,
+                    calls: Vec::new(),
+                },
+            );
         }
     }
 
@@ -911,8 +969,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                                     launch.provider
                                 )));
                             } else if picker.is_none() {
-                                let kind =
-                                    PickerKind::Models(text_generation_models(&catalog.models));
+                                let kind = PickerKind::Models(chat_capable_models(&catalog.models));
                                 picker = Some((picker_for(&kind), kind));
                             }
                         }
@@ -991,7 +1048,29 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
             dirty = false;
         }
     }
+    // Ctrl+C/Ctrl+Q/Ctrl+D quits mid-turn without waiting for the worker:
+    // record what it already sent, then consolidate the in-flight round's
+    // deltas, so `/resume` restores exactly what the terminal showed.
+    drain_turn_events(&rx, &mut state, &mut app);
+    state.flush_partial(&mut app);
     Ok(())
+}
+
+/// Drain the turn events that arrived before the quit, recording them
+/// exactly as the live loop does: a round or tool result that completed
+/// just before ctrl+c must be kept too. The turn's `Done` is dropped —
+/// the process is exiting, and an error that never reached the screen
+/// must not reach the resumed transcript either.
+fn drain_turn_events(
+    rx: &mpsc::Receiver<WorkerEvent>,
+    state: &mut SessionState,
+    app: &mut app::App,
+) {
+    while let Ok(event) = rx.try_recv() {
+        if let WorkerEvent::Turn(turn_event) = event {
+            record_turn_event(state, app, &turn_event);
+        }
+    }
 }
 
 /// ctrl+e (M7): suspend the TUI, edit the prompt buffer in `$EDITOR`,
@@ -1030,6 +1109,9 @@ fn record_turn_event(state: &mut SessionState, app: &mut app::App, event: &TurnE
             thinking,
             calls,
         } => {
+            // The records written below supersede the deltas accumulated
+            // for this round.
+            state.clear_partial();
             if !thinking.is_empty() {
                 state.record(
                     app,
@@ -1060,21 +1142,26 @@ fn record_turn_event(state: &mut SessionState, app: &mut app::App, event: &TurnE
         TurnEvent::Usage { usage } => {
             state.record(app, session::usage_record(*usage));
         }
+        // Streaming deltas are accumulated and consolidated into the
+        // round's records when the round completes (or is cut short; see
+        // `SessionState::flush_partial`).
+        TurnEvent::Text { delta } => state.accumulate(delta, false),
+        TurnEvent::Thinking { delta } => state.accumulate(delta, true),
         // Retry notices are UI-only: they are not conversation content,
         // so nothing is recorded in the session file.
-        TurnEvent::Text { .. }
-        | TurnEvent::Thinking { .. }
-        | TurnEvent::ToolCall { .. }
-        | TurnEvent::Retrying { .. } => {}
+        TurnEvent::ToolCall { .. } | TurnEvent::Retrying { .. } => {}
     }
 }
 
 /// Map a finished turn onto session records (error; usage is recorded
 /// round-by-round in `record_turn_event`) and update the conversation
-/// history. The history is adopted even when the turn
-/// failed, so the model sees the partial context (its prompt, rounds and
-/// tool results) on the next turn.
+/// history. Anything the last round streamed without completing — an
+/// error or a quit usually cuts it short — is consolidated and written
+/// first (content, then the error), as on screen. The history is adopted
+/// even when the turn failed, so the model sees the partial context (its
+/// prompt, rounds and tool results) on the next turn.
 fn record_done(state: &mut SessionState, app: &mut app::App, done: &TurnEnd) {
+    state.flush_partial(app);
     match &done.result {
         Ok(_) => {}
         Err(err) => {
@@ -1281,7 +1368,7 @@ fn handle_command(
         Command::Model(None) => {
             // An already-fetched catalog opens the picker instantly.
             if !catalog.models.is_empty() && catalog.provider == launch.provider {
-                Action::OpenPicker(PickerKind::Models(text_generation_models(&catalog.models)))
+                Action::OpenPicker(PickerKind::Models(chat_capable_models(&catalog.models)))
             } else {
                 app.entries.push(app::Entry::Info(format!(
                     "loading models from {}…",
@@ -1413,8 +1500,8 @@ fn switch_provider(
 }
 
 /// Apply a `/sampling` edit to the launch config, reporting as an entry.
-/// Parameter values are validated the same way turns validate them, so
-/// typos surface immediately instead of at the next turn.
+/// Parameters are pass-through: keys and values are not validated here (or
+/// at turn time) — the provider backend validates them at call time.
 fn apply_sampling(launch: &mut Launch, edit: &SamplingEdit, app: &mut app::App) {
     match edit {
         SamplingEdit::Show => {
@@ -1431,14 +1518,9 @@ fn apply_sampling(launch: &mut Launch, edit: &SamplingEdit, app: &mut app::App) 
                 .push(app::Entry::Info("sampling parameters cleared".into()));
         }
         SamplingEdit::Set(pairs) => {
-            let merged: SamplingParams = pairs.iter().cloned().collect();
-            if let Err(err) = crate::turn::sampling_from(&Some(merged)) {
-                app.entries.push(app::Entry::Error(err.to_string()));
-                return;
-            }
             let current = launch.sampling.get_or_insert_with(SamplingParams::new);
             for (key, value) in pairs {
-                current.insert(key.clone(), value.clone());
+                current.insert(key.clone(), Value::String(value.clone()));
             }
             app.entries.push(app::Entry::Info(format!(
                 "sampling: {}",
@@ -1462,11 +1544,14 @@ fn apply_sampling(launch: &mut Launch, edit: &SamplingEdit, app: &mut app::App) 
     }
 }
 
-/// `key=value` pairs joined for display.
+/// `key=value` pairs joined for display; string values are shown raw.
 fn describe_sampling(params: &SamplingParams) -> String {
     params
         .iter()
-        .map(|(key, value)| format!("{key}={value}"))
+        .map(|(key, value)| match value {
+            Value::String(raw) => format!("{key}={raw}"),
+            other => format!("{key}={other}"),
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1488,12 +1573,16 @@ fn apply_template(app: &mut app::App, template: &Template, extra: Option<&str>) 
     )));
 }
 
-/// Models usable as a chat brain: text-generation capable, per the
-/// provider's catalog. Unknown capability stays — can't confirm it can't.
-fn text_generation_models(models: &[ModelInfo]) -> Vec<ModelInfo> {
+/// Models the `/model` picker offers: text-generation and tool capable, per
+/// the provider's catalog. Clanky is agentic — a model that cannot call
+/// tools cannot drive the loop — so tool-less models are deal breakers and
+/// the picker hides them. Unknown capability stays — can't confirm it
+/// can't. Picker curation, not enforcement: `--model`/settings name a model
+/// directly and the backend's own error for it is surfaced unchanged.
+fn chat_capable_models(models: &[ModelInfo]) -> Vec<ModelInfo> {
     models
         .iter()
-        .filter(|m| m.supports_text_generation != Some(false))
+        .filter(|m| m.supports_text_generation != Some(false) && m.supports_tools != Some(false))
         .cloned()
         .collect()
 }
@@ -1805,6 +1894,7 @@ mod tests {
             display_name: Some("Llama 3".into()),
             context_window: Some(8192),
             supports_thinking: Some(true),
+            supports_tools: Some(true),
             supports_text_generation: Some(true),
             input_price_per_mtok: Some(0.4),
             output_price_per_mtok: Some(1.2),
@@ -1886,6 +1976,7 @@ mod tests {
                 display_name: None,
                 context_window: None,
                 supports_thinking: None,
+                supports_tools: None,
                 supports_text_generation: None,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
@@ -1899,6 +1990,7 @@ mod tests {
                 display_name: Some("Model".into()),
                 context_window: Some(4096),
                 supports_thinking: Some(true),
+                supports_tools: Some(true),
                 supports_text_generation: Some(true),
                 input_price_per_mtok: Some(0.09),
                 output_price_per_mtok: Some(0.18),
@@ -1913,6 +2005,7 @@ mod tests {
                 display_name: None,
                 context_window: None,
                 supports_thinking: None,
+                supports_tools: None,
                 supports_text_generation: None,
                 input_price_per_mtok: Some(2.0),
                 output_price_per_mtok: Some(1.5),
@@ -1923,21 +2016,23 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_filters_out_non_text_generation_models() {
-        let model = |id: &str, text: Option<bool>| ModelInfo {
+    fn model_picker_filters_out_models_that_cannot_chat_or_call_tools() {
+        let model = |id: &str, text: Option<bool>, tools: Option<bool>| ModelInfo {
             id: id.into(),
             display_name: None,
             context_window: None,
             supports_thinking: None,
+            supports_tools: tools,
             supports_text_generation: text,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             cache_read_price_per_mtok: None,
         };
-        let filtered = text_generation_models(&[
-            model("chat/model", Some(true)),
-            model("embed/model", Some(false)),
-            model("unknown/model", None),
+        let filtered = chat_capable_models(&[
+            model("chat/model", Some(true), Some(true)),
+            model("embed/model", Some(false), None),
+            model("plain/model", Some(true), Some(false)),
+            model("unknown/model", None, None),
         ]);
         let ids: Vec<&str> = filtered.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["chat/model", "unknown/model"]);
@@ -1963,7 +2058,7 @@ mod tests {
     }
 
     #[test]
-    fn sampling_edits_apply_and_validate() {
+    fn sampling_edits_apply_and_merge() {
         let mut cfg = launch();
         let mut app = app::App::new();
 
@@ -1978,7 +2073,7 @@ mod tests {
         );
         assert_eq!(
             cfg.sampling.as_ref().unwrap().get("temperature"),
-            Some(&"0.7".to_string())
+            Some(&Value::String("0.7".into()))
         );
         apply_sampling(
             &mut cfg,
@@ -1987,16 +2082,18 @@ mod tests {
         );
         assert_eq!(cfg.sampling.as_ref().unwrap().len(), 2, "set merges");
 
+        // No local validation: any key with any value is accepted here —
+        // the provider backend validates it at call time.
         apply_sampling(
             &mut cfg,
-            &SamplingEdit::Set(vec![("temperature".into(), "hot".into())]),
+            &SamplingEdit::Set(vec![("reasoning_effort".into(), "high".into())]),
             &mut app,
         );
-        assert!(matches!(app.entries.last(), Some(app::Entry::Error(_))));
+        assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
         assert_eq!(
-            cfg.sampling.as_ref().unwrap().get("temperature"),
-            Some(&"0.7".to_string()),
-            "rejected edit leaves the old value"
+            cfg.sampling.as_ref().unwrap().get("reasoning_effort"),
+            Some(&Value::String("high".into())),
+            "arbitrary backend parameters apply like any other"
         );
 
         apply_sampling(
@@ -2011,7 +2108,7 @@ mod tests {
         );
         assert_eq!(
             cfg.sampling.as_ref().unwrap().get("top_p"),
-            Some(&"0.9".to_string())
+            Some(&Value::String("0.9".into()))
         );
 
         apply_sampling(&mut cfg, &SamplingEdit::Clear, &mut app);
@@ -2181,6 +2278,7 @@ mod tests {
             launch: launch(),
             writer: Some(writer),
             pending_name: None,
+            partial: PartialRound::default(),
         };
         (state, dir)
     }
@@ -2311,5 +2409,183 @@ mod tests {
         push_system_report(&mut app, &[]);
         assert_eq!(app.entries.len(), 1);
         assert!(matches!(app.entries[0], app::Entry::Info(_)));
+    }
+
+    /// A `SessionState` that records into its own scratch directory under
+    /// a known file name (tests run in parallel, so nothing may be shared).
+    fn recording_state(tag: &str) -> (SessionState, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-flush-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = SessionState::new(launch());
+        state.dir = dir.clone();
+        state.pending_name = Some("session".into());
+        (state, dir)
+    }
+
+    #[test]
+    fn quitting_mid_stream_consolidates_and_writes_the_partial_round() {
+        // Ctrl+C cut the stream before any `Round` arrived: the flush
+        // consolidates the accumulated deltas into the same records a
+        // completed round writes, thinking first, so nothing shown on
+        // screen is lost and `/resume` restores the conversation.
+        let (mut state, dir) = recording_state("quit");
+        let mut app = app::App::new();
+        for event in [
+            TurnEvent::Thinking {
+                delta: "let me ".into(),
+            },
+            TurnEvent::Thinking {
+                delta: "think".into(),
+            },
+            TurnEvent::Text {
+                delta: "The answer".into(),
+            },
+        ] {
+            record_turn_event(&mut state, &mut app, &event);
+        }
+        state.flush_partial(&mut app);
+        let data = session::load(&dir.join("session.jsonl")).unwrap();
+        assert_eq!(
+            data.records,
+            vec![
+                session::Record::Thinking {
+                    text: "let me think".into()
+                },
+                session::Record::Assistant {
+                    text: "The answer".into(),
+                    calls: vec![]
+                },
+            ]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_completed_round_is_not_written_twice() {
+        // The round's records and the accumulated deltas describe the
+        // same content; flushing after a `Round` event must be a no-op.
+        let (mut state, dir) = recording_state("round");
+        let mut app = app::App::new();
+        record_turn_event(
+            &mut state,
+            &mut app,
+            &TurnEvent::Text {
+                delta: "done".into(),
+            },
+        );
+        record_turn_event(
+            &mut state,
+            &mut app,
+            &TurnEvent::Round {
+                text: "done".into(),
+                thinking: String::new(),
+                calls: vec![],
+            },
+        );
+        state.flush_partial(&mut app);
+        let data = session::load(&dir.join("session.jsonl")).unwrap();
+        assert_eq!(
+            data.records,
+            vec![session::Record::Assistant {
+                text: "done".into(),
+                calls: vec![]
+            }]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_turn_error_keeps_the_partial_round_before_the_error_record() {
+        let (mut state, dir) = recording_state("error");
+        let mut app = app::App::new();
+        record_turn_event(
+            &mut state,
+            &mut app,
+            &TurnEvent::Text {
+                delta: "partial".into(),
+            },
+        );
+        let done = TurnEnd {
+            result: Err(clanky_protocol::Error::provider(
+                clanky_protocol::ErrorCode::Backend,
+                "timed out reading response",
+                true,
+            )
+            .into()),
+            history: Vec::new(),
+            session: None,
+        };
+        record_done(&mut state, &mut app, &done);
+        let data = session::load(&dir.join("session.jsonl")).unwrap();
+        assert_eq!(
+            data.records,
+            vec![
+                session::Record::Assistant {
+                    text: "partial".into(),
+                    calls: vec![]
+                },
+                session::Record::Error {
+                    message: "provider error: backend: timed out reading response".into()
+                },
+            ]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn draining_before_the_quit_records_completed_rounds_too() {
+        // What the worker already sent is recorded exactly as the live
+        // loop would: a round that completed just before ctrl+c is kept,
+        // deltas after it still flush, and the turn's `Done` is dropped.
+        let (mut state, dir) = recording_state("drain");
+        let mut app = app::App::new();
+        let (tx, rx) = mpsc::channel::<WorkerEvent>();
+        tx.send(WorkerEvent::Turn(TurnEvent::Round {
+            text: "first".into(),
+            thinking: String::new(),
+            calls: vec![],
+        }))
+        .unwrap();
+        tx.send(WorkerEvent::Turn(TurnEvent::Text {
+            delta: "second".into(),
+        }))
+        .unwrap();
+        tx.send(WorkerEvent::Done(TurnEnd {
+            result: Err(clanky_protocol::Error::provider(
+                clanky_protocol::ErrorCode::Internal,
+                "never displayed",
+                false,
+            )
+            .into()),
+            history: Vec::new(),
+            session: None,
+        }))
+        .unwrap();
+        drain_turn_events(&rx, &mut state, &mut app);
+        state.flush_partial(&mut app);
+        let data = session::load(&dir.join("session.jsonl")).unwrap();
+        assert_eq!(
+            data.records,
+            vec![
+                session::Record::Assistant {
+                    text: "first".into(),
+                    calls: vec![]
+                },
+                session::Record::Assistant {
+                    text: "second".into(),
+                    calls: vec![]
+                },
+            ],
+            "the un-displayed error must not reach the resumed transcript"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }

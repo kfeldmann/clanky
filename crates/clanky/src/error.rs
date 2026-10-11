@@ -74,9 +74,6 @@ pub enum Error {
     #[error("no model configured: set `model` in settings.toml or pass --model")]
     NoModel,
 
-    #[error("invalid --sampling: {0}")]
-    InvalidSampling(String),
-
     #[error("invalid --thinking value `{0}`; expected an integer token budget, or `off`")]
     InvalidThinking(String),
 

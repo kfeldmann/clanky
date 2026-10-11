@@ -320,6 +320,7 @@ mod tests {
                 display_name: None,
                 context_window: None,
                 supports_thinking: None,
+                supports_tools: None,
                 supports_text_generation: None,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
@@ -364,7 +365,7 @@ mod tests {
 
     #[test]
     fn handshake_advertises_name_capabilities_and_default_model() {
-        let out = drive(r#"{"type":"hello","protocolVersion":1}"#);
+        let out = drive(r#"{"type":"hello","protocolVersion":2}"#);
         assert_eq!(out.len(), 1);
         match &out[0] {
             Message::Hello {
@@ -373,7 +374,7 @@ mod tests {
                 capabilities,
                 default_model,
             } => {
-                assert_eq!(*protocol_version, 1);
+                assert_eq!(*protocol_version, PROTOCOL_VERSION);
                 assert_eq!(name.as_deref(), Some("fake"));
                 assert!(capabilities.unwrap().list_models);
                 assert_eq!(default_model.as_deref(), Some("fake/default"));
@@ -411,7 +412,7 @@ mod tests {
     #[test]
     fn list_models_and_chat_round_trip() {
         let out = drive(
-            r#"{"type":"hello","protocolVersion":1}
+            r#"{"type":"hello","protocolVersion":2}
 {"type":"listModels","id":7}
 {"type":"chat","id":42,"model":"fake/m","messages":[{"role":"user","content":"hi"}]}"#,
         );

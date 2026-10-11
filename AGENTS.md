@@ -26,9 +26,9 @@ lynx -dump https://lite.duckduckgo.com/lite?q=<url-encoded-query>
 ## Project state
 
 M0-M8 are complete and shipped. Remaining: M9 (MCP tools, deferred until
-needed) and parts of M10 (polish & release). See milestones.md — checkboxes
-mark progress, and its "As built" notes record decisions made during
-implementation. Check them before redesigning something.
+needed) and parts of M10 (polish & release). M11 is in progress (M11a complete).
+See milestones.md — checkboxes mark progress, and its "As built" notes record
+decisions made during implementation. Check them before redesigning something.
 
 ## Project invariants
 
@@ -67,9 +67,9 @@ implementation. Check them before redesigning something.
 - `crates/clanky-protocol` — provider plugin protocol: message types, client,
   in-process loopback transport, and `serve` (plugin-side wire rules live
   here once, shared by real binaries and tests)
-- `crates/clanky-provider-deepinfra` — DeepInfra provider plugin
-  (OpenAI-compatible)
+- `crates/clanky-provider-deepinfra` — DeepInfra provider plugin (OpenAI-compatible)
 - `crates/clanky-provider-litellm` — LiteLLM proxy provider plugin
+- `crates/clanky-provider-anthropic` — Anthropic provider plugin
 - `examples/hello-world-provider/` — dependency-free Python provider plugin;
   the smallest template for writing a new one
 - `crates/clanky/tests/` — integration tests: golden session transcripts
