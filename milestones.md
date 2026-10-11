@@ -317,21 +317,32 @@ real tenant.
        was deleted. Print-mode events go through `PrintSink` in `main.rs` (testable against
        captured streams). `-q` in TUI mode is a usage error (`Error::QuietRequiresPrint`); in
        quiet mode retry notices are suppressed too (they're activity, not errors).
-3. Status line should de-content gracefully as terminal narrows
+3. [x] Status line should de-content gracefully as terminal narrows
    - Drop one element at a time from the status line when the width is too narrow. Drop elements in the following order:
        - provider
        - thinking-budget
        - model
        - cost
        - session-name
+       - queued indicator (can reduce to just the dot/circle for narrow terminals)
        - context-percentage
+   - The "queued" indicator is transient. It normally uses a symbol and a word. In narrow terminals it could reduce to just the symbol
+   - The hints (/ commands, ctl+c quit) replace the cost and context indicators if price data is not available
    - Another way to think of it: Add elements one at a time from the bottom of this list towards the top. Add as many as will fit.
    - Example status lines at different terminal widths, showing the desired ordering/placement of the elements as well as the addition of more elements as the width increases:
-       session-name ctx xx%
-       session-name $x.xxxx ctx xx%
-       model session-name $x.xxxx ctx xx%
-       model think xxxx session-name $x.xxxx ctx xx%
-       provider model think xxxx session-name $x.xxxx ctx xx%  <-- current status line
+       session-name queued-dot (ctx xx% | hints)
+       session-name queued-dot ($x.xxxx ctx xx% | hints)
+       model session-name queued-dot ($x.xxxx ctx xx% | hints)
+       model think xxxx session-name queued-full ($x.xxxx ctx xx% | hints)
+       provider model think xxxx session-name queued-full ($x.xxxx ctx xx% | hints)  <-- current status line
+   - As built: `status_line` in `src/tui/screen.rs` builds the line by adding elements one at a
+     time from the bottom of the drop list upward, keeping each only if the whole line still
+     fits. The cost and context percentage share one right-hand group (`$x.xxxx · xx% ctx`);
+     when price data is unavailable that group is the hints instead. The queued indicator is
+     two elements — the dot (kept with session-name as long as possible) and the word (added
+     only when there is room). Below the hints' width, elements keep dropping until the
+     provider alone fits, then nothing. Coverage in
+     `status_line_decontents_gracefully_as_the_terminal_narrows`.
 4. Muli-line input (produced via $EDITOR) is displayed in the input field with each line starting directly below the end of the previous (stair-step)
 5. In `--help`, it says "piped stdin is picked up in M1". Update that message now that piped stdin is a stable feature.
 

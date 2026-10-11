@@ -384,8 +384,13 @@ fn footer_lines(
     }
 }
 
-/// Status line: provider · model · session on the left; cost,
-/// context use, or a hint on the right; streaming shows on the prompt.
+/// Status line. As the terminal narrows, elements are dropped one at a
+/// time — first provider, then thinking-budget, model, cost, session-name,
+/// the "queued" word (reducing to just the dot), and finally the context
+/// percentage — so the line de-contents gracefully instead of truncating.
+/// The hints (`/ commands · ctrl+c quit`) replace the cost and context
+/// elements whenever price data is unavailable; they are the last element
+/// to go, after which the line collapses to just the queued dot.
 #[allow(clippy::too_many_arguments)]
 fn status_line(
     app: &App,
@@ -394,87 +399,185 @@ fn status_line(
     estimated_prompt: u64,
     estimated_completion: u64,
 ) -> Line<'static> {
+    let width = width as usize;
     let base = Style::new().fg(Color::DarkGray);
-    let mut left = vec![Span::styled(
-        status.provider.to_string(),
-        base.add_modifier(Modifier::BOLD),
-    )];
-    if let Some(model) = status.model {
-        left.push(Span::styled(" · ".to_string(), base));
-        left.push(Span::styled(model.to_string(), base));
-        if let Some(thinking) = status.thinking {
-            left.push(Span::styled(" · think ".to_string(), base));
+    let sep = || Span::styled(" · ".to_string(), base);
+
+    // Context percentage: how much of the window the next request would
+    // occupy (billed token counts plus estimates for content not yet
+    // covered by a provider report).
+    let has_usage = app.last_usage.is_some() || estimated_prompt > 0 || estimated_completion > 0;
+    let ctx = status
+        .context_window
+        .filter(|window| *window > 0 && has_usage)
+        .map(|window| {
+            let prompt = app
+                .last_usage
+                .and_then(|usage| usage.prompt_tokens)
+                .unwrap_or(0)
+                + estimated_prompt;
+            let completion = app
+                .last_usage
+                .and_then(|usage| usage.completion_tokens)
+                .unwrap_or(0)
+                + estimated_completion;
+            Span::styled(
+                format!("{}% ctx", (prompt + completion) * 100 / window),
+                base,
+            )
+        });
+    let cost = status
+        .cost
+        .map(|c| Span::styled(format_cost(c), Style::new().fg(Color::Yellow)));
+    // The right group: cost and context when price data exists, otherwise
+    // the hints stand in for both.
+    let has_price = cost.is_some() || ctx.is_some();
+    let queued = !app.pending.is_empty();
+    let hints = || Span::styled("/ commands · ctrl+c quit".to_string(), base);
+
+    // Elements, in the order they are dropped as the terminal narrows
+    // (so: the order they are added as it widens, most expendable last
+    // to be added... first to be dropped). The context element comes
+    // first because it is dropped last.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Elem {
+        Context, // or the hints, when there is no price data
+        QueuedDot,
+        Session,
+        QueuedWord,
+        Cost,
+        Model,
+        Think,
+        Provider,
+    }
+    let mut candidates = vec![Elem::Context];
+    if queued {
+        candidates.push(Elem::QueuedDot);
+    }
+    if status.session.is_some() {
+        candidates.push(Elem::Session);
+    }
+    if queued {
+        candidates.push(Elem::QueuedWord);
+    }
+    if cost.is_some() {
+        candidates.push(Elem::Cost);
+    }
+    if status.model.is_some() {
+        candidates.push(Elem::Model);
+    }
+    if status.thinking.is_some() {
+        candidates.push(Elem::Think);
+    }
+    candidates.push(Elem::Provider);
+
+    // Build the line with `on` telling which elements survived.
+    let build = |on: &[Elem]| -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+        let has = |e: Elem| on.contains(&e);
+        let mut left: Vec<Span<'static>> = Vec::new();
+        if has(Elem::Provider) {
+            left.push(Span::styled(
+                status.provider.to_string(),
+                base.add_modifier(Modifier::BOLD),
+            ));
+        }
+        if has(Elem::Model)
+            && let Some(model) = status.model
+        {
+            if !left.is_empty() {
+                left.push(sep());
+            }
+            left.push(Span::styled(model.to_string(), base));
+        }
+        if has(Elem::Think)
+            && let Some(thinking) = status.thinking
+        {
+            if !left.is_empty() {
+                left.push(sep());
+            }
+            left.push(Span::styled("think ".to_string(), base));
             left.push(Span::styled(
                 thinking.to_string(),
                 Style::new().fg(Color::Cyan),
             ));
         }
-    }
-    if let Some(session) = status.session {
-        left.push(Span::styled(" · ".to_string(), base));
-        left.push(Span::styled(session.to_string(), base));
-    }
-    // Streaming is signalled by the input prompt's dot, not here. The
-    // right side carries the session cost and how much of the context
-    // window the last turn consumed (the next request re-sends those
-    // prompt tokens, so they are what accumulates toward the limit).
-    let mut right = Vec::new();
-    if !app.pending.is_empty() {
-        right.push(Span::styled(
-            "○ queued".to_string(),
-            Style::new().fg(Color::Yellow),
-        ));
-    }
-    if let Some(cost) = status.cost {
-        if !right.is_empty() {
-            right.push(Span::styled(" · ".to_string(), base));
+        if has(Elem::Session)
+            && let Some(session) = status.session
+        {
+            if !left.is_empty() {
+                left.push(sep());
+            }
+            left.push(Span::styled(session.to_string(), base));
         }
-        right.push(Span::styled(
-            format_cost(cost),
-            Style::new().fg(Color::Yellow),
-        ));
-    }
-    let has_usage = app.last_usage.is_some() || estimated_prompt > 0 || estimated_completion > 0;
-    if let Some(window) = status.context_window
-        && window > 0
-        && has_usage
-    {
-        // Billed token counts plus estimates for content not yet covered
-        // by a provider report (user prompt and tool results before the
-        // next round; streamed text/thinking while it streams). With a
-        // report in hand the estimates are zero.
-        if !right.is_empty() {
-            right.push(Span::styled(" · ".to_string(), base));
+        if has(Elem::QueuedDot) {
+            // The dot is glued to whatever precedes it with a single
+            // space ("session ○"), standing alone when nothing does.
+            if !left.is_empty() {
+                left.push(Span::raw(" "));
+            }
+            left.push(Span::styled(
+                "○".to_string(),
+                Style::new().fg(Color::Yellow),
+            ));
         }
-        let prompt = app
-            .last_usage
-            .and_then(|usage| usage.prompt_tokens)
-            .unwrap_or(0)
-            + estimated_prompt;
-        let completion = app
-            .last_usage
-            .and_then(|usage| usage.completion_tokens)
-            .unwrap_or(0)
-            + estimated_completion;
-        right.push(Span::styled(
-            format!("{}% ctx", (prompt + completion) * 100 / window),
-            base,
-        ));
-    }
-    if right.is_empty() {
-        right.push(Span::styled("/ commands · ctrl+c quit".to_string(), base));
-    }
+        if has(Elem::QueuedWord) {
+            left.push(Span::styled(
+                " queued".to_string(),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        let mut right: Vec<Span<'static>> = Vec::new();
+        if has_price {
+            if has(Elem::Cost)
+                && let Some(cost) = &cost
+            {
+                right.push(cost.clone());
+            }
+            if has(Elem::Context)
+                && let Some(ctx) = &ctx
+            {
+                if !right.is_empty() {
+                    right.push(sep());
+                }
+                right.push(ctx.clone());
+            }
+        } else if has(Elem::Context) {
+            right.push(hints());
+        }
+        (left, right)
+    };
 
-    let width = width as usize;
+    // Add elements one at a time, keeping each only if the whole line
+    // still fits: left + a gap of at least one space + right.
+    let fits = |on: &[Elem]| -> bool {
+        let (left, right) = build(on);
+        let gap = usize::from(!left.is_empty() && !right.is_empty());
+        spans_width(&left) + gap + spans_width(&right) <= width
+    };
+    let mut on: Vec<Elem> = Vec::new();
+    for elem in candidates {
+        on.push(elem);
+        if !fits(&on) {
+            on.pop();
+        }
+    }
+    let (left, right) = build(&on);
+
     let left_width = spans_width(&left);
     let right_width = spans_width(&right);
-    if right_width + left_width <= width {
-        left.push(Span::raw(" ".repeat(width - left_width - right_width)));
-        left.extend(right);
-        Line::from(left)
+    if left_width + right_width <= width {
+        let mut all = left;
+        if right_width > 0 {
+            all.push(Span::raw(" ".repeat(width - left_width - right_width)));
+            all.extend(right);
+        }
+        Line::from(all)
     } else {
-        // Too tight for both: show only the status, truncated.
-        Line::from(truncate_spans(right, width))
+        // Nothing fits (an absurdly narrow terminal): truncate what the
+        // drop order left us with.
+        let mut all = left;
+        all.extend(right);
+        Line::from(truncate_spans(all, width))
     }
 }
 
@@ -1421,6 +1524,94 @@ mod tests {
         let line = status_line(&app, &status(), 40, 0, 0);
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains("○ queued"), "{text}");
+    }
+
+    #[test]
+    fn status_line_decontents_gracefully_as_the_terminal_narrows() {
+        let mut app = App::new();
+        app.last_usage = Some(clanky_protocol::Usage {
+            prompt_tokens: Some(2500),
+            completion_tokens: Some(500),
+            cached_tokens: None,
+        });
+        app.pending = vec!["x".into()];
+        let mut st = status();
+        st.provider = "deepinfra";
+        st.model = Some("meta-llama/Llama-4-Maverick-17B-128E-Instruct");
+        st.thinking = Some("12345");
+        st.session = Some("20261005-0239");
+        st.cost = Some(0.1234);
+        st.context_window = Some(10000);
+
+        let text = |w: u16| -> String {
+            status_line(&app, &st, w, 0, 0)
+                .spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect()
+        };
+
+        // Wide enough for everything: provider · model · think ·
+        // session ○ queued ... $cost · ctx%.
+        let full = text(120);
+        assert!(
+            full.contains(
+                "deepinfra · meta-llama/Llama-4-Maverick-17B-128E-Instruct · think 12345"
+            ),
+            "{full}"
+        );
+        assert!(full.contains("20261005-0239 ○ queued"), "{full}");
+        assert!(full.ends_with("$0.1234 · 30% ctx"), "{full}");
+
+        // Each narrowing drops exactly one element, in order:
+        // provider, thinking, model, cost, session, the "queued" word.
+        let t = text(103);
+        assert!(!t.contains("deepinfra"), "{t}");
+        assert!(
+            t.starts_with("meta-llama/Llama-4-Maverick-17B-128E-Instruct · think 12345"),
+            "{t}"
+        );
+        let t = text(89);
+        assert!(!t.contains("think"), "{t}");
+        assert!(
+            t.starts_with("meta-llama/Llama-4-Maverick-17B-128E-Instruct · 20261005-0239"),
+            "{t}"
+        );
+        let t = text(41);
+        assert!(!t.contains("meta-llama"), "{t}");
+        assert!(t.starts_with("20261005-0239 ○ queued"), "{t}");
+        let t = text(22);
+        assert!(!t.contains("20261005-0239"), "{t}");
+        assert!(t.starts_with("○ queued"), "{t}");
+        // The queued word reduces to the bare dot; the context
+        // percentage is the last element standing.
+        let t = text(10);
+        assert_eq!(t, "○  30% ctx");
+
+        // Without price data the hints replace cost and context, and are
+        // the last element to go.
+        st.cost = None;
+        st.context_window = None;
+        app.last_usage = None;
+        app.pending.clear();
+        let text = |w: u16| -> String {
+            status_line(&app, &st, w, 0, 0)
+                .spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect()
+        };
+        let t = text(116);
+        assert!(t.ends_with("/ commands · ctrl+c quit"), "{t}");
+        let t = text(39);
+        assert!(!t.contains("meta-llama"), "{t}");
+        assert!(t.starts_with("20261005-0239"), "{t}");
+        assert!(t.ends_with("/ commands · ctrl+c quit"), "{t}");
+        let t = text(24);
+        assert_eq!(t, "/ commands · ctrl+c quit");
+        // Only the provider fits below that.
+        let t = text(10);
+        assert_eq!(t, "deepinfra");
     }
 
     #[test]

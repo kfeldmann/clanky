@@ -303,6 +303,13 @@ post-quit history all work. Two details of that model are visible:
   renderer reserves it and the last column stays blank.
 - Resizing, returning from `$EDITOR`, and clearing redraw the bottom
   region in place; nothing is pushed into scrollback by a redraw.
+- The status line de-contents gracefully as the terminal narrows:
+  elements are dropped one at a time — provider, thinking budget,
+  model, cost, session name, the word "queued" (leaving just the dot) —
+  and finally the context percentage, so only the widest terminals show
+  everything. When cost/context data is unavailable the hints
+  (`/ commands · ctrl+c quit`) take their place on the right and are
+  the last element to go.
 
 ### `ctrl+t` — show/hide thinking
 
