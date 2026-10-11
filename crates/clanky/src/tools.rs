@@ -260,16 +260,22 @@ pub fn is_failed_result(output: &str) -> bool {
     output.starts_with("ERROR:") || output.contains("[exit status: ")
 }
 
-/// Shorten a tool result for activity display (stderr); the full result is
-/// always what the model receives.
-pub fn truncate_for_display(text: &str, max_chars: usize) -> String {
-    let single = text.replace('\n', " ⏎ ");
-    if single.chars().count() <= max_chars {
-        return single;
+/// Default number of output lines shown when previewing a tool result for
+/// display (TUI transcript and pipe-mode stderr); matches the TUI's
+/// `TOOL_PREVIEW_LINES`.
+pub const RESULT_PREVIEW_LINES: usize = 8;
+
+/// Shorten a tool result for display (TUI transcript, pipe-mode stderr):
+/// a few lines verbatim plus an omission note. Newlines are kept — output
+/// renders line by line, never collapsed with a symbol. The full result
+/// is always what the model receives.
+pub fn preview_result(output: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() <= max_lines {
+        return output.to_string();
     }
-    let mut out: String = single.chars().take(max_chars).collect();
-    out.push('…');
-    out
+    let shown = lines[..max_lines].join("\n");
+    format!("{shown}\n… (+{} more lines)", lines.len() - max_lines)
 }
 
 /// Character budget for displaying tool-call arguments (transcript and
@@ -369,6 +375,19 @@ mod tests {
         assert!(is_failed_result("out\n[exit status: 1]"));
         assert!(is_failed_result("[exit status: 143]"));
         assert!(is_failed_result("ERROR: unknown tool: nope"));
+    }
+
+    #[test]
+    fn preview_result_keeps_newlines_and_notes_truncation() {
+        assert_eq!(preview_result("one line", 8), "one line");
+        let output = (1..=12)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let shown = preview_result(&output, RESULT_PREVIEW_LINES);
+        assert_eq!(shown.lines().count(), RESULT_PREVIEW_LINES + 1);
+        assert!(shown.contains("(+4 more lines)"));
+        assert!(shown.starts_with("1\n2\n"));
     }
 
     #[test]

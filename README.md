@@ -356,3 +356,24 @@ example:
 
 The TUI only starts when stdin *and* stdout are terminals; piped input
 falls back to plain one-shot mode.
+
+## Print mode (`-p`)
+
+When the TUI can't start (or `-p` is given), Clanky runs a single turn:
+the agent's response goes to **stdout**, and activity — thinking, tool
+calls, tool results, retry notices — to **stderr**, so
+`clanky -p ... | grep` style pipes stay clean.
+
+- Thinking blocks are printed as they stream and closed with a trimmed
+  line plus a blank line, so each block reads as a unit.
+- Tool results render like the TUI transcript, without the color: a
+  `└─ name: …` header, continuation lines aligned under the first output
+  character, newlines kept (never collapsed into a symbol), and the
+  preview capped at a few lines with a `… (+N more lines)` note.
+
+`-q` / `--quiet` (print mode only; rejected in TUI mode) prints just the
+agent's response and errors — no thinking, tool calls, or tool results:
+
+```sh
+clanky -p -q "summarize this repo" > summary.txt
+```

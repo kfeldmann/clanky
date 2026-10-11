@@ -306,11 +306,17 @@ real tenant.
 
 ### ☐ M12 — Refinements, Bug Fixes
 1. [x] Add support for ctl+u in the input field (clear from cursor to beginning of line)
-2. Print-mode (-p) output changes
-   - Thinking text seems to end with no newline (should trim and add two newlines so there is a blank after the thinking block)
-   - Tool results are not truncated. Should behave like the TUI but without the color
-   - Tool results have their newlines replaced with a symbol. Remove that functionality. Copy the TUI behavior but without color
-   - Add `-q/--quiet` which prints only the agent response messages and errors. No thinking. No tool calls or results. `-q` is only effective with `-p` (should be rejected in TUI mode)
+2. [x] Print-mode (-p) output changes
+   - [x] Thinking text seems to end with no newline (should trim and add two newlines so there is a blank after the thinking block)
+   - [x] Tool results are not truncated. Should behave like the TUI but without the color
+   - [x] Tool results have their newlines replaced with a symbol. Remove that functionality. Copy the TUI behavior but without color
+   - [x] Add `-q/--quiet` which prints only the agent response messages and errors. No thinking. No tool calls or results. `-q` is only effective with `-p` (should be rejected in TUI mode)
+     - As built: the TUI's result-preview function moved to `clanky::tools::preview_result`
+       (line-capped with a `… (+N more lines)` note) and is shared by the TUI transcript and
+       pipe-mode stderr, so the two can't drift; the old newline-collapsing `truncate_for_display`
+       was deleted. Print-mode events go through `PrintSink` in `main.rs` (testable against
+       captured streams). `-q` in TUI mode is a usage error (`Error::QuietRequiresPrint`); in
+       quiet mode retry notices are suppressed too (they're activity, not errors).
 3. Status line should de-content gracefully as terminal narrows
    - Drop one element at a time from the status line when the width is too narrow. Drop elements in the following order:
        - provider

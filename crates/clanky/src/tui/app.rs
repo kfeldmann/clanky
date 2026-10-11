@@ -901,16 +901,9 @@ impl App {
 }
 
 /// Shorten a tool result for display: a few lines plus an omission note.
+/// Shared with pipe mode so stderr previews match the transcript.
 fn preview(output: &str) -> String {
-    let lines: Vec<&str> = output.lines().collect();
-    if lines.len() <= TOOL_PREVIEW_LINES {
-        return output.to_string();
-    }
-    let shown = lines[..TOOL_PREVIEW_LINES].join("\n");
-    format!(
-        "{shown}\n… (+{} more lines)",
-        lines.len() - TOOL_PREVIEW_LINES
-    )
+    crate::tools::preview_result(output, TOOL_PREVIEW_LINES)
 }
 
 #[cfg(test)]

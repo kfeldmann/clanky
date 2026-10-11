@@ -24,6 +24,9 @@ pub enum Error {
     #[error("no prompt given: pass a prompt on the command line or pipe one via stdin")]
     NoPrompt,
 
+    #[error("--quiet is only available in print mode; use it with -p/--print")]
+    QuietRequiresPrint,
+
     #[error("unknown provider `{name}`; discovered plugins: {available}", available = available.join(", "))]
     UnknownProvider {
         name: String,
