@@ -1,3 +1,4 @@
+![Clanky](clanky.jpg)
 # Clanky
 
 An AI coding agent/harness for the terminal, written in Rust.
