@@ -151,7 +151,7 @@ Architectural decisions already made:
   when a key is denied it; the metadata curates the model list (the picker
   hides tool-less models via the `supportsTools` hint) while `tools` and
   `reasoning_effort` pass through to the proxy unconditionally. The built-in default model is
-  `claude-haiku-4-5` (overridable with `model`/`--model`). Design notes: `litellm-provider-planning.md`.
+  `claude-haiku-4-5-20251001` (overridable with `model`/`--model`). Design notes: `litellm-provider-planning.md`.
   As built (revised after review): an earlier build filtered `reasoning_effort`
   and `tools` out of the request per model ("so a heterogeneous proxy does
   not 400"), which silently ignored user intent and pre-empted the proxy's
@@ -279,7 +279,7 @@ real tenant.
   `toolCallArgs`; finish-reason and usage mapping
 - Pinned live-capture fixtures (the LiteLLM M10 pattern); golden transcripts
 - Live-testable against the real tenant: bash tool loop end to end (do not build live tests into the code)
-- Done when: `clanky -p "count files in /tmp" --provider anthropic --model claude-haiku-4-5` runs
+- Done when: `clanky -p "count files in /tmp" --provider anthropic --model claude-haiku-4-5-20251001` runs
   bash and answers, streamed.
 
 ### ✔ M11c — API-key fallback + polish
@@ -303,6 +303,29 @@ real tenant.
   tenant issues no keys, so the key path is header-tested only (structural
   tests + a mock-backend chat pinned to the same fixtures); first live
   key-user should sanity-check against the real API.
+
+### ☐ M12 — Refinements, Bug Fixes
+1. Add support for ctl+u in the input field (clear from cursor to beginning of line)
+2. Print-mode (-p) output changes
+   - Thinking text seems to end with no newline (should trim and add two newlines so there is a blank after the thinking block)
+   - Tool results are not truncated. Should behave like the TUI but without the color
+   - Tool results have their newlines replaced with a symbol. Remove that functionality. Copy the TUI behavior but without color
+   - Add `-q/--quiet` which prints only the agent response messages and errors. No thinking. No tool calls or results. `-q` is only effective with `-p` (should be rejected in TUI mode)
+3. Status line should de-content gracefully as terminal narrows
+   - Drop one element at a time from the status line when the width is too narrow. Drop elements in the following order:
+       - provider
+       - thinking-budget
+       - model
+       - cost
+       - session-name
+       - context-percentage
+   - Another way to think of it: Add elements one at a time from the bottom of this list towards the top. Add as many as will fit.
+   - Example status lines at different terminal widths, showing the desired ordering/placement of the elements as well as the addition of more elements as the width increases:
+       session-name ctx xx%
+       session-name $x.xxxx ctx xx%
+       model session-name $x.xxxx ctx xx%
+       model think xxxx session-name $x.xxxx ctx xx%
+       provider model think xxxx session-name $x.xxxx ctx xx%  <-- current status line
 
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming

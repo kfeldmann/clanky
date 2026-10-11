@@ -25,8 +25,9 @@ lynx -dump https://lite.duckduckgo.com/lite?q=<url-encoded-query>
 
 ## Project state
 
-M0-M8 are complete and shipped. Remaining: M9 (MCP tools, deferred until
-needed) and parts of M10 (polish & release). M11 is in progress (M11a complete).
+Milestones are complete through M11 (except for M9 which is deferred, and the first item in M10 which is low priority).
+M12 "Refinements, Bug Fixes" is next.
+
 See milestones.md — checkboxes mark progress, and its "As built" notes record
 decisions made during implementation. Check them before redesigning something.
 
