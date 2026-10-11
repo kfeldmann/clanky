@@ -42,7 +42,8 @@ pub struct Cli {
 
     /// Retries for a retryable provider error (rate limits, backend
     /// errors, network timeouts), overriding the settings; 0 disables
-    /// retrying. Retries use exponential backoff (500 ms, 1 s, 2 s, …).
+    /// retrying. Retries use backoff growing ×1.25 per retry (500 ms,
+    /// 625 ms, 781 ms, …).
     #[arg(long)]
     pub max_retries: Option<u32>,
 

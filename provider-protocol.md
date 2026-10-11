@@ -216,7 +216,7 @@ Plugin → client:
   `protocol` | `protocolVersion` | `internal`. `retryable` is a hint;
   `retryAfterMs` (optional, on `rateLimit`) may refine it. The client acts
   on the hint: a `retryable` request-scoped error is retried (default 5
-  attempts, exponential backoff, honoring `retryAfterMs`), so providers
+  attempts, backoff growing ×1.25 per retry, honoring `retryAfterMs`), so providers
   should set it for transient conditions (`rateLimit`, `backend` — network
   timeouts included) and leave it `false` for `auth`/`invalidRequest`. A
   retry replays the whole request, so it is only attempted while the round

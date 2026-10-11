@@ -168,7 +168,7 @@ Architectural decisions already made:
   pipe mode
 - DONE - Provider retries: retryable errors (`rateLimit`, `backend` — network
   timeouts included) are retried up to `max_retries` (default 5) with
-  exponential backoff (500 ms … 30 s cap), honoring `Retry-After`; a retry
+  backoff growing ×1.25 per retry (500 ms … 30 s cap), honoring `Retry-After`; a retry
   is surfaced in the transcript (TUI) or on stderr (pipe), and a round that
   already streamed content is never replayed
 - DONE - TUI reworked to linear terminal output: the transcript is printed straight

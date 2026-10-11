@@ -83,7 +83,8 @@ Notes:
   the provider and cannot be overridden through `sampling`.
 - `max_retries` covers transient provider failures — rate limits (429
   `Model busy`), backend errors, and network timeouts. Retries use
-  exponential backoff (500 ms, 1 s, 2 s, 4 s, 8 s), honoring a server
+  backoff growing ×1.25 per retry (500 ms, 625 ms, 781 ms, 976 ms, 1.2 s,
+  …, capped at 30 s), honoring a server
   `Retry-After` when it asks for longer, and are shown in the transcript
   (TUI) or on stderr (pipe mode). A round that already streamed content is
   never replayed, so a retry cannot duplicate output. Set it on the CLI
