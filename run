@@ -21,20 +21,6 @@ set -eu
 # (docker would otherwise create it as root).
 mkdir -p "$HOME/.clanky"
 
-#if [ -z $DEEPINFRA_URL ]
-#then
-#    echo "ERROR: Missing required environment variable: DEEPINFRA_URL" >&2
-#    exit 1
-#fi
-# At least one provider's credentials must be present (the container ships
-# both the DeepInfra and LiteLLM plugins). Clanky defaults to DeepInfra, so a
-# LiteLLM-only user also needs `provider = "litellm"` in settings or
-# `--provider litellm`.
-if [ -z "${DEEPINFRA_TOKEN:-}" ] && [ -z "${LITELLM_API_KEY:-}" ]
-then
-    echo "ERROR: set DEEPINFRA_TOKEN (DeepInfra) or LITELLM_API_KEY (LiteLLM)" >&2
-    exit 1
-fi
 
 if [ -t 0 ]; then
     INTERACTIVE_FLAGS="-it" # real terminal
@@ -53,6 +39,8 @@ docker run \
   --env DEEPINFRA_TOKEN \
   --env LITELLM_BASE_URL \
   --env LITELLM_API_KEY \
+  --env ANTHROPIC_API_KEY \
+  --env ANTHROPIC_BASE_URL \
   -v "$(pwd):/work" \
   -v "$HOME/.clanky:/home/clanky/.clanky" \
   -w /work \
