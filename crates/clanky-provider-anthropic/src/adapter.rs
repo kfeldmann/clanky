@@ -522,7 +522,7 @@ mod tests {
             ChatMessage::user("say hi"),
         ];
         let body: Value = serde_json::from_str(
-            &build_request_body("claude-haiku-4-5", &messages, None, None, None, false).unwrap(),
+            &build_request_body("claude-haiku-4-5-20251001", &messages, None, None, None, false).unwrap(),
         )
         .unwrap();
         let fixture: Value = serde_json::from_str(REQ_BASIC).unwrap();
@@ -570,7 +570,7 @@ mod tests {
         ];
         let body: Value = serde_json::from_str(
             &build_request_body(
-                "claude-haiku-4-5",
+                "claude-haiku-4-5-20251001",
                 &messages,
                 Some(&[Tool {
                     name: "bash".into(),

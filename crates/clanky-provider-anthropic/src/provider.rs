@@ -588,7 +588,7 @@ mod tests {
         let (chunks, done) = run_chat(
             &mut provider,
             &request(
-                "claude-haiku-4-5",
+                "claude-haiku-4-5-20251001",
                 vec![ChatMessage::user("list 5 numbers")],
             ),
         );
@@ -618,7 +618,7 @@ mod tests {
     fn tool_stream_maps_to_tool_call_chunks_and_runs_the_loop_shape() {
         let mut provider = provider(payloads(STREAM_TOOLS));
         let mut req = request(
-            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
             vec![ChatMessage::user("list /tmp with the bash tool")],
         );
         req.tools = Some(vec![Tool {
@@ -666,7 +666,7 @@ mod tests {
         let mut provider = provider(payloads(STREAM_THINKING));
         let (chunks, done) = run_chat(
             &mut provider,
-            &request("claude-haiku-4-5", vec![ChatMessage::user("17*23?")]),
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("17*23?")]),
         );
 
         let thinking: String = chunks
@@ -694,7 +694,7 @@ mod tests {
         // Invariant: the user's `stream = false` in sampling is authoritative
         // — the provider never flips it back on.
         let mut provider = provider(Vec::new());
-        let mut req = request("claude-haiku-4-5", vec![ChatMessage::user("hi")]);
+        let mut req = request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]);
         req.sampling = Some(clanky_protocol::Sampling::from_iter([(
             "stream".into(),
             json!(false),
@@ -710,7 +710,7 @@ mod tests {
         let mut provider = provider(Vec::new());
         let _ = run_chat(
             &mut provider,
-            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
         )
         .1;
         assert_eq!(
@@ -730,7 +730,7 @@ mod tests {
         provider.cancel.cancel();
         let (chunks, done) = run_chat(
             &mut provider,
-            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
         );
         let done = done.unwrap();
         assert_eq!(
@@ -762,7 +762,7 @@ mod tests {
         let (chunks, done) = run_chat(
             &mut provider,
             &request(
-                "claude-haiku-4-5",
+                "claude-haiku-4-5-20251001",
                 vec![ChatMessage::user("list 5 numbers")],
             ),
         );
@@ -803,7 +803,7 @@ mod tests {
         .with_credentials(Box::new(|| Some(test_creds())), Box::new(|_| {}));
         let _ = run_chat(
             &mut provider,
-            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
         )
         .1;
         assert_eq!(
@@ -820,7 +820,7 @@ mod tests {
                 .with_credentials(Box::new(|| None), Box::new(|_| {}));
         let err = run_chat(
             &mut provider,
-            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
         )
         .1
         .unwrap_err();
@@ -845,7 +845,7 @@ mod tests {
             Some(crate::backend::BackendError::new(Some(429), "rate limited"));
         let err = run_chat(
             &mut provider,
-            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
         )
         .1
         .unwrap_err();
@@ -865,7 +865,7 @@ mod tests {
         let mut provider = provider(vec!["{not json}".into()]);
         let err = run_chat(
             &mut provider,
-            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
         )
         .1
         .unwrap_err();

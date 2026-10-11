@@ -225,7 +225,7 @@ M10 pattern but with Anthropic-native events instead of OpenAI deltas:
   `stream-thinking.txt`, `stream-tools.txt`) pin golden adapter tests;
   provider tests replay them through a mock backend. The live
   "done when" (`clanky -p "count files in /tmp" --provider anthropic
-  --model claude-haiku-4-5`) runs the bash tool loop streamed — confirmed
+  --model claude-haiku-4-5-20251001`) runs the bash tool loop streamed — confirmed
   against the real tenant; not built into the test suite.
 
 Tool names: the spike confirmed plain `bash` passes through the bearer

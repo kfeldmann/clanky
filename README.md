@@ -202,7 +202,7 @@ Notes:
   instead: the `/model` picker hides models whose `/model/info` says they
   cannot call tools (a deal breaker for the agentic loop), though `--model`
   can still name one and gets the server's answer.
-- **Built-in default model.** The default model is `claude-haiku-4-5`,
+- **Built-in default model.** The default model is `claude-haiku-4-5-20251001`,
   overridable with `model` in settings or `--model`. Clanky still defaults to
   the `deepinfra` provider, so a LiteLLM-only setup also sets
   `provider = "litellm"` in `settings.toml` (or passes `--provider litellm`).
@@ -246,7 +246,7 @@ else — streaming, tools, thinking — is identical through both.
 
 Notes:
 
-- The default model is `claude-haiku-4-5` (from the live catalog;
+- The default model is `claude-haiku-4-5-20251001` (from the live catalog;
   overridable with `model` in settings or `--model`).
 - The model list comes from `GET /v1/models` on the authenticated account.
 - `ANTHROPIC_BASE_URL` overrides `https://api.anthropic.com`.
