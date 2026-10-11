@@ -1,8 +1,12 @@
 //! Anthropic provider plugin for Clanky (OAuth-authenticated).
 //!
 //! Implements the Clanky provider protocol (`clanky-protocol`) on top of
-//! Anthropic's Messages API, authenticated exclusively by OAuth (our
-//! enterprise tenant issues no API keys). The library holds the provider
+//! Anthropic's Messages API. Auth is OAuth-first (our enterprise tenant
+//! issues no API keys): credentials live on disk under
+//! `~/.clanky/providers/anthropic/`, written by the headless `login`
+//! subcommand (PKCE + paste), and are refreshed automatically before
+//! expiry. Users with an API key can instead set `ANTHROPIC_API_KEY`
+//! (M11c, best-effort: untestable on this tenant, which issues no keys). The library holds the provider
 //! logic (testable in-process); the `clanky-provider-anthropic` binary
 //! serves it as a plugin process over stdin/stdout.
 //!
@@ -19,7 +23,7 @@ mod pkce;
 mod provider;
 
 pub use auth::{Credentials, credentials_path, load, store};
-pub use backend::{Backend, BackendError, UreqBackend};
+pub use backend::{AuthMode, Backend, BackendError, UreqBackend};
 pub use oauth::{
     AUTHORIZE_URL, CLIENT_ID, REDIRECT_URI, SCOPES, TOKEN_URL, TokenResponse, authorize_url,
     exchange_authorization_code, parse_authorization_input, refresh,

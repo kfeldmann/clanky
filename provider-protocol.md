@@ -29,6 +29,19 @@ Design goals, in order:
 - Clanky passes the environment through untouched. The plugin reads its own
   auth material (e.g. `DEEPINFRA_API_KEY`); Clanky never handles third-party
   provider keys. A plugin's settings entry may add extra env vars.
+- **Interactive auth belongs in an offline subcommand, not the session.**
+  The plugin's stdin/stdout *are* the protocol channel, so a plugin that
+  needs an interactive flow (OAuth's browser + paste, device prompts)
+  cannot ask the user mid-session. Give the plugin binary a subcommand —
+  `clanky-provider-<name> login` — that runs the flow over its own
+  terminal/stdin and stores the result on disk (e.g.
+  `~/.clanky/providers/<name>/`); the serving process then loads it
+  lazily, per request, so a login written after startup is picked up.
+  This needs no protocol change: auth material is the plugin's business
+  (this section), and an expired login surfaces as a normal `auth` error
+  whose message names the subcommand to re-run. See
+  `clanky-provider-anthropic login` for a working headless example
+  (PKCE + pasted code, no browser).
 - The plugin's working directory is Clanky's working directory.
 
 ## 2. Message envelope

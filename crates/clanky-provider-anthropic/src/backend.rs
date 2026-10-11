@@ -1,18 +1,36 @@
 //! HTTP transport to the Anthropic Messages API.
 //!
 //! Kept behind the [`Backend`] trait so provider logic is testable without
-//! network access. Unlike the OpenAI-compatible plugins, the bearer path
-//! shapes its own headers (spike-confirmed):
+//! network access. Auth is [`AuthMode`]: the two modes differ only in
+//! headers, and every request goes through the same Messages adapter.
 //!
-//! - `Authorization: Bearer <token>` (never `x-api-key` on the OAuth path)
-//! - `anthropic-beta: claude-code-20250219,oauth-2025-04-20`
-//! - `anthropic-version: 2023-06-01` (required — the spike's first 400)
-//! - `user-agent: claude-cli/2.1.280` + `x-app: cli`
+//! - `AuthMode::Bearer` (OAuth; spike-confirmed):
+//!   - `Authorization: Bearer <token>` (never `x-api-key` on this path)
+//!   - `anthropic-beta: claude-code-20250219,oauth-2025-04-20`
+//!   - `anthropic-version: 2023-06-01` (required — the spike's first 400)
+//!   - `user-agent: claude-cli/2.1.280` + `x-app: cli`
+//! - `AuthMode::ApiKey` (`ANTHROPIC_API_KEY`; M11c, best-effort — no key on
+//!   this tenant to test against): the documented plain headers
+//!   - `x-api-key: <key>`
+//!   - `anthropic-version: 2023-06-01`
+//!
+//!   No Claude Code identity headers on the key path: this is the standard
+//!   third-party surface, not the OAuth one.
 
 use std::io::BufRead;
 use std::time::Duration;
 
 use crate::auth::Credentials;
+
+/// How a request authenticates. The two modes differ only in headers
+/// ([`apply_auth`]); the body adapter is shared.
+#[derive(Debug, Clone)]
+pub enum AuthMode {
+    /// OAuth bearer token (the `login` subcommand / refresh path).
+    Bearer(Credentials),
+    /// API key (`ANTHROPIC_API_KEY`) sent as `x-api-key`.
+    ApiKey(String),
+}
 
 /// A failure at the HTTP layer: an HTTP status (when the server answered)
 /// or a connection/client error.
@@ -51,16 +69,11 @@ impl BackendError {
 /// *handle*, not the header strings.
 pub trait Backend {
     /// `GET <url>` with OAuth bearer + beta headers (model listing).
-    fn get_model_list(&self, url: &str, creds: &Credentials) -> Result<String, BackendError>;
+    fn get_model_list(&self, url: &str, auth: &AuthMode) -> Result<String, BackendError>;
 
     /// `POST <url>` with OAuth bearer + beta headers, returning the body.
     /// Non-streaming in M11a (the whole response is read).
-    fn post_message(
-        &self,
-        url: &str,
-        creds: &Credentials,
-        body: &str,
-    ) -> Result<String, BackendError>;
+    fn post_message(&self, url: &str, auth: &AuthMode, body: &str) -> Result<String, BackendError>;
 
     /// POST a request and stream the response as SSE payloads — one item
     /// per event, the joined `data:` lines with the prefix and a single
@@ -70,7 +83,7 @@ pub trait Backend {
     fn post_stream(
         &self,
         url: &str,
-        creds: &Credentials,
+        auth: &AuthMode,
         body: &str,
     ) -> Result<Box<dyn Iterator<Item = Result<String, BackendError>>>, BackendError>;
 }
@@ -124,17 +137,12 @@ impl Default for UreqBackend {
 }
 
 impl Backend for UreqBackend {
-    fn get_model_list(&self, url: &str, creds: &Credentials) -> Result<String, BackendError> {
-        self.call(bearer_headers(self.agent.get(url), creds), None)
+    fn get_model_list(&self, url: &str, auth: &AuthMode) -> Result<String, BackendError> {
+        self.call(apply_auth(self.agent.get(url), auth), None)
     }
 
-    fn post_message(
-        &self,
-        url: &str,
-        creds: &Credentials,
-        body: &str,
-    ) -> Result<String, BackendError> {
-        let req = bearer_headers(self.agent.post(url), creds)
+    fn post_message(&self, url: &str, auth: &AuthMode, body: &str) -> Result<String, BackendError> {
+        let req = apply_auth(self.agent.post(url), auth)
             .set("Content-Type", "application/json")
             .set("Accept", "application/json");
         self.call(req, Some(body))
@@ -143,10 +151,10 @@ impl Backend for UreqBackend {
     fn post_stream(
         &self,
         url: &str,
-        creds: &Credentials,
+        auth: &AuthMode,
         body: &str,
     ) -> Result<Box<dyn Iterator<Item = Result<String, BackendError>>>, BackendError> {
-        let req = bearer_headers(self.agent.post(url), creds)
+        let req = apply_auth(self.agent.post(url), auth)
             .set("Content-Type", "application/json")
             .set("Accept", "text/event-stream");
         let resp = match req.send_string(body) {
@@ -249,14 +257,69 @@ impl<R: BufRead> Iterator for SseLines<R> {
     }
 }
 
-/// Attach the OAuth bearer path's headers (the exact strings the spike
-/// captured; `Authorization` over `x-api-key`, Claude Code identity).
-fn bearer_headers(req: ureq::Request, creds: &Credentials) -> ureq::Request {
-    req.set("Authorization", &format!("Bearer {}", creds.access_token))
-        .set("anthropic-version", "2023-06-01")
-        .set("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-        .set("User-Agent", "claude-cli/2.1.280")
-        .set("x-app", "cli")
+/// Attach the mode's auth headers. The bearer path uses the exact strings
+/// the spike captured (Claude Code identity required by the OAuth surface);
+/// the key path uses the documented plain headers — no Claude Code
+/// identity, since it is the standard third-party surface, not the OAuth
+/// one.
+fn apply_auth(req: ureq::Request, auth: &AuthMode) -> ureq::Request {
+    match auth {
+        AuthMode::Bearer(creds) => req
+            .set("Authorization", &format!("Bearer {}", creds.access_token))
+            .set("anthropic-version", "2023-06-01")
+            .set("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            .set("User-Agent", "claude-cli/2.1.280")
+            .set("x-app", "cli"),
+        AuthMode::ApiKey(key) => req
+            .set("x-api-key", key)
+            .set("anthropic-version", "2023-06-01"),
+    }
+}
+
+/// `apply_auth` sets the mode's headers (checked structurally here; the
+/// wire strings are the spike-captured / documented ones).
+#[cfg(test)]
+mod auth_headers_tests {
+    use super::*;
+
+    fn request() -> ureq::Request {
+        UreqBackend::new()
+            .agent
+            .get("https://api.anthropic.com/v1/messages")
+    }
+
+    #[test]
+    fn bearer_mode_sends_the_oauth_surface_headers() {
+        let req = apply_auth(
+            request(),
+            &AuthMode::Bearer(Credentials {
+                access_token: "sk-ant-oat01-x".into(),
+                refresh_token: "r".into(),
+                expires_at: 0,
+                refresh_token_expires_at: None,
+            }),
+        );
+        assert_eq!(req.header("authorization"), Some("Bearer sk-ant-oat01-x"));
+        assert_eq!(
+            req.header("anthropic-beta"),
+            Some("claude-code-20250219,oauth-2025-04-20")
+        );
+        assert_eq!(req.header("anthropic-version"), Some("2023-06-01"));
+        assert_eq!(req.header("user-agent"), Some("claude-cli/2.1.280"));
+        assert_eq!(req.header("x-app"), Some("cli"));
+        assert_eq!(req.header("x-api-key"), None);
+    }
+
+    #[test]
+    fn api_key_mode_sends_the_documented_plain_headers() {
+        let req = apply_auth(request(), &AuthMode::ApiKey("sk-ant-api03-x".into()));
+        assert_eq!(req.header("x-api-key"), Some("sk-ant-api03-x"));
+        assert_eq!(req.header("anthropic-version"), Some("2023-06-01"));
+        // No OAuth-surface identity on the key path.
+        assert_eq!(req.header("authorization"), None);
+        assert_eq!(req.header("anthropic-beta"), None);
+        assert_eq!(req.header("x-app"), None);
+    }
 }
 
 #[cfg(test)]

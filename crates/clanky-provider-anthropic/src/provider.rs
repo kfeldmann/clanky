@@ -1,11 +1,15 @@
 //! Anthropic provider logic: protocol messages ⇄ the Anthropic Messages API
-//! (bearer-auth OAuth path; SSE-streaming since M11b).
+//! (SSE-streaming since M11b). Auth is [`crate::backend::AuthMode`] (M11c):
 //!
-//! Auth is OAuth-only in M11a: credentials come from the on-disk store
-//! (`~/.clanky/providers/anthropic/credentials.json`, written by the
-//! `login` subcommand), and are refreshed automatically before expiry. A
-//! failed refresh surfaces as an actionable `auth` error — the refresh
-//! token is finite, so "login expired" will be the most common failure.
+//! - **API key** (`ANTHROPIC_API_KEY`, checked per request): the documented
+//!   third-party surface — `x-api-key` headers, no refresh, no expiry. An
+//!   explicit env var wins over the credential store, the same way a CLI
+//!   flag wins over settings (user's choice, not the program's).
+//! - **OAuth** otherwise: credentials come from the on-disk store
+//!   (`~/.clanky/providers/anthropic/credentials.json`, written by the
+//!   `login` subcommand) and are refreshed automatically before expiry. A
+//!   failed refresh surfaces as an actionable `auth` error — the refresh
+//!   token is finite, so "login expired" will be the most common failure.
 
 use std::cell::RefCell;
 
@@ -16,6 +20,7 @@ use clanky_protocol::{
 
 use crate::adapter;
 use crate::auth::{self, Credentials};
+use crate::backend::AuthMode;
 use crate::oauth::{self, OAuthError};
 
 /// Provider name reported at handshake.
@@ -58,6 +63,9 @@ pub struct AnthropicProvider<B: crate::backend::Backend> {
     /// Credential source (defaults to the on-disk store; injectable in
     /// tests). `None` models "no usable credentials".
     loader: CredentialLoader,
+    /// API-key source (defaults to `$ANTHROPIC_API_KEY`; injectable in
+    /// tests). Checked first, per request. `None` means "no key".
+    key_loader: KeyLoader,
     /// Persists refreshed credentials (defaults to the on-disk store).
     saver: CredentialSaver,
 }
@@ -66,11 +74,14 @@ pub struct AnthropicProvider<B: crate::backend::Backend> {
 type CredentialLoader = Box<dyn Fn() -> Option<Credentials>>;
 /// Persists (rotated) credentials after a refresh.
 type CredentialSaver = Box<dyn Fn(&Credentials)>;
+/// Reads the API key; `None` means "no key set".
+type KeyLoader = Box<dyn Fn() -> Option<String>>;
 
 impl AnthropicProvider<crate::backend::UreqBackend> {
-    /// Build the standard provider from the environment. Unlike the other
-    /// plugins there is no key env var: credentials live on disk, so the
-    /// provider always constructs and only reports `auth` errors per request.
+    /// Build the standard provider from the environment. Two auth modes
+    /// (M11c): `ANTHROPIC_API_KEY` if set (checked per request, no refresh),
+    /// otherwise the on-disk OAuth store — so the provider always constructs
+    /// and only reports `auth` errors per request.
     pub fn from_env() -> Self {
         let base_url = std::env::var("ANTHROPIC_BASE_URL")
             .ok()
@@ -88,6 +99,7 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
             default_model: None,
             cancel: CancelFlag::default(),
             loader: Box::new(auth::load),
+            key_loader: Box::new(load_api_key),
             credentials: RefCell::new(None),
             saver: Box::new(|creds| {
                 if let Err(err) = auth::store(creds) {
@@ -97,6 +109,12 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
                 }
             }),
         }
+    }
+
+    /// Inject the API-key loader (tests); defaults to `$ANTHROPIC_API_KEY`.
+    pub fn with_api_key(mut self, key_loader: KeyLoader) -> Self {
+        self.key_loader = key_loader;
+        self
     }
 
     /// Inject the credential loader/saver (tests); both default to the
@@ -121,7 +139,18 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
         format!("{}/{path}", self.base_url.trim_end_matches('/'))
     }
 
-    /// Current credentials, refreshing past-expiry ones in place. The
+    /// Current request auth: the API key if set, else the OAuth store
+    /// (refreshing past-expiry tokens in place). The `Some(Err)` cache means
+    /// "login expired" is not re-attempted per turn.
+    fn current_auth(&self) -> Result<AuthMode, Error> {
+        // The key wins: an explicitly set env var is the user's choice.
+        if let Some(key) = (self.key_loader)() {
+            return Ok(AuthMode::ApiKey(key));
+        }
+        self.current_credentials().map(AuthMode::Bearer)
+    }
+
+    /// Current OAuth credentials, refreshing past-expiry ones in place. The
     /// `Some(Err)` cache means "login expired" is not re-attempted per turn.
     fn current_credentials(&self) -> Result<Credentials, Error> {
         // A cached failure ("login expired") short-circuits every request.
@@ -157,7 +186,7 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
     /// Load credentials via the injected loader; if they exist but are
     /// expired, refresh them first (persisting the rotated refresh token).
     fn load_and_refresh(&self) -> Result<Credentials, Error> {
-        let loaded = (self.loader)().ok_or_else(login_expired_error)?;
+        let loaded = (self.loader)().ok_or_else(no_credentials_error)?;
         if !loaded.expired() {
             return Ok(loaded);
         }
@@ -211,6 +240,9 @@ fn reissue_error(err: &Error) -> Error {
     }
 }
 
+/// The refresh token has expired or been rotated away: re-login (the key
+/// alternative is noted in `no_credentials_error`, not here — a re-login is
+/// the one-step fix for someone on the OAuth path).
 fn login_expired_error() -> Error {
     Error::Provider {
         code: ErrorCode::Auth,
@@ -218,6 +250,25 @@ fn login_expired_error() -> Error {
         retryable: false,
         retry_after_ms: None,
     }
+}
+
+/// No usable credentials at all: both ways to get them, one actionable step
+/// each.
+fn no_credentials_error() -> Error {
+    Error::Provider {
+        code: ErrorCode::Auth,
+        message: "not logged in — run `clanky-provider-anthropic login`, or set ANTHROPIC_API_KEY"
+            .into(),
+        retryable: false,
+        retry_after_ms: None,
+    }
+}
+
+/// The API key from the environment, if set to a non-empty value.
+fn load_api_key() -> Option<String> {
+    std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
 }
 
 /// Map an OAuth-flow failure to a protocol error. `invalid_grant` means the
@@ -279,10 +330,10 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
     }
 
     fn list_models(&mut self) -> Result<Vec<ModelInfo>, Error> {
-        let creds = self.current_credentials()?;
+        let auth = self.current_auth()?;
         let body = self
             .backend
-            .get_model_list(&self.url("v1/models"), &creds)
+            .get_model_list(&self.url("v1/models"), &auth)
             .map_err(|e| map_backend_error(e, "listing models"))?;
         parse_model_list(&body)
     }
@@ -292,7 +343,7 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
         request: &ChatRequest,
         sink: &mut dyn FnMut(ChunkPayload),
     ) -> Result<ChatDone, Error> {
-        let creds = self.current_credentials()?;
+        let auth = self.current_auth()?;
         let body = adapter::build_request_body(
             &request.model,
             &request.messages,
@@ -303,7 +354,7 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
         )?;
         let payloads = self
             .backend
-            .post_stream(&self.url("v1/messages"), &creds, &body)
+            .post_stream(&self.url("v1/messages"), &auth, &body)
             .map_err(|e| map_backend_error(e, "chat completion"))?;
         let mut state = adapter::StreamState::default();
         for payload in payloads {
@@ -433,6 +484,8 @@ mod tests {
     #[derive(Default)]
     struct MockBackend {
         posts: RefCell<Vec<(String, String)>>,
+        /// API keys seen by `post_stream` (empty on the bearer path).
+        api_keys: RefCell<Vec<String>>,
         sse: Vec<String>,
         post_error: Option<crate::backend::BackendError>,
     }
@@ -441,7 +494,7 @@ mod tests {
         fn get_model_list(
             &self,
             _url: &str,
-            _creds: &Credentials,
+            _auth: &AuthMode,
         ) -> Result<String, crate::backend::BackendError> {
             Ok(r#"{"data": []}"#.into())
         }
@@ -449,7 +502,7 @@ mod tests {
         fn post_message(
             &self,
             _url: &str,
-            _creds: &Credentials,
+            _auth: &AuthMode,
             _body: &str,
         ) -> Result<String, crate::backend::BackendError> {
             // Not on the chat path since M11b; fail loudly if it comes back.
@@ -462,13 +515,20 @@ mod tests {
         fn post_stream(
             &self,
             url: &str,
-            creds: &Credentials,
+            auth: &AuthMode,
             body: &str,
         ) -> Result<
             Box<dyn Iterator<Item = Result<String, crate::backend::BackendError>>>,
             crate::backend::BackendError,
         > {
-            assert_eq!(creds.access_token, "sk-ant-oat01-test");
+            assert!(
+                matches!(auth, AuthMode::Bearer(c) if c.access_token == "sk-ant-oat01-test")
+                    || matches!(auth, AuthMode::ApiKey(k) if k == "sk-ant-api03-test"),
+                "unexpected auth mode: {auth:?}"
+            );
+            if let AuthMode::ApiKey(key) = auth {
+                self.api_keys.borrow_mut().push(key.clone());
+            }
             self.posts
                 .borrow_mut()
                 .push((url.to_string(), body.to_string()));
@@ -680,6 +740,100 @@ mod tests {
         );
         // Whatever was emitted before the cancel stays.
         assert!(chunks.is_empty(), "nothing was streamed yet");
+    }
+
+    // --- API-key mode (M11c) ---------------------------------------------
+
+    /// The M11c done-condition: an API-key user gets identical behavior
+    /// through the same adapter — same endpoint, same request body, only
+    /// the auth differs.
+    #[test]
+    fn an_api_key_user_gets_identical_behavior_through_the_same_adapter() {
+        let mut provider = AnthropicProvider::new(
+            MockBackend {
+                sse: payloads(STREAM_BASIC),
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_api_key(Box::new(|| Some("sk-ant-api03-test".into())))
+        .with_credentials(Box::new(|| None), Box::new(|_| {}));
+
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &request(
+                "claude-haiku-4-5",
+                vec![ChatMessage::user("list 5 numbers")],
+            ),
+        );
+        // Identical answer shape to the bearer-path fixture test.
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "1,2,3,4,5");
+        assert_eq!(done.unwrap().finish_reason, FinishReason::Stop);
+        assert_eq!(
+            provider.backend.api_keys.borrow().as_slice(),
+            ["sk-ant-api03-test"],
+            "the key path authenticates every request"
+        );
+        // Same endpoint and body as the bearer test pins.
+        assert_eq!(
+            provider.backend.posts.borrow()[0].0,
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn an_explicit_api_key_wins_over_stored_credentials() {
+        // Invariant: the user's explicit env var is authoritative — it
+        // selects the mode, not the program's preference.
+        let mut provider = AnthropicProvider::new(
+            MockBackend {
+                sse: Vec::new(),
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_api_key(Box::new(|| Some("sk-ant-api03-test".into())))
+        .with_credentials(Box::new(|| Some(test_creds())), Box::new(|_| {}));
+        let _ = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+        )
+        .1;
+        assert_eq!(
+            provider.backend.api_keys.borrow().as_slice(),
+            ["sk-ant-api03-test"]
+        );
+    }
+
+    #[test]
+    fn without_a_key_or_credentials_the_error_names_both_fixes() {
+        let mut provider =
+            AnthropicProvider::new(MockBackend::default(), "https://api.anthropic.com")
+                .with_api_key(Box::new(|| None))
+                .with_credentials(Box::new(|| None), Box::new(|_| {}));
+        let err = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap_err();
+        match err {
+            Error::Provider { code, message, .. } => {
+                assert_eq!(code, ErrorCode::Auth);
+                assert_eq!(
+                    message,
+                    "not logged in — run `clanky-provider-anthropic login`, or set ANTHROPIC_API_KEY"
+                );
+            }
+            other => panic!("unexpected: {other}"),
+        }
     }
 
     // --- error mapping ---------------------------------------------------

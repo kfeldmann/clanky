@@ -162,6 +162,7 @@ per-provider table.
 | --- | --- | --- |
 | DeepInfra | `clanky-provider-deepinfra` | `DEEPINFRA_API_KEY` (or `DEEPINFRA_TOKEN`), optional `DEEPINFRA_URL` |
 | LiteLLM proxy | `clanky-provider-litellm` | `LITELLM_API_KEY`, optional `LITELLM_BASE_URL` |
+| Anthropic | `clanky-provider-anthropic` | `clanky-provider-anthropic login` (OAuth) — or `ANTHROPIC_API_KEY`; optional `ANTHROPIC_BASE_URL` |
 
 Both ship from this workspace:
 
@@ -211,6 +212,44 @@ Notes:
   `merge_reasoning_content_in_choices: true`, reasoning is instead merged into
   the visible content and cannot be separated — the plugin does not attempt
   to split it.)
+
+### Anthropic
+
+The Anthropic plugin talks to the Messages API and authenticates either way
+your account allows:
+
+**OAuth (subscription / enterprise accounts with no API key):**
+
+```sh
+clanky-provider-anthropic login   # once per machine; headless (SSH/container)
+clanky --provider anthropic -p "say hi"
+```
+
+The `login` subcommand runs a PKCE flow with no browser: it prints an
+authorize URL, you open it anywhere, and paste the code back. Credentials
+live in `~/.clanky/providers/anthropic/credentials.json` (0600) and are
+refreshed automatically before expiry. The refresh token is finite and
+rotates on every refresh — when it expires (weeks later), requests start
+failing with an actionable `auth` error and you re-run `login`.
+
+**API key (if your account has one):**
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+clanky --provider anthropic -p "say hi"
+```
+
+An explicitly set key wins over stored credentials (your choice, not the
+program's). The key path sends the documented `x-api-key` headers; the
+OAuth path sends bearer headers and identifies as Claude Code. Everything
+else — streaming, tools, thinking — is identical through both.
+
+Notes:
+
+- The default model is `claude-haiku-4-5` (from the live catalog;
+  overridable with `model` in settings or `--model`).
+- The model list comes from `GET /v1/models` on the authenticated account.
+- `ANTHROPIC_BASE_URL` overrides `https://api.anthropic.com`.
 
 ### Writing a provider plugin
 

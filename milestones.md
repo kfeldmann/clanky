@@ -203,7 +203,7 @@ Architectural decisions already made:
   turn indefinitely (ctrl+c is the escape hatch).
 - Done when: a stranger can `cargo install` and use it.
 
-## ☐ M11 — Anthropic provider plugin (OAuth)
+## ✔ M11 — Anthropic provider plugin (OAuth)
 New provider plugin `crates/clanky-provider-anthropic` (Anthropic Messages
 API), driven exclusively by OAuth — our enterprise tenant has no API keys.
 Split into a/b/c, each shippable and testable on its own. Design notes,
@@ -264,7 +264,7 @@ real tenant.
 - Done when: `clanky -p "count files in /tmp" --provider anthropic --model claude-haiku-4-5` runs
   bash and answers, streamed.
 
-### ☐ M11c — API-key fallback + polish
+### ✔ M11c — API-key fallback + polish
 - `x-api-key` request mode beside bearer (the two auth modes differ only in
   headers) — covers any tenant/user that *does* have a key
 - Actionable-error polish, README section,
@@ -272,6 +272,19 @@ real tenant.
   OAuth-based plugins
 - Done when: an `ANTHROPIC_API_KEY` user gets identical behavior through the
   same adapter.
+
+  As built: auth became `AuthMode` (`Bearer(Credentials)` / `ApiKey(String)`)
+  at the backend boundary; `apply_auth` sets the spike-captured OAuth headers
+  vs. the documented plain key headers (`x-api-key` + `anthropic-version`
+  only — no Claude Code identity on the key path). `$ANTHROPIC_API_KEY` is
+  checked per request and wins over the store (explicit env var = the
+  user's choice, per the project invariants); no refresh/expiry on that
+  path. Error polish: "not logged in — run `clanky-provider-anthropic
+  login`, or set ANTHROPIC_API_KEY" when nothing is usable (the
+  "login expired" message stays re-login-only). Best-effort caveat: our
+  tenant issues no keys, so the key path is header-tested only (structural
+  tests + a mock-backend chat pinned to the same fixtures); first live
+  key-user should sanity-check against the real API.
 
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming

@@ -93,6 +93,9 @@ decisions made during implementation. Check them before redesigning something.
 - DeepInfra: `DEEPINFRA_API_KEY` (fallback `DEEPINFRA_TOKEN`), optional
   `DEEPINFRA_URL` override
 - LiteLLM: `LITELLM_API_KEY`, `LITELLM_BASE_URL`
+- Anthropic: `ANTHROPIC_API_KEY` (optional; key path) or
+  `clanky-provider-anthropic login` (OAuth path, no key needed), optional
+  `ANTHROPIC_BASE_URL`
 - Provider keys are read by the provider plugin, never by Clanky core.
 
 ## DeepInfra (first supported provider)
