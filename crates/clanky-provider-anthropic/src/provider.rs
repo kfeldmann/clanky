@@ -666,7 +666,10 @@ mod tests {
         let mut provider = provider(payloads(STREAM_THINKING));
         let (chunks, done) = run_chat(
             &mut provider,
-            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("17*23?")]),
+            &request(
+                "claude-haiku-4-5-20251001",
+                vec![ChatMessage::user("17*23?")],
+            ),
         );
 
         let thinking: String = chunks
