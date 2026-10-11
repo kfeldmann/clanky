@@ -184,6 +184,28 @@ struct Pricing {
     cache_read: f64,
 }
 
+impl Pricing {
+    /// Estimated session cost in dollars: billed token totals at their
+    /// billed rates (uncached prompt at `input`, cached prompt at
+    /// `cache_read`, completion at `output`), plus the live estimates for
+    /// content no provider report covers yet — estimated prompt tokens at
+    /// the input rate, estimated completion tokens at the output rate.
+    /// The estimates keep the display moving between usage reports, the
+    /// same way they feed the ctx % (see `App::estimated_tokens`).
+    fn session_cost(
+        &self,
+        billed: &app::BilledUsage,
+        estimated_prompt: u64,
+        estimated_completion: u64,
+    ) -> f64 {
+        let uncached = billed.prompt_tokens - billed.cached_tokens;
+        ((uncached + estimated_prompt) as f64 * self.input
+            + billed.cached_tokens as f64 * self.cache_read
+            + (billed.completion_tokens + estimated_completion) as f64 * self.output)
+            / 1_000_000.0
+    }
+}
+
 /// The provider's model catalog, fetched on a worker thread so the status
 /// line can price the session and `/model` can open instantly.
 struct Catalog {
@@ -242,6 +264,21 @@ impl Catalog {
                 .unwrap_or(info.input_price_per_mtok?),
         })
     }
+}
+
+/// Estimated session cost in dollars for the status line: catalog pricing
+/// (dollars per million tokens) × token totals. Every chat round is its own
+/// billed request (its report covers that request's full prompt), and each
+/// turn re-sends the whole conversation, so reports simply sum across
+/// rounds and turns. Cached prompt tokens bill at the cheaper cache-read
+/// rate. Live estimates for content no report covers yet (the user prompt
+/// and tool results between rounds, streamed text/thinking while they
+/// stream) count in as well, so the cost ticks up during streaming the
+/// same way the ctx % does.
+fn session_cost(catalog: &Catalog, launch: &Launch, app: &App) -> Option<f64> {
+    let pricing = catalog.pricing_for(&launch.provider, launch.model.as_deref())?;
+    let (estimated_prompt, estimated_completion) = app.estimated_tokens();
+    Some(pricing.session_cost(&app.billed_usage, estimated_prompt, estimated_completion))
 }
 
 /// Run the interactive session until the user quits.
@@ -1005,22 +1042,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
 
         if dirty {
             let session_name = state.current_name();
-            // Estimated session cost: catalog pricing (dollars per million
-            // tokens) × billed token totals. Every chat round is its own
-            // billed request (its report covers that request's full
-            // prompt), and each turn re-sends the whole conversation, so
-            // reports simply sum across rounds and turns. Cached prompt
-            // tokens bill at the cheaper cache-read rate.
-            let cost = catalog
-                .pricing_for(&launch.provider, launch.model.as_deref())
-                .map(|p| {
-                    let u = &app.billed_usage;
-                    let uncached = u.prompt_tokens - u.cached_tokens;
-                    (uncached as f64 * p.input
-                        + u.cached_tokens as f64 * p.cache_read
-                        + u.completion_tokens as f64 * p.output)
-                        / 1_000_000.0
-                });
+            let cost = session_cost(&catalog, launch, &app);
             // `off`/empty mean disabled and are not shown.
             let thinking = launch
                 .thinking
@@ -1966,6 +1988,81 @@ mod tests {
         assert!(all.contains("/resume"), "{all}");
         assert!(all.contains("/review"), "{all}");
         assert!(all.contains("Review this code"), "{all}");
+    }
+
+    /// Regression test: the status-line cost must tick up during
+    /// streaming, not only when a round's usage report lands (end of
+    /// streaming / before a tool call). Live estimates for content no
+    /// report covers yet count in at the same rates the ctx % uses.
+    #[test]
+    fn cost_includes_live_estimates_between_usage_reports() {
+        let mut catalog = Catalog::new("deepinfra".into());
+        catalog.models = vec![ModelInfo {
+            id: "mock/model".into(),
+            display_name: None,
+            context_window: None,
+            supports_thinking: None,
+            supports_tools: None,
+            supports_text_generation: None,
+            input_price_per_mtok: Some(1.0),
+            output_price_per_mtok: Some(2.0),
+            cache_read_price_per_mtok: None,
+        }];
+        let mut launch = launch();
+        launch.model = Some("mock/model".into());
+        let mut app = app::App::new();
+
+        // Nothing billed and nothing estimated: no cost, no pricing-less
+        // zero either.
+        assert_eq!(session_cost(&catalog, &launch, &app), Some(0.0));
+
+        // Stream some completion content: 300 chars -> 9 full steps of
+        // 32 chars = 288 chars / 3 chars-per-token = 96 estimated
+        // completion tokens.
+        app.on_turn_event(TurnEvent::Text {
+            delta: "x".repeat(300),
+        });
+        let (est_p, est_c) = app.estimated_tokens();
+        assert_eq!((est_p, est_c), (0, 96));
+        // 96 est. completion tokens at $2/Mtok.
+        assert_eq!(
+            session_cost(&catalog, &launch, &app),
+            Some(96.0 * 2.0 / 1e6)
+        );
+
+        // A tool result feeds back to the model: estimated prompt side.
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "y".repeat(300),
+        });
+        let (est_p, est_c) = app.estimated_tokens();
+        assert_eq!((est_p, est_c), (96, 96));
+        // 96 est. prompt tokens at $1/Mtok + 96 est. completion at $2/Mtok.
+        assert_eq!(
+            session_cost(&catalog, &launch, &app),
+            Some((96.0 * 1.0 + 96.0 * 2.0) / 1e6)
+        );
+
+        // The round's usage report covers everything so far: the
+        // estimates clear and the cost snaps back to the billed totals.
+        app.on_turn_event(TurnEvent::Usage {
+            usage: clanky_protocol::Usage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(50),
+                cached_tokens: Some(100),
+            },
+        });
+        assert_eq!(app.estimated_tokens(), (0, 0));
+        // 100 cached prompt tokens at the cache-read rate (falls back to
+        // the input rate) + 50 completion at the output rate.
+        assert_eq!(
+            session_cost(&catalog, &launch, &app),
+            Some((100.0 * 1.0 + 50.0 * 2.0) / 1e6)
+        );
+
+        // No catalog pricing for the model: no cost shown.
+        let empty = Catalog::new("deepinfra".into());
+        assert_eq!(session_cost(&empty, &launch, &app), None);
     }
 
     #[test]
