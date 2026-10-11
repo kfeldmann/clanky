@@ -305,7 +305,7 @@ real tenant.
   key-user should sanity-check against the real API.
 
 ### ☐ M12 — Refinements, Bug Fixes
-1. Add support for ctl+u in the input field (clear from cursor to beginning of line)
+1. [x] Add support for ctl+u in the input field (clear from cursor to beginning of line)
 2. Print-mode (-p) output changes
    - Thinking text seems to end with no newline (should trim and add two newlines so there is a blank after the thinking block)
    - Tool results are not truncated. Should behave like the TUI but without the color

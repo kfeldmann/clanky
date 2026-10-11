@@ -1710,6 +1710,10 @@ fn handle_key(
         (true, KeyCode::Char('l')) => Action::Clear,
         (true, KeyCode::Char('t')) => Action::ToggleThinking,
         (true, KeyCode::Char('e')) => Action::OpenEditor,
+        (true, KeyCode::Char('u')) => {
+            app.clear_to_start();
+            Action::None
+        }
 
         (false, KeyCode::Tab) => {
             app.tab_complete();
@@ -1798,6 +1802,25 @@ mod tests {
                 .collect(),
         );
         guard
+    }
+
+    #[test]
+    fn ctrl_u_clears_from_cursor_to_start() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(cfg.clone());
+        let mut app = app::App::new();
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+        app.input = "hello".into();
+        app.cursor = 3;
+        let key = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, key);
+        assert_eq!(app.input, "lo");
+        assert_eq!(app.cursor, 0);
+        // Plain `u` still types a character.
+        let plain = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, plain);
+        assert_eq!(app.input, "ulo");
     }
 
     #[test]

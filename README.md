@@ -280,6 +280,7 @@ clanky --provider hello-world -p "say hi"
 | `↑`/`↓` | recall previously submitted prompts (the first `↑` saves the current input as a draft; `↓` past the newest entry restores it) |
 | `Tab` | complete the file path at the caret: longest common prefix first, further `Tab` presses cycle candidates |
 | `ctrl+e` | edit the prompt buffer in `$EDITOR` (the TUI suspends; an emptied buffer clears the input) |
+| `ctrl+u` | clear the input from the cursor to the beginning of the line |
 | `ctrl+c` / `ctrl+d` | quit |
 | `ctrl+l` | clear the visible screen |
 | `ctrl+t` | toggle showing streamed thinking (display only; the session file always records it) |

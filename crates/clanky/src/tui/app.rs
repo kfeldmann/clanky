@@ -573,6 +573,12 @@ impl App {
         }
     }
 
+    /// ctrl+u: clear from the cursor to the beginning of the line.
+    pub fn clear_to_start(&mut self) {
+        self.input.replace_range(..self.cursor, "");
+        self.cursor = 0;
+    }
+
     pub fn delete(&mut self) {
         if self.cursor < self.input.len() {
             let next = self.cursor
