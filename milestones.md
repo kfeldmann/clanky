@@ -140,9 +140,9 @@ Architectural decisions already made:
 
 ## ☐ M10 — Polish & release
 - Error messages, logging, docs, packaging (crates.io / release binaries)
-- Example provider plugin in the repo (hello-world, Python) — already added
+- DONE - Example provider plugin in the repo (hello-world, Python) — already added
   in M8 (`examples/hello-world-provider/`), so M10 only needs to link it
-- **LiteLLM provider plugin** (`clanky-provider-litellm`, `crates/
+- DONE - **LiteLLM provider plugin** (`clanky-provider-litellm`, `crates/
   clanky-provider-litellm`): the proxy's OpenAI-compatible `/v1` surface,
   pinned to captures from a live gateway (`tests/fixtures/`). Reads
   `LITELLM_API_KEY` / `LITELLM_BASE_URL` / `LITELLM_MODEL`; metadata
@@ -163,15 +163,15 @@ Architectural decisions already made:
   model (new optional protocol hint, additive in v2) and the `/model` picker
   hides tool-less models. `--model` bypasses the picker, so such a model is
   still reachable and answers with the proxy's error.
-- TUI quality-of-life: `↑`/`↓` prompt recall, `/system` (view the assembled
+- DONE - TUI quality-of-life: `↑`/`↓` prompt recall, `/system` (view the assembled
   system prompt); fix: fresh TUI sessions now seed the system context like
   pipe mode
-- Provider retries: retryable errors (`rateLimit`, `backend` — network
+- DONE - Provider retries: retryable errors (`rateLimit`, `backend` — network
   timeouts included) are retried up to `max_retries` (default 5) with
   exponential backoff (500 ms … 30 s cap), honoring `Retry-After`; a retry
   is surfaced in the transcript (TUI) or on stderr (pipe), and a round that
   already streamed content is never replayed
-- TUI reworked to linear terminal output: the transcript is printed straight
+- DONE - TUI reworked to linear terminal output: the transcript is printed straight
   to the normal buffer (no alternate screen, no mouse capture), so native
   scrolling and selection work and history persists after quitting; replaced
   the ratatui viewport, mouse drag selection, and OSC 52 copy entirely
@@ -182,7 +182,7 @@ Architectural decisions already made:
   any assistant message containing triple backticks in a longer fence;
   that degraded the common case — an answer with a code block — to literal
   text and was removed.)
-- Interrupted turns lose nothing streamed: when a turn is cut short by a
+- DONE - Interrupted turns lose nothing streamed: when a turn is cut short by a
   provider error mid-stream or by ctrl+c quitting mid-stream, the
   accumulated deltas are consolidated and written to the session (for
   thinking and text; partial tool calls/results are not kept), so
@@ -194,7 +194,7 @@ Architectural decisions already made:
   a round record; `record_done` and the quit path (after draining the
   events the worker already sent) flush that accumulator — a completed
   round supersedes it, so nothing is written twice.
-- Timeouts removed — unbounded by design: the 600 s HTTP request timeout in
+- DONE - Timeouts removed — unbounded by design: the 600 s HTTP request timeout in
   all three provider backends and the 600 s default bash command timeout are
   gone. Requests/streams are never killed mid-answer and commands run until
   they finish; the 15 s connect timeout stays. A voluntary per-call
