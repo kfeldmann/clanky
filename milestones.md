@@ -255,13 +255,13 @@ real tenant.
 - Done when: `clanky -p "say hi" --provider anthropic` works on the
   enterprise account, headless (SSH/container), with no key.
 
-### ☐ M11b — Streaming + agentic fidelity
+### ✔ M11b — Streaming + agentic fidelity
 - SSE → protocol chunks: `content_block_delta` text/thinking deltas →
   `kind: "text"` / `kind: "thinking"`; `input_json_delta` →
   `toolCallArgs`; finish-reason and usage mapping
 - Pinned live-capture fixtures (the LiteLLM M10 pattern); golden transcripts
-- Live-testable against the real tenant: bash tool loop end to end
-- Done when: `clanky -p "count files in /tmp" --provider anthropic` runs
+- Live-testable against the real tenant: bash tool loop end to end (do not build live tests into the code)
+- Done when: `clanky -p "count files in /tmp" --provider anthropic --model claude-haiku-4-5` runs
   bash and answers, streamed.
 
 ### ☐ M11c — API-key fallback + polish

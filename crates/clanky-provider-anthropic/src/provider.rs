@@ -1,5 +1,5 @@
 //! Anthropic provider logic: protocol messages ⇄ the Anthropic Messages API
-//! (bearer-auth OAuth path; non-streaming in M11a).
+//! (bearer-auth OAuth path; SSE-streaming since M11b).
 //!
 //! Auth is OAuth-only in M11a: credentials come from the on-disk store
 //! (`~/.clanky/providers/anthropic/credentials.json`, written by the
@@ -11,10 +11,10 @@ use std::cell::RefCell;
 
 use clanky_protocol::{
     CancelFlag, Capabilities, ChatDone, ChatRequest, ChunkPayload, Error, ErrorCode, FinishReason,
-    Handler, ModelInfo, PluginInfo, Usage,
+    Handler, ModelInfo, PluginInfo,
 };
 
-use crate::adapter::{self, AnthropicResponse};
+use crate::adapter;
 use crate::auth::{self, Credentials};
 use crate::oauth::{self, OAuthError};
 
@@ -46,9 +46,9 @@ pub struct AnthropicProvider<B: crate::backend::Backend> {
     base_url: String,
     /// Advertised default model (handshake hint for pickers).
     default_model: Option<String>,
-    /// Set by the plugin runtime (spec §7); checked around the blocking HTTP
-    /// call (non-streaming in M11a) — a cancel during the single call is
-    /// covered by the client's kill fallback.
+    /// Set by the plugin runtime (spec §7); checked between SSE events so a
+    /// cancel stops generation at the next event boundary. A cancel during a
+    /// single blocked read is covered by the client's kill fallback.
     cancel: CancelFlag,
     /// Credentials loaded lazily (they may have been written by `login`
     /// after this process started) and refreshed on expiry. `None` until the
@@ -299,14 +299,35 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
             request.tools.as_deref(),
             request.sampling.as_ref(),
             request.thinking,
+            true,
         )?;
-        let raw = self
+        let payloads = self
             .backend
-            .post_message(&self.url("v1/messages"), &creds, &body)
+            .post_stream(&self.url("v1/messages"), &creds, &body)
             .map_err(|e| map_backend_error(e, "chat completion"))?;
-        let response: AnthropicResponse = serde_json::from_str(&raw)
-            .map_err(|e| Error::Protocol(format!("malformed messages response: {e}")))?;
-        let parts = adapter::response_to_events(&response, sink);
+        let mut state = adapter::StreamState::default();
+        for payload in payloads {
+            // Spec §7: stop promptly once the client cancels. The check runs
+            // between SSE events; a cancel during a blocked read is handled
+            // by the client's kill fallback.
+            if self.cancel.is_cancelled() {
+                return Ok(ChatDone {
+                    finish_reason: FinishReason::Cancelled,
+                    usage: state.clone_usage(),
+                });
+            }
+            let payload = payload.map_err(|e| map_backend_error(e, "chat stream"))?;
+            let trimmed = payload.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let event: adapter::StreamEvent = serde_json::from_str(trimmed)
+                .map_err(|e| Error::Protocol(format!("malformed stream event: {e}")))?;
+            if state.ingest(&event, sink) {
+                break; // message_stop
+            }
+        }
+        let parts = state.finish();
         Ok(ChatDone {
             finish_reason: parts.finish_reason,
             usage: parts.usage,
@@ -384,17 +405,336 @@ fn map_backend_error(err: crate::backend::BackendError, context: &str) -> Error 
     }
 }
 
-/// Usage part carried between the adapter and the done mapping (kept local;
-/// the protocol `Usage` is constructed in `adapter::response_to_events`).
-#[allow(dead_code)]
-fn usage_from(u: &adapter::AnthropicUsage) -> Option<Usage> {
-    Some(Usage {
-        prompt_tokens: u.input_tokens,
-        completion_tokens: u.output_tokens,
-        cached_tokens: u.cache_read_input_tokens,
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::{StreamEvent, StreamState};
+    use clanky_protocol::{ChatMessage, ChunkPayload, Tool, Usage};
+    use serde_json::json;
+    use std::cell::RefCell;
 
-/// `FinishReason` is re-exported here for the adapter's mapping tests.
-#[allow(unused_imports)]
-use FinishReason as _;
+    /// The spike's streaming captures, pinned in `tests/fixtures/`
+    /// (one per shape: plain text, thinking, tool_use).
+    const STREAM_BASIC: &str = include_str!("../tests/fixtures/stream-basic.txt");
+    const STREAM_TOOLS: &str = include_str!("../tests/fixtures/stream-tools.txt");
+    const STREAM_THINKING: &str = include_str!("../tests/fixtures/stream-thinking.txt");
+
+    /// A canned backend that never touches disk (credentials injected).
+    fn test_creds() -> Credentials {
+        Credentials {
+            access_token: "sk-ant-oat01-test".into(),
+            refresh_token: "sk-ant-ort01-test".into(),
+            expires_at: auth::now_ms() + 3_600_000,
+            refresh_token_expires_at: None,
+        }
+    }
+
+    /// Records requests and replays a captured SSE stream.
+    #[derive(Default)]
+    struct MockBackend {
+        posts: RefCell<Vec<(String, String)>>,
+        sse: Vec<String>,
+        post_error: Option<crate::backend::BackendError>,
+    }
+
+    impl crate::backend::Backend for MockBackend {
+        fn get_model_list(
+            &self,
+            _url: &str,
+            _creds: &Credentials,
+        ) -> Result<String, crate::backend::BackendError> {
+            Ok(r#"{"data": []}"#.into())
+        }
+
+        fn post_message(
+            &self,
+            _url: &str,
+            _creds: &Credentials,
+            _body: &str,
+        ) -> Result<String, crate::backend::BackendError> {
+            // Not on the chat path since M11b; fail loudly if it comes back.
+            Err(crate::backend::BackendError::new(
+                None,
+                "unexpected non-streaming call",
+            ))
+        }
+
+        fn post_stream(
+            &self,
+            url: &str,
+            creds: &Credentials,
+            body: &str,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<String, crate::backend::BackendError>>>,
+            crate::backend::BackendError,
+        > {
+            assert_eq!(creds.access_token, "sk-ant-oat01-test");
+            self.posts
+                .borrow_mut()
+                .push((url.to_string(), body.to_string()));
+            if let Some(err) = &self.post_error {
+                return Err(err.clone());
+            }
+            Ok(Box::new(self.sse.clone().into_iter().map(Ok)))
+        }
+    }
+
+    /// The captured SSE text → the payload strings the backend yields
+    /// (`data:` lines only, one per event — what `backend::sse_payloads`
+    /// produces off the wire, with the `event:` lines ignored).
+    fn payloads(text: &str) -> Vec<String> {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.strip_prefix(' ').unwrap_or(line).to_string())
+            .filter(|line| !line.trim().is_empty())
+            .collect()
+    }
+
+    fn provider(sse: Vec<String>) -> AnthropicProvider<MockBackend> {
+        AnthropicProvider::new(
+            MockBackend {
+                sse,
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_credentials(Box::new(|| Some(test_creds())), Box::new(|_| {}))
+    }
+
+    fn run_chat(
+        provider: &mut AnthropicProvider<MockBackend>,
+        request: &ChatRequest,
+    ) -> (Vec<ChunkPayload>, Result<ChatDone, Error>) {
+        let mut chunks = Vec::new();
+        let done = provider.chat(request, &mut |c| chunks.push(c));
+        (chunks, done)
+    }
+
+    fn request(model: &str, messages: Vec<ChatMessage>) -> ChatRequest {
+        ChatRequest {
+            model: model.into(),
+            messages,
+            tools: None,
+            sampling: None,
+            thinking: None,
+        }
+    }
+
+    // --- streaming chat ---------------------------------------------------
+
+    #[test]
+    fn plain_stream_answers_with_text_and_usage() {
+        let mut provider = provider(payloads(STREAM_BASIC));
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &request(
+                "claude-haiku-4-5",
+                vec![ChatMessage::user("list 5 numbers")],
+            ),
+        );
+
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "1,2,3,4,5");
+
+        let done = done.unwrap();
+        assert_eq!(done.finish_reason, FinishReason::Stop);
+        assert_eq!(
+            done.usage,
+            Some(Usage {
+                prompt_tokens: Some(685),
+                completion_tokens: Some(13),
+                cached_tokens: Some(0),
+            })
+        );
+    }
+
+    #[test]
+    fn tool_stream_maps_to_tool_call_chunks_and_runs_the_loop_shape() {
+        let mut provider = provider(payloads(STREAM_TOOLS));
+        let mut req = request(
+            "claude-haiku-4-5",
+            vec![ChatMessage::user("list /tmp with the bash tool")],
+        );
+        req.tools = Some(vec![Tool {
+            name: "bash".into(),
+            description: Some("Run a shell command".into()),
+            parameters: None,
+        }]);
+        let (chunks, done) = run_chat(&mut provider, &req);
+
+        let starts: Vec<&ChunkPayload> = chunks
+            .iter()
+            .filter(|c| matches!(c, ChunkPayload::ToolCallStart { .. }))
+            .collect();
+        assert_eq!(starts.len(), 1);
+        match starts[0] {
+            ChunkPayload::ToolCallStart { index, id, name } => {
+                assert_eq!(*index, 0);
+                assert_eq!(id, "toolu_01Ko64L89gKDZTEabFP8ZXrQ");
+                assert_eq!(name, "bash");
+            }
+            _ => unreachable!(),
+        }
+        let args: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::ToolCallArgs { args_chunk, .. } => Some(args_chunk.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+            json!({"command": "ls -la /tmp"})
+        );
+        // The turn ends ToolCalls, so the agentic loop runs the tool.
+        assert_eq!(done.unwrap().finish_reason, FinishReason::ToolCalls);
+
+        // The request that went out asked for a stream.
+        let body: serde_json::Value =
+            serde_json::from_str(&provider.backend.posts.borrow()[0].1).unwrap();
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn thinking_stream_surfaces_thinking_chunks() {
+        let mut provider = provider(payloads(STREAM_THINKING));
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5", vec![ChatMessage::user("17*23?")]),
+        );
+
+        let thinking: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(thinking.contains("17 * 23"), "{thinking}");
+        // The visible answer is clean.
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "17 × 23 = 391");
+        assert_eq!(done.unwrap().finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn a_user_sampling_stream_false_wins_over_the_provider_default() {
+        // Invariant: the user's `stream = false` in sampling is authoritative
+        // — the provider never flips it back on.
+        let mut provider = provider(Vec::new());
+        let mut req = request("claude-haiku-4-5", vec![ChatMessage::user("hi")]);
+        req.sampling = Some(clanky_protocol::Sampling::from_iter([(
+            "stream".into(),
+            json!(false),
+        )]));
+        let _ = run_chat(&mut provider, &req).1;
+        let body: serde_json::Value =
+            serde_json::from_str(&provider.backend.posts.borrow()[0].1).unwrap();
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn chat_posts_to_the_messages_endpoint_with_bearer_credentials() {
+        let mut provider = provider(Vec::new());
+        let _ = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+        )
+        .1;
+        assert_eq!(
+            provider.backend.posts.borrow()[0].0,
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    // --- cancellation -----------------------------------------------------
+
+    #[test]
+    fn cancel_between_events_stops_generation_and_reports_cancelled() {
+        // The basic capture, cut short after the first text delta (what the
+        // stream looks like when the user hits ctrl+c between events).
+        let events = payloads(STREAM_BASIC);
+        let mut provider = provider(events[..4].to_vec());
+        provider.cancel.cancel();
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+        );
+        let done = done.unwrap();
+        assert_eq!(
+            done.finish_reason,
+            FinishReason::Cancelled,
+            "the client's cancel, not the stream's own stop"
+        );
+        // Whatever was emitted before the cancel stays.
+        assert!(chunks.is_empty(), "nothing was streamed yet");
+    }
+
+    // --- error mapping ---------------------------------------------------
+
+    #[test]
+    fn stream_errors_surface_as_backend_errors() {
+        let mut provider = provider(Vec::new());
+        provider.backend.post_error =
+            Some(crate::backend::BackendError::new(Some(429), "rate limited"));
+        let err = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap_err();
+        match err {
+            Error::Provider {
+                code, retryable, ..
+            } => {
+                assert_eq!(code, ErrorCode::RateLimit);
+                assert!(retryable);
+            }
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_event_is_a_protocol_error() {
+        let mut provider = provider(vec!["{not json}".into()]);
+        let err = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap_err();
+        match err {
+            Error::Protocol(message) => {
+                assert!(message.contains("malformed stream event"), "{message}")
+            }
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn the_first_event_parses_and_message_stop_terminates() {
+        // Adapter-level sanity for the state the provider drives.
+        let mut state = StreamState::default();
+        let mut terminal = false;
+        for payload in payloads(STREAM_BASIC) {
+            let event: StreamEvent = serde_json::from_str(payload.trim()).unwrap();
+            if state.ingest(&event, &mut |_| {}) {
+                terminal = true;
+                break;
+            }
+        }
+        assert!(terminal, "message_stop must be terminal");
+    }
+}

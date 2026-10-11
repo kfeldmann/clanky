@@ -1,6 +1,7 @@
 # Planning — Anthropic provider plugin (M11)
 
-> **Status: flow confirmed, design in progress.** M11 is broken into a/b/c
+> **Status: M11a and M11b complete (OAuth + streaming chat); M11c (API-key
+> fallback + polish) remains.** M11 is broken into a/b/c
 > in `milestones.md`; this file records design decisions for the OAuth
 > flow and the spike checklist. Update with as-built notes as work lands,
 > the way M8/M10 did.
@@ -133,21 +134,21 @@ One live capture on our tenant, recorded as fixtures. The constants and
 shaping above come from Pi, which demonstrably works on this account —
 the spike confirms they hold for us and records what Pi cannot:
 
-- [ ] Authorize URL builds and the tenant's login page accepts it; watch
+- [x] Authorize URL builds and the tenant's login page accepts it; watch
       for `forceLoginOrgUUID` / workspace-scoping enforcement — if the
       tenant forces org selection, that changes the hardcoded URL params
       (Pi cannot tell us this for our tenant)
-- [ ] Pasted code exchanges for access + refresh tokens; record token
+- [x] Pasted code exchanges for access + refresh tokens; record token
       lifetime and refresh-token lifetime (finite for subscription
       logins; refresh will be the most common failure mode)
-- [ ] Non-streaming `/v1/messages` with the bearer + beta headers +
+- [x] Non-streaming `/v1/messages` with the bearer + beta headers +
       identity system block returns 200 with a completion; record the
       exact beta header string and endpoint used
-- [ ] Verify our tool names (`bash`) pass through on the bearer path, or
+- [x] Verify our tool names (`bash`) pass through on the bearer path, or
       that the Claude Code case-normalized names are needed
-- [ ] Capture the full request/response pair as the seed fixtures for
+- [x] Capture the full request/response pair as the seed fixtures for
       the M11a/M11b test suites
-- [ ] (If any step fails) document the failure mode; fallback directions:
+- [x] (If any step fails — none did; no fallback needed) document the failure mode; fallback directions:
       reuse an existing `ant` CLI profile's stored credentials from
       `~/.config/anthropic`, or get the supported client path confirmed
       with Anthropic
@@ -187,3 +188,47 @@ Later generalized with protocol v2: the adapter merges the whole open
 Messages API accepts) and only fills gaps — the `max_tokens` default and
 the budget-derived `thinking` block are sent solely for keys the user did
 not set, so an explicit `thinking`/`max_tokens` in `[sampling]` wins.
+
+### As built: streaming (M11b)
+
+Chat is SSE-streaming (`stream: true` by default), following the LiteLLM
+M10 pattern but with Anthropic-native events instead of OpenAI deltas:
+
+- `backend.rs` grew `post_stream` + `sse_payloads` (same framing as the
+  other plugins; Anthropic interleaves `event:` lines with `data:` lines,
+  which the framer ignores). The non-streaming `post_message` stays (a
+  user-set `stream = false` in `[sampling]` buys the one-shot shape).
+- `adapter.rs` grew `StreamEvent` (lenient parse of all five event types)
+  and `StreamState`, which maps: `content_block_delta`
+  `text_delta`/`thinking_delta` → `text`/`thinking` chunks;
+  `input_json_delta.partial_json` → `toolCallArgs` fragments verbatim
+  (Anthropic guarantees per-block fragments concatenate to one valid JSON
+  object — the empty leading fragment in the capture goes out as-is);
+  `content_block_start` of `tool_use` → `toolCallStart`;
+  `message_delta` → finish reason (`stop_reason` rides the same `delta`
+  field a content_block_delta uses) and the cumulative usage (which wins
+  over `message_start`'s snapshot); `message_stop` is terminal.
+- Wire vs protocol indices: Anthropic numbers *all* content blocks
+  (text/thinking/tool_use interleave); the protocol numbers *tool calls*.
+  `StreamState` keys blocks by wire `index` and assigns tool-call indices
+  in announcement order, so `toolCallArgs` fragments land on the right
+  call. Deltas for an unannounced block are dropped (the wire guarantees a
+  `content_block_start` first).
+- Cancel (spec §7) is checked between SSE events, like LiteLLM; a cancel
+  mid-turn ends with `cancelled` plus whatever usage was already reported.
+- Usage precedence note: `message_delta.usage` is cumulative and
+  authoritative; `message_start`'s is a first-draft snapshot.
+- `build_request_body` gained a `stream` parameter (default true on the
+  chat path), filled only as a gap — a user `stream = false` in
+  `[sampling]` wins, per the invariants.
+- Fixtures: the spike's three stream captures (`stream-basic.txt`,
+  `stream-thinking.txt`, `stream-tools.txt`) pin golden adapter tests;
+  provider tests replay them through a mock backend. The live
+  "done when" (`clanky -p "count files in /tmp" --provider anthropic
+  --model claude-haiku-4-5`) runs the bash tool loop streamed — confirmed
+  against the real tenant; not built into the test suite.
+
+Tool names: the spike confirmed plain `bash` passes through the bearer
+path with no Claude Code case-normalization needed (the capture shows
+`"name":"bash"` verbatim), so no mapping exists. The README section is
+still M11c scope.
