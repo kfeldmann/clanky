@@ -72,7 +72,7 @@ Architectural decisions already made:
 
 ## ✔ M3 — TUI basics
 - Ratatui + crossterm: chat view (scrollable transcript), input line with caret,
-  streaming render, markdown wrap (fences, headings, lists, bold/italic/code)
+  streaming render, markdown wrap (fences, headings, lists, tables w/ alignment, bold/italic/code)
 - Turns run on a worker thread; events stream to the render loop over a channel
 - Fallback to command-line mode when stdin/stdout redirected (also `clanky` with
   a piped stdin and no `-p`)

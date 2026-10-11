@@ -1,9 +1,10 @@
 //! Minimal markdown rendering for the chat view (M3).
 //!
 //! Supports what a coding assistant actually emits: fenced code blocks,
-//! headings, bullet/ordered lists, blockquotes, inline code, bold, and
-//! italic. Unrecognized syntax is rendered as plain text, so nothing is
-//! ever lost.
+//! headings, bullet/ordered lists, blockquotes, tables (with `:--`,
+//! `:--:`, `--:` column alignment), inline code, bold, and italic.
+//! Unrecognized syntax is rendered as plain text, so nothing is ever
+//! lost.
 //!
 //! [`wrap`] pre-wraps styled lines to a viewport width so the scroll math
 //! in the TUI stays exact (ratatui's own wrap would happen inside the
@@ -17,11 +18,15 @@ use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 pub fn render(text: &str, base: Style) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_code = false;
-    for raw in text.split('\n') {
+    let source: Vec<&str> = text.split('\n').collect();
+    let mut i = 0;
+    while i < source.len() {
+        let raw = source[i];
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
             in_code = !in_code;
             lines.push(Line::from(Span::styled(raw.to_string(), dim(base))));
+            i += 1;
             continue;
         }
         if in_code {
@@ -32,9 +37,35 @@ pub fn render(text: &str, base: Style) -> Vec<Line<'static>> {
             }
             spans.push(Span::styled(trimmed.to_string(), code_style(base)));
             lines.push(Line::from(spans));
+            i += 1;
+            continue;
+        }
+        // A table needs a header row, a delimiter row (`--` cells, with
+        // optional `:` for column alignment), and at least the columns to
+        // line up. Consume the whole block at once; a non-matching row
+        // ends the table and is rendered on its own.
+        if let Some(alignments) = source
+            .get(i + 1)
+            .and_then(|next| table_delimiter(next.trim()))
+            .filter(|a| split_table_row(trimmed).len() == a.len())
+        {
+            let mut body: Vec<Vec<&str>> = Vec::new();
+            let mut j = i + 2;
+            while let Some(row) = source.get(j) {
+                let row = row.trim();
+                if row.is_empty() || !row.contains('|') {
+                    break;
+                }
+                body.push(split_table_row(row));
+                j += 1;
+            }
+            let header = split_table_row(trimmed);
+            lines.extend(render_table(&header, &body, &alignments, base));
+            i = j;
             continue;
         }
         lines.extend(render_block_line(raw, base));
+        i += 1;
     }
     lines
 }
@@ -178,6 +209,178 @@ pub fn wrap_text(text: &str, style: Style, width: u16) -> Vec<Line<'static>> {
         return vec![Line::default()];
     }
     wrap(&lines, width)
+}
+
+/// Parse a table delimiter row like `| :-- | --: | :--: |` into one
+/// alignment per column. A leading/trailing `|` is required so ordinary
+/// dashes (`--` used as a horizontal rule, or `a - b` prose) don't turn
+/// into a table.
+fn table_delimiter(line: &str) -> Option<Vec<Align>> {
+    let t = line.trim();
+    if !t.starts_with('|') || !t.ends_with('|') {
+        return None;
+    }
+    let cells: Vec<&str> = split_table_row(t);
+    if cells.is_empty() {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let c = cell.trim();
+        let left = c.starts_with(':');
+        let right = c.ends_with(':');
+        let dashes = &c[if left { 1 } else { 0 }..c.len() - if right { 1 } else { 0 }];
+        if !dashes.chars().all(|ch| ch == '-') || dashes.is_empty() {
+            return None;
+        }
+        aligns.push(match (left, right) {
+            (true, true) => Align::Center,
+            (true, false) => Align::Left,
+            (false, true) => Align::Right,
+            (false, false) => Align::None,
+        });
+    }
+    Some(aligns)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Align {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// Split a table row on `|`, dropping the required leading and trailing
+/// pipes. Escaped pipes (`\|`) are not split markers.
+fn split_table_row(line: &str) -> Vec<&str> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    let mut cells = Vec::new();
+    let mut start = 0;
+    let bytes = t.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'|' {
+            cells.push(&t[start..i]);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    cells.push(&t[start..]);
+    cells.iter().map(|c| c.trim()).collect()
+}
+
+/// Render a table block as aligned rows: header bold, a `---` rule under
+/// it, and body rows padded so every column lines up. Cells are rendered
+/// inline (bold/italic/code work inside cells), so widths are measured
+/// after styling. Wide characters count double, matching the wrapper.
+fn render_table<'a>(
+    header: &[&'a str],
+    body: &[Vec<&'a str>],
+    aligns: &[Align],
+    base: Style,
+) -> Vec<Line<'static>> {
+    // Render cells first (styles), then measure.
+    let render_row = |cells: &[&'a str]| -> Vec<Vec<Span<'static>>> {
+        (0..aligns.len())
+            .map(|c| {
+                let raw = cells.get(c).map(|s| unescape_pipes(s)).unwrap_or_default();
+                inline(&raw, base)
+            })
+            .collect()
+    };
+    let header_cells = render_row(header);
+    let body_cells: Vec<Vec<Vec<Span<'static>>>> = body.iter().map(|r| render_row(r)).collect();
+
+    let mut widths = vec![0usize; aligns.len()];
+    for cells in std::iter::once(&header_cells).chain(body_cells.iter()) {
+        for (col, spans) in cells.iter().enumerate() {
+            let w: usize = spans.iter().map(|s| s.content.width()).sum();
+            widths[col] = widths[col].max(w);
+        }
+    }
+
+    let pad_cell = |spans: Vec<Span<'static>>, align: Align, width: usize| -> Vec<Span<'static>> {
+        let w: usize = spans.iter().map(|s| s.content.width()).sum();
+        let pad = width.saturating_sub(w);
+        let pad_span = |n: usize| Span::styled(" ".repeat(n), base);
+        match align {
+            Align::Right => {
+                let mut out = vec![pad_span(pad)];
+                out.extend(spans);
+                out
+            }
+            Align::Center => {
+                let mut out = vec![pad_span(pad / 2)];
+                out.extend(spans);
+                out.push(pad_span(pad - pad / 2));
+                out
+            }
+            // Unspecified (`--`) and left (`:--`) both align left.
+            _ => {
+                let mut out = spans;
+                out.push(pad_span(pad));
+                out
+            }
+        }
+    };
+
+    let mut lines = Vec::new();
+    let row_line = |cells: Vec<Vec<Span<'static>>>, bold: bool| -> Line<'static> {
+        let mut spans = vec![Span::styled("| ".to_string(), dim(base))];
+        for (col, cell) in cells.into_iter().enumerate() {
+            if col > 0 {
+                spans.push(Span::styled(" | ".to_string(), dim(base)));
+            }
+            let styled: Vec<Span<'static>> = if bold {
+                cell.into_iter()
+                    .map(|mut s| {
+                        s.style = s.style.add_modifier(Modifier::BOLD);
+                        s
+                    })
+                    .collect()
+            } else {
+                cell
+            };
+            spans.extend(pad_cell(styled, aligns[col], widths[col]));
+        }
+        spans.push(Span::styled(" |".to_string(), dim(base)));
+        Line::from(spans)
+    };
+    lines.push(row_line(header_cells, true));
+    lines.push(Line::from(Span::styled(
+        {
+            let mut rule = String::from("| ");
+            for (col, &w) in widths.iter().enumerate() {
+                if col > 0 {
+                    rule.push_str(" | ");
+                }
+                rule.push_str(&"-".repeat(w));
+            }
+            rule.push_str(" |");
+            rule
+        },
+        dim(base),
+    )));
+    for cells in body_cells {
+        lines.push(row_line(cells, false));
+    }
+    lines
+}
+
+/// Turn `\|` back into `|` inside table cells.
+fn unescape_pipes(cell: &str) -> String {
+    if cell.contains("\\|") {
+        cell.replace("\\|", "|")
+    } else {
+        cell.to_string()
+    }
 }
 
 fn render_block_line(raw: &str, base: Style) -> Vec<Line<'static>> {
@@ -459,6 +662,70 @@ mod tests {
 
     fn span_text(spans: &[Span<'static>]) -> String {
         spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn tables_align_columns() {
+        let md = "| name | qty |\n| :-- | --: |\n| cat | 1 |\n| hippopotamus | 42 |";
+        let lines = render(md, Style::new());
+        let texts: Vec<String> = lines.iter().map(|l| span_text(&l.spans)).collect();
+        assert_eq!(
+            texts,
+            [
+                "| name         | qty |",
+                "| ------------ | --- |",
+                "| cat          |   1 |",
+                "| hippopotamus |  42 |",
+            ]
+        );
+        // Header is bold.
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn table_center_alignment() {
+        let md = "| a | b |\n| :-: | -- |\n| x | yy |";
+        let lines = render(md, Style::new());
+        let texts: Vec<String> = lines.iter().map(|l| span_text(&l.spans)).collect();
+        assert_eq!(texts, ["| a | b  |", "| - | -- |", "| x | yy |"]);
+    }
+
+    #[test]
+    fn table_inline_styling_and_escaped_pipes() {
+        let md = "| code | note |\n| -- | -- |\n| `x\\|y` | **b** |";
+        let lines = render(md, Style::new());
+        let texts: Vec<String> = lines.iter().map(|l| span_text(&l.spans)).collect();
+        // The escaped pipe stays in the cell; the cell is one column.
+        assert_eq!(texts[2], "| x|y  | b    |");
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(Color::Cyan))
+        );
+    }
+
+    #[test]
+    fn table_stops_at_blank_line() {
+        let md = "| a | b |\n| -- | -- |\n| 1 | 2 |\n\n| 3 | 4 |";
+        let lines = render(md, Style::new());
+        let texts: Vec<String> = lines.iter().map(|l| span_text(&l.spans)).collect();
+        // The row after the blank line has no header, so it renders inline.
+        assert_eq!(texts[0], "| a | b |");
+        assert_eq!(texts[2], "| 1 | 2 |");
+        assert!(texts[4].contains("3 | 4"));
+    }
+
+    #[test]
+    fn dashes_alone_are_not_a_table() {
+        let lines = render("--\n:--\n--:", Style::new());
+        let texts: Vec<String> = lines.iter().map(|l| span_text(&l.spans)).collect();
+        assert_eq!(texts, ["--", ":--", "--:"]);
     }
 
     #[test]
