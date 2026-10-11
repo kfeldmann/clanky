@@ -800,7 +800,8 @@ impl App {
                 let preview_style = if failed {
                     Style::new().fg(Color::Red)
                 } else {
-                    Style::new().fg(Color::Gray)
+                    // Matches inline code rendering (see markdown.rs).
+                    Style::new().fg(Color::Cyan)
                 };
                 // The preview spans multiple lines: emit one source Line
                 // per output line (continuations aligned under the first
@@ -866,7 +867,9 @@ impl App {
             // Show the part exactly as it is sent to the model: the
             // content already carries its own provenance heading.
             Entry::SystemPart { content } => {
-                let dimmed = Style::new().fg(Color::Gray);
+                // The user's terminal PS1 blue (ANSI 0;34): keep the
+                // system prompt visually kin to the prompt they know.
+                let dimmed = Style::new().fg(Color::Blue);
                 lines.extend(markdown::wrap_text(content, dimmed, width));
                 lines.push(Line::default());
             }
@@ -1284,7 +1287,7 @@ mod tests {
         let lines = app.entry_lines(2, 80);
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::DarkGray));
         let last = lines[0].spans.last().unwrap();
-        assert_eq!(last.style.fg, Some(Color::Gray));
+        assert_eq!(last.style.fg, Some(Color::Cyan));
         assert_eq!(last.content, "ok");
 
         // Tool-call failures (ERROR: prefix) are failures too.

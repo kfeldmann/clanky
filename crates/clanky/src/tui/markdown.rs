@@ -158,9 +158,13 @@ fn cap_lines(
     }
     let budget = width - note_width;
     let tail = &mut shown[max_lines - 1];
-    let mut piece = String::new();
+    // Keep the surviving content at its own style (the row may mix
+    // styles); only the note itself gets `note_style`. Rebuilding the
+    // row as a single `note_style` span would recolor content the user
+    // already saw in another color.
+    let mut spans: Vec<Span<'static>> = Vec::new();
     let mut piece_width = 0usize;
-    for (c, _style) in tail.spans.iter().flat_map(|s| {
+    for (c, style) in tail.spans.iter().flat_map(|s| {
         let span_style = s.style.patch(tail.style);
         s.content.chars().map(move |c| (c, span_style))
     }) {
@@ -169,10 +173,15 @@ fn cap_lines(
             break;
         }
         piece_width += cw;
-        piece.push(c);
+        match spans.last_mut() {
+            Some(last) if last.style == style => {
+                last.content.to_mut().push(c);
+            }
+            _ => spans.push(Span::styled(c.to_string(), style)),
+        }
     }
-    piece.push_str(&note);
-    *tail = Line::from(Span::styled(piece, note_style));
+    spans.push(Span::styled(note, note_style));
+    *tail = Line::from(spans);
     shown
 }
 
@@ -892,6 +901,24 @@ mod tests {
         let uncapped_texts: Vec<String> = uncapped.iter().map(|l| span_text(&l.spans)).collect();
         assert_eq!(texts[0], uncapped_texts[0]);
         assert_eq!(texts[1], uncapped_texts[1]);
+    }
+
+    #[test]
+    fn wrap_capped_note_line_keeps_content_styles() {
+        // The surviving content on the note row keeps its own style;
+        // only the `… (+N more lines)` note uses `note_style`. A row
+        // colored cyan (a tool result preview) must not flip colors
+        // mid-row when the cap kicks in.
+        let content = Span::styled("word ".repeat(40), Style::new().fg(Color::Cyan));
+        let lines = vec![Line::from(vec![content])];
+        let capped = wrap_capped(&lines, 40, 1, Style::new().fg(Color::DarkGray));
+        assert_eq!(capped.len(), 1);
+        let text = span_text(&capped[0].spans);
+        assert!(text.contains("… (+"), "{text}");
+        assert_eq!(capped[0].spans[0].style.fg, Some(Color::Cyan));
+        let note = capped[0].spans.last().unwrap();
+        assert!(note.content.contains("more lines)"));
+        assert_eq!(note.style.fg, Some(Color::DarkGray));
     }
 
     #[test]
