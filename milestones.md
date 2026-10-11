@@ -201,6 +201,20 @@ Architectural decisions already made:
   positive integer (schema `minimum: 1`, no `maximum`; 0 or non-integer →
   error). Trade-off accepted: a stuck upstream or hanging command holds the
   turn indefinitely (ctrl+c is the escape hatch).
+- DONE - TUI rendering stability (status-line duplication on `$EDITOR`
+  return and resize; invisible last column under GNU screen): the tail
+  repositioning now uses absolute cursor addressing (CUP, clamped by every
+  terminal) instead of "cursor next line with a huge count", which VTE
+  (xfce4-terminal) treats as scrolling — that was the duplicate status line
+  after ctrl+e and the status-line ladder while resizing. A fresh anchor
+  (startup, resize, editor roundtrip) draws the block ending on the bottom
+  row instead of printing at the bottom edge and scrolling. And the last
+  terminal column is never painted: writing it sets the pending-wrap flag
+  (the following CR/LF scrolls, and GNU screen defers displaying a
+  character written there until the screen scrolls — the "invisible last
+  column"), so the whole layout is computed one column narrower and the
+  reserved column stays blank. Everything else (native scrolling, printed
+  history, popups) is unchanged.
 - Done when: a stranger can `cargo install` and use it.
 
 ## ✔ M11 — Anthropic provider plugin (OAuth)

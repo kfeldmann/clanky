@@ -11,10 +11,23 @@
 //! Tab-completion popup, the status line, and the input line. Everything
 //! above that region is final: once printed it is never touched again.
 //!
-//! The redraw is cursor-relative. After every render the cursor sits on
-//! the input row; moving up `tail_height - 1` rows reaches the top of the
-//! redrawable region (the tail spans that many rows above the input row),
-//! so no absolute positions are tracked. Finalized
+//! Two terminal-level rules keep the region stable:
+//!
+//! - The renderer tracks the screen row the input line sits on and moves
+//!   with absolute cursor addressing (CUP), which every terminal clamps
+//!   to the screen — never with relative moves whose overflow scrolls.
+//!   A fresh anchor (startup, resize, returning from `$EDITOR`) positions
+//!   the block so it *ends* on the bottom row instead of printing at the
+//!   bottom edge and scrolling the previous one into history.
+//! - No row is ever painted into the terminal's last column. Writing it
+//!   sets the pending-wrap flag, and a following CR/LF then scrolls the
+//!   screen one row (duplicate status lines after `$EDITOR`, status lines
+//!   streaming upward on resize); GNU screen also defers displaying a
+//!   character written there until the screen scrolls, so the last column
+//!   would look invisible. Reserving one blank column sidesteps the
+//!   whole pending-wrap minefield.
+//!
+//! Finalized
 //! transcript lines are printed once above the tail and never rewritten
 //! (`App::printed_*` bookkeeping); a streaming entry that outgrows the
 //! screen has its oldest rows committed the same way, keeping the tail
@@ -24,7 +37,7 @@
 
 use std::io::{self, Write};
 
-use ratatui::crossterm::cursor::{MoveTo, MoveToColumn, MoveToNextLine, MoveUp};
+use ratatui::crossterm::cursor::{MoveTo, MoveToColumn};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::style::{Color, Modifier, Style};
@@ -61,6 +74,11 @@ pub struct Screen<W: Write> {
     out: W,
     width: u16,
     height: u16,
+    /// Screen row the input line sits on (the anchor; every region draw
+    /// starts at the top of the tail, `anchor - tail_height + 1`). Rows
+    /// below the bottom are never addressed — CUP would clamp there and
+    /// the block would be drawn one row low.
+    anchor: u16,
     /// Rows printed by the last render that the next render rewrites
     /// (streaming tail + popup + status + input).
     tail_height: usize,
@@ -69,25 +87,18 @@ pub struct Screen<W: Write> {
 impl<W: Write> Screen<W> {
     /// Take ownership of a writer and anchor the region at the bottom row.
     pub fn new(out: W, width: u16, height: u16) -> Self {
-        let mut this = Self {
+        Self {
             out,
             width,
             height,
+            anchor: height.saturating_sub(1),
             tail_height: 0,
-        };
-        this.reanchor();
-        this
+        }
     }
 
     /// Current terminal dimensions as last seen by the renderer.
     pub fn size(&self) -> (u16, u16) {
         (self.width, self.height)
-    }
-
-    /// Move to the bottom row (clamped: cursor down never scrolls) and the
-    /// first column. This is the anchor every region draw starts from.
-    fn reanchor(&mut self) {
-        let _ = execute!(self.out, MoveToNextLine(u16::MAX), MoveToColumn(0));
     }
 
     /// Re-anchor after a resize (the buffer was reflowed, the anchor is
@@ -96,12 +107,12 @@ impl<W: Write> Screen<W> {
     pub fn resync(&mut self, app: &mut App, width: u16, height: u16) {
         self.width = width;
         self.height = height;
+        self.anchor = height.saturating_sub(1);
         self.tail_height = 0;
         let sealed = app.sealed_boundary();
         if sealed < app.entries.len() {
             app.set_printed(sealed, 0);
         }
-        self.reanchor();
     }
 
     /// Erase the visible screen (Ctrl+L). Scrollback is preserved; the
@@ -109,7 +120,7 @@ impl<W: Write> Screen<W> {
     pub fn clear_screen(&mut self) {
         let _ = execute!(self.out, Clear(ClearType::All), MoveTo(0, 0));
         self.tail_height = 0;
-        self.reanchor();
+        self.anchor = self.height.saturating_sub(1);
     }
 
     /// Finish: a fresh line below the transcript so the shell prompt does
@@ -130,7 +141,12 @@ impl<W: Write> Screen<W> {
         modal: Option<&Modal>,
         completion: Option<&CompletionState>,
     ) -> io::Result<()> {
-        let width = self.width;
+        // One column is reserved: painting the terminal's last column
+        // would set the pending-wrap flag (and a character written there
+        // is not displayed by GNU screen until the screen scrolls), so
+        // the whole layout — wrapping, status padding, boxes — happens
+        // at one column less. The reserved column stays blank.
+        let width = self.width.saturating_sub(1).max(1);
         let height = self.height;
 
         // The footer's height caps how many rows of the streaming entry
@@ -182,26 +198,33 @@ impl<W: Write> Screen<W> {
         }
         tail.extend(footer.lines);
 
-        // Move to the top of the previous tail, print the new rows (the
-        // final row without a trailing newline: the cursor stays on it),
-        // and erase whatever is left below when the tail shrank.
-        //
-        // The last render parked the cursor at the input caret, so the
-        // column must be reset to 0 first: MoveUp preserves the column,
-        // and printing from column > 0 would shift the tail right (a
-        // full-width status line would then wrap and scroll the screen).
-        // The tail spans the input row minus (height - 1) rows above it,
-        // so moving up `height - 1` lands on its top row; moving up the
-        // full height would overshoot one row and drift the region
-        // upward with every render.
-        if self.tail_height > 0 {
-            execute!(
-                self.out,
-                MoveUp(self.tail_height as u16 - 1),
-                MoveToColumn(0)
-            )?;
+        // A fresh anchor (startup, resize, `$EDITOR` roundtrip) re-anchors
+        // at the bottom row and draws the block ending on it: the previous
+        // stream position is unknown (the buffer was reflowed, the editor
+        // scrolled), so printing upward from the bottom is the only safe
+        // start. With a live anchor the block is rewritten in place: CUP
+        // to the top of the tail and print the rows. CUP never scrolls
+        // (every terminal clamps it inside the screen), so a re-anchor can
+        // never push an old status line into history.
+        let fresh = self.tail_height == 0;
+        let new_rows = commit.len() + tail.len();
+        if fresh {
+            self.anchor = self.height.saturating_sub(1);
         }
-        let shrink = commit.len() + tail.len() < self.tail_height;
+        // The top row of the block being drawn: with a live anchor it is
+        // the previous tail's top (the block may grow downward from it);
+        // fresh, it is however far above the bottom row the block needs.
+        let top = if fresh {
+            self.anchor
+                .saturating_sub(u16::try_from(new_rows.saturating_sub(1)).unwrap_or(u16::MAX))
+        } else {
+            self.anchor
+                .saturating_sub(self.tail_height as u16)
+                .saturating_add(1)
+        };
+
+        execute!(self.out, MoveTo(0, top))?;
+        let shrink = new_rows < self.tail_height;
         let mut first = true;
         for line in commit.iter().chain(tail.iter()) {
             if !first {
@@ -211,13 +234,16 @@ impl<W: Write> Screen<W> {
             print_line(&mut self.out, line, width)?;
             // Erase stale characters when the new row is shorter than
             // what the previous render left on it (e.g. the input
-            // placeholder replaced by shorter typed text).
+            // placeholder replaced by shorter typed text). The full
+            // width is cleared, including the reserved column.
             execute!(self.out, Clear(ClearType::UntilNewLine))?;
         }
         if shrink {
             execute!(self.out, Clear(ClearType::FromCursorDown))?;
         }
         self.tail_height = tail.len();
+        self.anchor =
+            top.saturating_add(u16::try_from(new_rows.saturating_sub(1)).unwrap_or(u16::MAX));
         execute!(self.out, MoveToColumn(footer.caret))?;
         self.out.flush()
     }
@@ -786,16 +812,32 @@ mod tests {
                             body.push(c);
                         }
                         let params = body.trim_start_matches('[');
-                        let n = params
+                        let nums: Vec<usize> = params
                             .split(';')
-                            .next()
-                            .and_then(|p| p.parse::<usize>().ok())
-                            .unwrap_or(1);
+                            .map(|p| p.parse::<usize>().ok().unwrap_or(1))
+                            .collect();
+                        let n = nums.first().copied().unwrap_or(1);
                         match final_byte {
                             Some('A') => row = row.saturating_sub(n.max(1)),
                             Some('E') => {
                                 row = (row + n.max(1)).min(height - 1);
                                 col = 0;
+                            }
+                            // CUP (what the renderer positions with):
+                            // clamped, never scrolls.
+                            Some('H') | Some('f') => {
+                                row = nums
+                                    .first()
+                                    .copied()
+                                    .unwrap_or(1)
+                                    .saturating_sub(1)
+                                    .min(height - 1);
+                                col = nums
+                                    .get(1)
+                                    .copied()
+                                    .unwrap_or(1)
+                                    .saturating_sub(1)
+                                    .min(width - 1);
                             }
                             Some('G') => col = n.saturating_sub(1).min(width - 1),
                             Some('K') => {
@@ -1050,13 +1092,111 @@ mod tests {
             "{status_row}"
         );
         assert!(
-            status_row.ends_with("/ commands · ctrl+c quit"),
+            status_row.trim_end().ends_with("/ commands · ctrl+c quit"),
             "{status_row}"
         );
-        assert_eq!(status_row.chars().count(), 80, "one full-width status row");
+        // The last column is reserved (never painted) so the terminal's
+        // pending-wrap state is never entered; the row spans the rest.
+        assert_eq!(
+            status_row.chars().count(),
+            80,
+            "one status row, last column left blank: {status_row:?}"
+        );
         let input_row = &rows[7];
         assert_eq!(input_row.trim_end(), " ❯ Say hello", "{input_row}");
         assert_eq!(input_row.chars().count(), 80, "placeholder remnants erased");
+    }
+
+    /// Regression (editor roundtrip): returning from `$EDITOR` used to
+    /// print the tail at the bottom edge via a relative "move down a lot"
+    /// (CNL with a huge count), which some terminals (VTE: xfce4-terminal)
+    /// treat as scrolling instead of clamping — duplicating the status
+    /// line one row up on every editor return. The renderer now positions
+    /// with absolute CUP and ends the block on the bottom row instead of
+    /// printing past it, so nothing ever scrolls.
+    #[test]
+    fn editor_roundtrip_does_not_scroll_the_status_line() {
+        let mut app = App::new();
+        app.push_user("hello");
+        let mut s = Screen::new(Buf::default(), 80, 8);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        // ctrl+e: the TUI resyncs at the same size, then renders.
+        let (w, h) = s.size();
+        s.resync(&mut app, w, h);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+
+        let rows = s.take_out().emulated_screen(80, 8);
+        let status_rows = rows
+            .iter()
+            .filter(|r| r.contains("deepinfra · mock/model"))
+            .count();
+        assert_eq!(status_rows, 1, "one status line, not scrolled: {rows:?}");
+        assert!(
+            rows[6].contains("deepinfra"),
+            "status above the input: {rows:?}"
+        );
+        assert!(
+            rows[7].contains("type a message…"),
+            "input on the bottom row: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("❯ hello")),
+            "the committed prompt stays in history: {rows:?}"
+        );
+    }
+
+    /// Regression (resize): each resize used to print the tail at the
+    /// bottom edge (scrolling one row per redraw), so resizing streamed a
+    /// ladder of status lines upward. After a resync the block is drawn
+    /// ending on the bottom row, and further renders rewrite it in place.
+    #[test]
+    fn resize_re_anchors_and_then_rewrites_in_place() {
+        let mut app = App::new();
+        app.push_user("hello");
+        let mut s = Screen::new(Buf::default(), 80, 8);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+
+        // Widen the terminal: resync, then two more renders.
+        s.resync(&mut app, 100, 8);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
+
+        let rows = s.take_out().emulated_screen(100, 8);
+        let status_rows = rows
+            .iter()
+            .filter(|r| r.contains("deepinfra · mock/model"))
+            .count();
+        assert_eq!(status_rows, 1, "no status-line ladder: {rows:?}");
+        assert!(rows[6].contains("deepinfra"), "{rows:?}");
+        assert!(rows[7].contains("type a message…"), "{rows:?}");
+        // Everything above the re-anchored block is untouched.
+        assert!(rows[..4].iter().all(|r| r.trim().is_empty()), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("❯ hello")),
+            "the committed prompt stays put: {rows:?}"
+        );
+    }
+
+    /// The terminal's last column is never painted: writing it sets the
+    /// pending-wrap flag (a following CR/LF then scrolls, and GNU screen
+    /// defers displaying the character until the screen scrolls — the
+    /// "invisible last column"). Every row the renderer emits stops one
+    /// column short; the status line pads up to (but not including) it.
+    #[test]
+    fn rows_never_paint_the_last_column() {
+        let mut app = App::new();
+        app.busy = true; // full-width status right edge
+        let mut s = Screen::new(Buf::default(), 40, 8);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        let text = s.take_out().text();
+        // No printable row in the stream reaches 40 display columns
+        // (escape codes are already stripped by `text`).
+        for line in text.split('\n') {
+            assert!(
+                line.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() < 40,
+                "row painted into the last column: {line:?}"
+            );
+        }
     }
 
     /// Regression test: multi-line tool output used to reach the

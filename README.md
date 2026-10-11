@@ -289,6 +289,20 @@ clanky --provider hello-world -p "say hi"
 | `/system` | show the assembled system prompt (context files and skills, as sent to the model) |
 | `/md [flags] [file]` | export the session as a Markdown file (asks for a filename in a modal when none is given) |
 
+### Rendering notes
+
+The transcript prints straight to the terminal's normal buffer (no
+alternate screen, no mouse capture), so native scrolling, selection, and
+post-quit history all work. Two details of that model are visible:
+
+- The rightmost column of the terminal is never painted. Writing the
+  last column puts the terminal into a pending-wrap state whose
+  follow-up behaviors differ across terminals (and GNU `screen` defers
+  displaying a character written there until the screen scrolls), so the
+  renderer reserves it and the last column stays blank.
+- Resizing, returning from `$EDITOR`, and clearing redraw the bottom
+  region in place; nothing is pushed into scrollback by a redraw.
+
 ### `ctrl+t` — show/hide thinking
 
 `ctrl+t` toggles whether streamed thinking is displayed. The status line
