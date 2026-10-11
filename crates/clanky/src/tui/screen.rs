@@ -13,12 +13,15 @@
 //!
 //! Two terminal-level rules keep the region stable:
 //!
-//! - The renderer tracks the screen row the input line sits on and moves
-//!   with absolute cursor addressing (CUP), which every terminal clamps
-//!   to the screen — never with relative moves whose overflow scrolls.
-//!   A fresh anchor (startup, resize, returning from `$EDITOR`) positions
-//!   the block so it *ends* on the bottom row instead of printing at the
-//!   bottom edge and scrolling the previous one into history.
+//! - A fresh anchor (startup, resize, returning from `$EDITOR`) positions
+//!   the redrawable block with absolute cursor addressing (CUP), so it
+//!   *ends* on the bottom row; CUP is clamped by every terminal and never
+//!   scrolls. (The old "cursor next line with a huge count" printed at
+//!   the bottom edge and scrolled, which some terminals — VTE — turn
+//!   into a duplicated status line.) Steady-state redraws are
+//!   cursor-relative instead: printing a growing transcript scrolls the
+//!   screen, which invalidates every absolute row address, so only
+//!   relative moves can track a live tail across scrolls.
 //! - No row is ever painted into the terminal's last column. Writing it
 //!   sets the pending-wrap flag, and a following CR/LF then scrolls the
 //!   screen one row (duplicate status lines after `$EDITOR`, status lines
@@ -37,7 +40,7 @@
 
 use std::io::{self, Write};
 
-use ratatui::crossterm::cursor::{MoveTo, MoveToColumn};
+use ratatui::crossterm::cursor::{MoveTo, MoveToColumn, MoveUp};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{Clear, ClearType};
 use ratatui::style::{Color, Modifier, Style};
@@ -74,11 +77,6 @@ pub struct Screen<W: Write> {
     out: W,
     width: u16,
     height: u16,
-    /// Screen row the input line sits on (the anchor; every region draw
-    /// starts at the top of the tail, `anchor - tail_height + 1`). Rows
-    /// below the bottom are never addressed — CUP would clamp there and
-    /// the block would be drawn one row low.
-    anchor: u16,
     /// Rows printed by the last render that the next render rewrites
     /// (streaming tail + popup + status + input).
     tail_height: usize,
@@ -91,7 +89,6 @@ impl<W: Write> Screen<W> {
             out,
             width,
             height,
-            anchor: height.saturating_sub(1),
             tail_height: 0,
         }
     }
@@ -107,7 +104,6 @@ impl<W: Write> Screen<W> {
     pub fn resync(&mut self, app: &mut App, width: u16, height: u16) {
         self.width = width;
         self.height = height;
-        self.anchor = height.saturating_sub(1);
         self.tail_height = 0;
         let sealed = app.sealed_boundary();
         if sealed < app.entries.len() {
@@ -120,7 +116,6 @@ impl<W: Write> Screen<W> {
     pub fn clear_screen(&mut self) {
         let _ = execute!(self.out, Clear(ClearType::All), MoveTo(0, 0));
         self.tail_height = 0;
-        self.anchor = self.height.saturating_sub(1);
     }
 
     /// Finish: a fresh line below the transcript so the shell prompt does
@@ -198,33 +193,43 @@ impl<W: Write> Screen<W> {
         }
         tail.extend(footer.lines);
 
-        // A fresh anchor (startup, resize, `$EDITOR` roundtrip) re-anchors
-        // at the bottom row and draws the block ending on it: the previous
-        // stream position is unknown (the buffer was reflowed, the editor
-        // scrolled), so printing upward from the bottom is the only safe
-        // start. With a live anchor the block is rewritten in place: CUP
-        // to the top of the tail and print the rows. CUP never scrolls
-        // (every terminal clamps it inside the screen), so a re-anchor can
-        // never push an old status line into history.
-        let fresh = self.tail_height == 0;
+        // Positioning splits by anchor state, because the two states can
+        // trust different things:
+        //
+        // - Fresh (startup, resize, `$EDITOR` roundtrip): the cursor's
+        //   whereabouts are unknown (the buffer was reflowed, the editor
+        //   scrolled), so positioning is absolute: CUP to the row where
+        //   the block *ends* on the bottom row. CUP never scrolls (every
+        //   terminal clamps it inside the screen) — the previous "cursor
+        //   next line with a huge count" printed at the bottom edge and
+        //   scrolled, which VTE turned into duplicated status lines.
+        //   Stale content left in the region by the editor or the reflow
+        //   is wiped first.
+        // - Live (steady state): the previous render parked the cursor at
+        //   the input caret, and the tail spans `tail_height` rows ending
+        //   there — so a relative move up reaches its top regardless of
+        //   where the screen has scrolled. Printing rows past the bottom
+        //   (a growing transcript) scrolls the screen, which silently
+        //   invalidates *every* absolute row address, so a live anchor
+        //   must not use CUP: it would redraw into stale rows and push the
+        //   tail into scrollback on every render. The column is reset
+        //   first (MoveUp preserves it, and printing from column > 0
+        //   would shift the tail right).
         let new_rows = commit.len() + tail.len();
-        if fresh {
-            self.anchor = self.height.saturating_sub(1);
-        }
-        // The top row of the block being drawn: with a live anchor it is
-        // the previous tail's top (the block may grow downward from it);
-        // fresh, it is however far above the bottom row the block needs.
-        let top = if fresh {
-            self.anchor
-                .saturating_sub(u16::try_from(new_rows.saturating_sub(1)).unwrap_or(u16::MAX))
-        } else {
-            self.anchor
-                .saturating_sub(self.tail_height as u16)
-                .saturating_add(1)
-        };
-
-        execute!(self.out, MoveTo(0, top))?;
         let shrink = new_rows < self.tail_height;
+        if self.tail_height == 0 {
+            let top = (self.height as usize)
+                .saturating_sub(new_rows)
+                .min(self.height as usize - 1);
+            execute!(self.out, MoveTo(0, top as u16))?;
+            execute!(self.out, Clear(ClearType::FromCursorDown))?;
+        } else {
+            execute!(
+                self.out,
+                MoveUp(self.tail_height as u16 - 1),
+                MoveToColumn(0)
+            )?;
+        }
         let mut first = true;
         for line in commit.iter().chain(tail.iter()) {
             if !first {
@@ -242,8 +247,6 @@ impl<W: Write> Screen<W> {
             execute!(self.out, Clear(ClearType::FromCursorDown))?;
         }
         self.tail_height = tail.len();
-        self.anchor =
-            top.saturating_add(u16::try_from(new_rows.saturating_sub(1)).unwrap_or(u16::MAX));
         execute!(self.out, MoveToColumn(footer.caret))?;
         self.out.flush()
     }
@@ -790,13 +793,22 @@ mod tests {
         }
 
         /// Emulate the recorded stream on a `width`×`height` screen and
-        /// return the final rows, space-padded to `width`. Handles the
+        /// return the final rows plus every row that scrolled off the
+        /// top (scrollback), both space-padded to `width`. Handles the
         /// sequences this module emits (CUU `A`, CNL `E`, CHA `G`,
         /// EL `K`, ED `J`, SGR `m` ignored) plus CR, LF with scroll at
         /// the bottom edge, and autowrap — enough to catch redraws that
-        /// start at the wrong row or column, or leave stale characters.
+        /// start at the wrong row or column, leave stale characters, or
+        /// wrongly push redrawn content (e.g. the status line) into
+        /// scrollback.
         fn emulated_screen(&self, width: usize, height: usize) -> Vec<String> {
+            self.emulated(width, height).0
+        }
+
+        /// Like [`Self::emulated_screen`], also returning scrollback.
+        fn emulated(&self, width: usize, height: usize) -> (Vec<String>, Vec<String>) {
             let mut rows = vec![vec![' '; width]; height];
+            let mut history: Vec<Vec<char>> = Vec::new();
             let (mut row, mut col) = (0usize, 0usize);
             let mut chars = std::str::from_utf8(&self.0).unwrap().chars().peekable();
             while let Some(c) = chars.next() {
@@ -859,7 +871,7 @@ mod tests {
                     '\r' => col = 0,
                     '\n' => {
                         if row + 1 == height {
-                            rows.remove(0);
+                            history.push(rows.remove(0));
                             rows.push(vec![' '; width]);
                         } else {
                             row += 1;
@@ -873,7 +885,7 @@ mod tests {
                         if col + w > width {
                             col = 0;
                             if row + 1 == height {
-                                rows.remove(0);
+                                history.push(rows.remove(0));
                                 rows.push(vec![' '; width]);
                             } else {
                                 row += 1;
@@ -884,7 +896,12 @@ mod tests {
                     }
                 }
             }
-            rows.into_iter().map(|r| r.into_iter().collect()).collect()
+            let screen = rows.into_iter().map(|r| r.into_iter().collect()).collect();
+            let history = history
+                .into_iter()
+                .map(|r| r.into_iter().collect())
+                .collect();
+            (screen, history)
         }
     }
 
@@ -1197,6 +1214,107 @@ mod tests {
                 "row painted into the last column: {line:?}"
             );
         }
+    }
+
+    /// Regression (absolute addressing): steady-state redraws used to be
+    /// positioned with CUP against a tracked screen row, but printing a
+    /// growing transcript scrolls the screen, which invalidates that
+    /// row — every subsequent redraw then landed too low and pushed the
+    /// status and input lines into scrollback, once per render, so
+    /// scrollback filled with copies of the tail. Steady-state redraws
+    /// must be cursor-relative (scroll-proof); only a fresh anchor uses
+    /// CUP, and its block ends on the bottom row without scrolling.
+    #[test]
+    fn growing_transcript_never_pushes_the_tail_into_scrollback() {
+        let mut app = App::new();
+        let mut s = screen(Buf::default(), 40, 6);
+        // One screenful of scrolling history: many finalized entries,
+        // each rendered right after the previous (steady-state path).
+        for n in 0..12 {
+            app.push_user(&format!("msg-{n}"));
+            s.render(&mut app, &status(), None, None, None).unwrap();
+        }
+        let (rows, history) = s.take_out().emulated(40, 6);
+        // Scrollback holds only transcript lines, never tail rows.
+        for r in &history {
+            assert!(
+                !r.contains("0% ctx") && !r.contains("type a message"),
+                "a redraw pushed the tail into scrollback: {r:?}"
+            );
+        }
+        // Exactly one status line, on the screen, above the input.
+        let status_rows = rows
+            .iter()
+            .filter(|r| r.contains("deepinfra · mock/model"))
+            .count();
+        assert_eq!(status_rows, 1, "one status line: {rows:?}");
+        assert!(rows[5].contains("type a message…"), "{rows:?}");
+    }
+
+    /// Regression (resize): a fresh anchor after a resize used to place
+    /// the block at an absolute top row computed by subtraction, which
+    /// saturates at row 0 when the block is taller than the screen (the
+    /// streaming entry is reprinted in full at the new width); the block
+    /// then printed past the bottom and scrolled — streaming status-line
+    /// copies upward, the exact symptom resync was meant to fix. A fresh
+    /// anchor must draw the block *ending* on the bottom row: rows that
+    /// do not fit scroll once (transcript), never the tail repeatedly.
+    #[test]
+    fn resize_with_a_tall_streaming_entry_does_not_scroll_the_tail() {
+        let mut app = App::new();
+        app.busy = true;
+        let mut s = screen(Buf::default(), 20, 6);
+        for n in 1..=8 {
+            app.on_turn_event(TurnEvent::Text {
+                delta: format!("line-{n}\n"),
+            });
+        }
+        s.render(&mut app, &status(), None, None, None).unwrap();
+
+        // Resize: the anchor is lost, the streaming entry is reprinted
+        // in full at the new width (taller than one screen here).
+        s.resync(&mut app, 20, 6);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+
+        let (rows, history) = s.take_out().emulated(20, 6);
+        for r in &history {
+            assert!(
+                !r.contains("0% ctx") && !r.contains("type a message"),
+                "the resize pushed the tail into scrollback: {r:?}"
+            );
+        }
+        let status_rows = rows.iter().filter(|r| r.contains("0% ctx")).count();
+        assert_eq!(status_rows, 1, "one status line: {rows:?}");
+        assert!(rows[5].contains("❯"), "input on the bottom row: {rows:?}");
+    }
+
+    /// Steady-state redraws keep working while the tail *grows* across
+    /// the bottom row (the streaming entry gets longer than the budget
+    /// and its oldest rows commit, scrolling the screen between renders):
+    /// the region stays put and the tail is rewritten in place, not
+    /// pushed into scrollback.
+    #[test]
+    fn tail_growth_scrolls_once_per_commit_not_per_redraw() {
+        let mut app = App::new();
+        app.busy = true;
+        let mut s = screen(Buf::default(), 20, 6);
+        for n in 1..=16 {
+            app.on_turn_event(TurnEvent::Text {
+                delta: format!("line-{n}\n"),
+            });
+            s.render(&mut app, &status(), None, None, None).unwrap();
+        }
+        let (rows, history) = s.take_out().emulated(20, 6);
+        for r in &history {
+            assert!(
+                !r.contains("0% ctx") && !r.contains("type a message"),
+                "a redraw pushed the tail into scrollback: {r:?}"
+            );
+        }
+        assert!(
+            rows.iter().filter(|r| r.contains("0% ctx")).count() == 1,
+            "{rows:?}"
+        );
     }
 
     /// Regression test: multi-line tool output used to reach the

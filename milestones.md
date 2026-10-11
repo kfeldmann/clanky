@@ -207,8 +207,12 @@ Architectural decisions already made:
   terminal) instead of "cursor next line with a huge count", which VTE
   (xfce4-terminal) treats as scrolling — that was the duplicate status line
   after ctrl+e and the status-line ladder while resizing. A fresh anchor
-  (startup, resize, editor roundtrip) draws the block ending on the bottom
-  row instead of printing at the bottom edge and scrolling. And the last
+  (startup, resize, editor roundtrip) is placed with absolute CUP (clamped
+  everywhere) so the block ends on the bottom row; steady-state redraws
+  stay cursor-relative, because printing a growing transcript scrolls the
+  screen and invalidates every absolute row address — the first attempt
+  tracked an anchor row and used CUP for steady-state redraws, which
+  pushed the tail into scrollback once per render. And the last
   terminal column is never painted: writing it sets the pending-wrap flag
   (the following CR/LF scrolls, and GNU screen defers displaying a
   character written there until the screen scrolls — the "invisible last
