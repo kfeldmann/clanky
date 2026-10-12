@@ -40,11 +40,11 @@ if [ ! -x target/release/clanky-subagents]; then
   exit 1
 fi
 test -d docker/binaries || mkdir docker/binaries
-cp target/release/clanky docker/binaries/clanky
+cp target/release/clanky                    docker/binaries/clanky
 cp target/release/clanky-provider-deepinfra docker/binaries/clanky-provider-deepinfra
-cp target/release/clanky-provider-litellm docker/binaries/clanky-provider-litellm
+cp target/release/clanky-provider-litellm   docker/binaries/clanky-provider-litellm
 cp target/release/clanky-provider-anthropic docker/binaries/clanky-provider-anthropic
-cp target/release/clanky-subagents docker/binaries/clanky-subagents
+cp target/release/clanky-subagents          docker/binaries/clanky-subagents
 chmod 755 docker/binaries/clanky \
     docker/binaries/clanky-provider-deepinfra \
     docker/binaries/clanky-provider-litellm \
