@@ -1,0 +1,55 @@
+diagram top-down
+
+user "User"
+
+group left-right fill="" color=""
+group top-down "Subagents\n(crates/clanky-subagents)"
+    subagents "clanky-subagents\nN parallel clanky -pq jobs"
+end
+group top-down "Clanky Core\n(crates/clanky)"
+    tui "TUI\nsrc/tui/"
+    cli "CLI\n-p / -q / -pq"
+    settings "Config & Settings\nsettings.toml" : cylinder
+    context "Context Assembly\ncontext.rs, prompts.rs, skills.rs"
+    session "Sessions\nsession.rs transcripts" : cylinder
+    turn "Agentic Turn Loop\nturn.rs" color="#0D47A1" fill="#ffd54f"
+    tools "Tools\nbash tool"
+end
+end
+
+group "Protocol Layer\n(crates/clanky-protocol)"
+    client "Client\nrequest/response, streaming"
+    transport "Transports\nstdio pipe | in-process loopback"
+    wire "Wire Rules\nserve.rs / process.rs"
+end
+
+group left-right "Provider Plugins"
+    deepinfra "provider-deepinfra\nOpenAI-compatible HTTP"
+    litellm "provider-litellm\nLiteLLM proxy"
+    anthropic "provider-anthropic\nkeys | OAuth login"
+end
+
+group "Provider APIs"
+    api "Remote LLM APIs\nDeepInfra | LiteLLM | Anthropic" : cylinder color="#388E3C" fill="#c8e6c9"
+end
+
+user --> tui
+user --> cli
+tui --> turn
+cli --> turn
+settings --> context
+context --> turn
+turn -- "tool calls" --> tools
+turn --> context
+turn -- "assistant messages" --> session
+turn --> client
+client --> transport
+transport --> wire
+wire --> deepinfra
+wire --> litellm
+wire --> anthropic
+deepinfra --> api
+litellm --> api
+anthropic --> api
+subagents -- dotted "spawns (process)" --> cli
+session -- dotted "resume / export" --> tui
