@@ -181,10 +181,14 @@ per-provider table.
 | LiteLLM proxy | `clanky-provider-litellm` | `LITELLM_API_KEY`, optional `LITELLM_BASE_URL` |
 | Anthropic | `clanky-provider-anthropic` | `clanky-provider-anthropic login` (OAuth) — or `ANTHROPIC_API_KEY`; optional `ANTHROPIC_BASE_URL` |
 
-Both ship from this workspace:
+All three ship from this workspace:
 
 ```sh
-cargo install clanky clanky-provider-deepinfra clanky-provider-litellm
+cargo install \
+  clanky \
+  clanky-provider-deepinfra \
+  clanky-provider-litellm \
+  clanky-provider-anthropic
 ```
 
 ### LiteLLM
