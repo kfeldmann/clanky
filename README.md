@@ -338,10 +338,10 @@ post-quit history all work. Two details of that model are visible:
 
 ### `ctrl+t` — show/hide thinking
 
-`ctrl+t` toggles whether streamed thinking is displayed. The status line
-always shows the current state (`think:on` / `think:off`). This is a
+`ctrl+t` toggles whether streamed thinking is displayed. This is a
 display-only switch: the session file records every thinking block, so
-`/md --thinking` and `--all` still export the full text.
+`/md --thinking` and `--all` still export the full text, and /resume
+loads the full session including all thinking text.
 
 Because the transcript is printed straight to the terminal, it cannot be
 rewritten to expand or collapse what is already on screen. The toggle
@@ -400,8 +400,8 @@ calls, tool results, retry notices — to **stderr**, so
   line plus a blank line, so each block reads as a unit.
 - Tool results render like the TUI transcript, without the color: a
   `└─ name: …` header, continuation lines aligned under the first output
-  character, newlines kept (never collapsed into a symbol), and the
-  preview capped at a few lines with a `… (+N more lines)` note.
+  character, newlines kept, and the preview capped at a few lines with
+  a `… (+N more lines)` note.
 
 `-q` / `--quiet` (print mode only; rejected in TUI mode) prints just the
 agent's response and errors — no thinking, tool calls, or tool results:
