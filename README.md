@@ -303,6 +303,11 @@ post-quit history all work. Two details of that model are visible:
   renderer reserves it and the last column stays blank.
 - Resizing, returning from `$EDITOR`, and clearing redraw the bottom
   region in place; nothing is pushed into scrollback by a redraw.
+- Multi-line input (paste, `$EDITOR`) renders as one row per line,
+  indented under the prompt symbol, so every line starts at the same
+  column; each row scrolls horizontally to keep the caret visible, and
+  when the input outgrows the screen the rows around the caret are the
+  ones shown.
 - The status line de-contents gracefully as the terminal narrows:
   elements are dropped one at a time — provider, thinking budget,
   model, cost, session name, the word "queued" (leaving just the dot) —

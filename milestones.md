@@ -343,7 +343,14 @@ real tenant.
      only when there is room). Below the hints' width, elements keep dropping until the
      provider alone fits, then nothing. Coverage in
      `status_line_decontents_gracefully_as_the_terminal_narrows`.
-4. Muli-line input (produced via $EDITOR) is displayed in the input field with each line starting directly below the end of the previous (stair-step)
+4. [x] Muli-line input (produced via $EDITOR) is displayed in the input field with each line starting directly below the end of the previous (stair-step)
+   - As built: `input_rows` in `src/tui/screen.rs` renders one row per physical line of the
+     input buffer — the first after the prompt (`● ❯ `), the rest indented to the same
+     column — so every line starts at the same place instead of stair-stepping. Each row
+     windows horizontally (caret stays visible), the caret parks on the row containing the
+     cursor (the footer's caret became a `(row, col)`), and when the input has more lines
+     than fit, the rows around the caret are kept. Coverage in
+     `multi_line_input_starts_each_row_at_the_prompt_column` and friends.
 5. In `--help`, it says "piped stdin is picked up in M1". Update that message now that piped stdin is a stable feature.
 
 ## Open Questions

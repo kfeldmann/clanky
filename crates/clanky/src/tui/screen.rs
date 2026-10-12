@@ -247,7 +247,16 @@ impl<W: Write> Screen<W> {
             execute!(self.out, Clear(ClearType::FromCursorDown))?;
         }
         self.tail_height = tail.len();
-        execute!(self.out, MoveToColumn(footer.caret))?;
+        if let Some((row, col)) = footer.caret {
+            // The caret lives inside the tail (an input row); moving up
+            // from the tail's bottom row reaches it without absolute
+            // addressing (a live anchor cannot use CUP — see above).
+            let from_bottom = tail.len().saturating_sub(1 + row);
+            if from_bottom > 0 {
+                execute!(self.out, MoveUp(from_bottom as u16))?;
+            }
+            execute!(self.out, MoveToColumn(col))?;
+        }
         self.out.flush()
     }
 }
@@ -336,10 +345,15 @@ fn sgr(style: Style) -> String {
 }
 
 /// The redrawable footer: an optional popup, the status line, and the
-/// input line — plus the caret column within the last row.
+/// input line(s) — plus the caret's (row, column) within the footer.
+/// The row is an offset into `lines` (the caret sits in the input
+/// region, on the physical line containing the cursor).
 struct Footer {
     lines: Vec<Line<'static>>,
-    caret: u16,
+    /// `None` when there is no safe place to park the caret (e.g. the
+    /// input region did not fit); the cursor stays where the last row
+    /// left it, one column past the row's text.
+    caret: Option<(usize, u16)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -376,11 +390,19 @@ fn footer_lines(
         estimated_prompt,
         estimated_completion,
     ));
-    let (input, caret) = input_row(app, width);
-    lines.push(input);
+    // How many rows the input region may occupy. The footer always
+    // includes the status line; the input rows get the rest of the
+    // screen (the terminal needs at least one row left for the input —
+    // one screen of transcript rows can be committed anyway).
+    let input_budget = (height as usize).saturating_sub(lines.len()).max(1);
+    let input = input_rows(app, width, input_budget);
+    let input_start = lines.len();
+    lines.extend(input.lines);
     Footer {
         lines,
-        caret: modal_caret.unwrap_or(caret),
+        caret: modal_caret
+            .map(|col| (0, col))
+            .or_else(|| input.caret.map(|(row, col)| (input_start + row, col))),
     }
 }
 
@@ -591,63 +613,169 @@ fn format_cost(cost: f64) -> String {
     }
 }
 
-/// The input line and the caret column within it. The text is windowed
-/// horizontally so the caret stays on screen.
-fn input_row(app: &App, width: u16) -> (Line<'static>, u16) {
-    // The prompt is always three columns: a streaming dot ("●" while a
-    // turn runs, a blank otherwise) plus "❯ ". The fixed width keeps the
-    // caret column steady whether or not the dot is lit.
-    let prompt_width = INPUT_PROMPT.width() + 1;
-    let view_width = (width as usize).saturating_sub(prompt_width);
+/// The input region: one row per physical line of the input buffer,
+/// plus the caret's (row, column) within the region.
+///
+/// Multi-line input (paste, `$EDITOR`) used to render as one row whose
+/// embedded newlines made each terminal emulator wrap after the
+/// previous line's text — a stair-step. Now each physical line gets its
+/// own row: the first starts after the prompt symbol (`● ❯ `) and the
+/// rest are indented under it, so every line starts at the same column.
+/// Each row is windowed horizontally so the caret stays on screen.
+struct InputRows {
+    lines: Vec<Line<'static>>,
+    /// The caret's row (index into `lines`) and column, or `None` when
+    /// the terminal is too narrow for an input row at all.
+    caret: Option<(usize, u16)>,
+}
+
+/// The prompt prefix is always three columns: a streaming dot ("●" while
+/// a turn runs, a blank otherwise) plus "❯ ". The fixed width keeps the
+/// caret column steady whether or not the dot is lit. Continuation rows
+/// are indented to the same width.
+const PROMPT_WIDTH: usize = 3;
+
+/// `budget` caps how many rows the input region may occupy. When the
+/// input has more lines than fit, the rows around the caret are kept
+/// (the caret must stay on screen); the hidden ones just don't render —
+/// the buffer itself is unaffected.
+fn input_rows(app: &App, width: u16, budget: usize) -> InputRows {
+    let view_width = (width as usize).saturating_sub(PROMPT_WIDTH);
     if view_width == 0 {
-        return (Line::default(), 0);
+        return InputRows {
+            lines: Vec::new(),
+            caret: None,
+        };
     }
     let prompt_style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
-    let dot_style = prompt_style;
     let dot = if app.busy {
-        Span::styled("●", dot_style)
+        Span::styled("●", prompt_style)
     } else {
-        Span::raw(" ")
+        Span::raw(" ".to_string())
     };
     if app.input.is_empty() && !app.busy {
-        return (
-            Line::from(vec![
+        return InputRows {
+            lines: vec![Line::from(vec![
                 dot,
                 Span::styled(INPUT_PROMPT.to_string(), prompt_style),
                 Span::styled(
                     "type a message…".to_string(),
                     Style::new().fg(Color::DarkGray),
                 ),
-            ]),
-            prompt_width as u16,
-        );
+            ])],
+            caret: Some((0, PROMPT_WIDTH as u16)),
+        };
     }
-    let (window, caret_col) = input_window(&app.input, app.cursor, view_width);
-    let mut spans = vec![dot, Span::styled(INPUT_PROMPT.to_string(), prompt_style)];
-    spans.extend(window);
-    (Line::from(spans), (prompt_width + caret_col) as u16)
+
+    // Split into physical lines, tracking where each begins in the
+    // buffer so the cursor maps to a (row, column) pair. A trailing
+    // newline yields an empty final row (the caret's own row).
+    let mut starts: Vec<usize> = vec![0];
+    let mut rows: Vec<String> = Vec::new();
+    let mut row_text = String::new();
+    for (i, c) in app.input.char_indices() {
+        if c == '\n' {
+            rows.push(std::mem::take(&mut row_text));
+            starts.push(i + 1);
+        } else {
+            row_text.push(c);
+        }
+    }
+    rows.push(row_text);
+    // Cursor position as (row, byte offset within that row). A cursor
+    // exactly at a newline belongs to the end of the row above it (the
+    // newline ends that row); a cursor at the very end of the buffer
+    // (or an empty buffer) is not inside any [start, next-start) range
+    // and lands on the final row.
+    let cursor = app.cursor.min(app.input.len());
+    let mut caret_row = 0usize;
+    let mut caret_byte = cursor;
+    let mut found = false;
+    for (r, &start) in starts.iter().enumerate().take(rows.len()) {
+        let end = starts.get(r + 1).copied().unwrap_or(app.input.len());
+        if (start..end).contains(&cursor) {
+            caret_row = r;
+            caret_byte = cursor - start;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        caret_row = rows.len() - 1;
+        caret_byte = rows[caret_row].len();
+    }
+
+    let indent = " ".repeat(PROMPT_WIDTH);
+    let mut lines = Vec::new();
+    let mut caret = None;
+    for (r, row) in rows.iter().enumerate() {
+        let cursor_here = if r == caret_row {
+            Some(caret_byte)
+        } else {
+            None
+        };
+        let (window, caret_col) = input_window(row, cursor_here, view_width);
+        let mut spans = Vec::with_capacity(3);
+        if r == 0 {
+            spans.push(dot.clone());
+            spans.push(Span::styled(INPUT_PROMPT.to_string(), prompt_style));
+        } else {
+            spans.push(Span::raw(indent.clone()));
+        }
+        spans.extend(window);
+        if r == caret_row {
+            caret = Some((r, (PROMPT_WIDTH + caret_col) as u16));
+        }
+        lines.push(Line::from(spans));
+    }
+    // Trim to the budget around the caret so the caret's row stays
+    // visible. The hidden rows are dropped entirely (the renderer
+    // erases stale characters below).
+    if lines.len() > budget {
+        let anchor = caret.map(|(r, _)| r).unwrap_or(0);
+        let max_skip = lines.len() - budget;
+        // Center the window on the caret, clamped to the buffer.
+        let skip = anchor.saturating_sub(budget / 2).min(max_skip).max(
+            max_skip
+                .saturating_sub(lines.len() - 1 - anchor)
+                .min(max_skip),
+        );
+        let caret = caret.map(|(r, col)| (r - skip, col));
+        let lines = lines.into_iter().skip(skip).take(budget).collect();
+        return InputRows { lines, caret };
+    }
+    InputRows { lines, caret }
 }
 
-/// The visible slice of the input line so the caret stays on screen.
-/// Returns the styled spans and the caret column within the window.
-fn input_window(input: &str, cursor: usize, view_width: usize) -> (Vec<Span<'static>>, usize) {
+/// The visible slice of one physical input line so the caret stays on
+/// screen. Returns the styled spans and the caret column within the
+/// window. `cursor` is the caret's byte offset within `line`, if the
+/// caret is on this line.
+fn input_window(
+    line: &str,
+    cursor: Option<usize>,
+    view_width: usize,
+) -> (Vec<Span<'static>>, usize) {
     // Display columns of every char and of the caret.
     let mut cols = Vec::new();
     let mut col = 0usize;
-    let mut caret_col = 0usize;
-    for (i, c) in input.char_indices() {
-        if i == cursor {
-            caret_col = col;
+    let mut caret_col = None;
+    for (i, c) in line.char_indices() {
+        if cursor == Some(i) {
+            caret_col = Some(col);
         }
         cols.push((col, c));
         col += c.width().unwrap_or(0);
     }
-    if cursor >= input.len() {
-        caret_col = col;
-    }
+    let caret_col = match caret_col {
+        Some(c) => c,
+        // The caret is at the end of this line (or not on it): park it
+        // past the text — no windowing needed for that line.
+        None => col,
+    };
 
     if col <= view_width {
-        return (vec![Span::raw(input.to_string())], caret_col);
+        return (vec![Span::raw(line.to_string())], caret_col);
     }
 
     // Keep the caret visible with a little slack on the right.
@@ -732,7 +860,7 @@ fn modal_box(modal: &Modal, width: u16, height: u16) -> (Vec<Line<'static>>, u16
     // Size the box from the prompt (the field is windowed to the box, so
     // it can never widen it) and window the field to that inner width.
     let inner = box_width(title.width(), line_width(&prompt), width) - 4;
-    let (field, caret_col) = input_window(&modal.input, modal.cursor, inner);
+    let (field, caret_col) = input_window(&modal.input, Some(modal.cursor), inner);
     let rows = vec![prompt, Line::from(field)];
     (boxed(&title, rows, width), 2 + caret_col as u16)
 }
@@ -1721,26 +1849,163 @@ mod tests {
         assert!(text.contains("18% ctx"), "{text}");
     }
 
+    fn input_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.clone()).collect()
+    }
+
     #[test]
-    fn input_row_shows_placeholder_and_windows_long_input() {
+    fn input_rows_show_placeholder_and_window_long_input() {
         let mut app = App::new();
-        let (line, caret) = input_row(&app, 40);
-        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        let input = input_rows(&app, 40, 24);
+        assert_eq!(input.lines.len(), 1);
+        let text = input_text(&input.lines[0]);
         assert!(text.contains("type a message…"), "{text}");
-        assert_eq!(caret, 3, "caret after the dot and prompt symbol");
+        assert_eq!(
+            input.caret,
+            Some((0, PROMPT_WIDTH as u16)),
+            "caret after the dot and prompt symbol"
+        );
 
         app.input = "hi".into();
         app.cursor = 2;
-        let (line, caret) = input_row(&app, 40);
-        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        let input = input_rows(&app, 40, 24);
+        assert_eq!(input.lines.len(), 1);
+        let text = input_text(&input.lines[0]);
         assert!(text.contains("❯ hi"), "{text}");
-        assert_eq!(caret, 5);
+        assert_eq!(input.caret, Some((0, 5)));
 
         // Long input: the caret stays visible at the right edge.
         app.input = "x".repeat(100);
         app.cursor = 100;
-        let (_, caret) = input_row(&app, 40);
-        assert!(caret > 0);
+        let input = input_rows(&app, 40, 24);
+        assert_eq!(input.lines.len(), 1);
+        assert!(input.caret.map(|(_, c)| c) > Some(0));
+    }
+
+    /// Regression (M12 #4): multi-line input (paste, `$EDITOR`) used to
+    /// render as one row with embedded newlines, so each terminal
+    /// wrapped line two columns after the previous one ended — a
+    /// stair-step. Each physical line now gets its own row, indented
+    /// under the prompt symbol so every line starts at the same column.
+    #[test]
+    fn multi_line_input_starts_each_row_at_the_prompt_column() {
+        let mut app = App::new();
+        app.input = "line one\nline two\nline three".into();
+        app.cursor = app.input.len();
+        let mut s = Screen::new(Buf::default(), 40, 8);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        let rows = s.take_out().emulated_screen(40, 8);
+        // Rows: status, then one input row per physical line, ending on
+        // the bottom row. Every input row starts at the same column.
+        assert_eq!(input_text_row(&rows, "line one"), 5, "{rows:?}");
+        assert_eq!(input_text_row(&rows, "line two"), 6, "{rows:?}");
+        assert_eq!(input_text_row(&rows, "line three"), 7, "{rows:?}");
+        for (needle, expect) in [("line one", 3), ("line two", 3), ("line three", 3)] {
+            let row = &rows[input_text_row(&rows, needle)];
+            assert_eq!(
+                row.find(needle).map(|i| row[..i].chars().count()),
+                Some(expect),
+                "{needle} starts at column {expect}: {row}"
+            );
+        }
+        // The caret sits past the end of the last line, on the bottom row.
+        // (The caret move is a column-only CHA; the bottom row is where the
+        // block ends.)
+    }
+
+    /// A trailing newline yields an empty final input row, and the caret
+    /// (at the end of the buffer) sits on it.
+    #[test]
+    fn trailing_newline_gives_the_caret_an_empty_row() {
+        let mut app = App::new();
+        app.input = "hello\n".into();
+        app.cursor = app.input.len();
+        let mut s = Screen::new(Buf::default(), 40, 8);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        let buf = s.take_out();
+        let rows = buf.emulated_screen(40, 8);
+        let hello_row = rows.iter().position(|r| r.contains("❯ hello")).unwrap();
+        let empty_row = hello_row + 1;
+        assert!(rows[empty_row].trim().is_empty(), "{rows:?}");
+        assert_eq!(
+            empty_row, 7,
+            "caret's empty row is the bottom row: {rows:?}"
+        );
+        // The caret parks on its own empty row, in the prompt column
+        // (MoveToColumn(3) emits CHA 4), with no CUU.
+        let out = String::from_utf8_lossy(&buf.0);
+        assert!(
+            out.contains("\x1b[4G"),
+            "caret in the prompt column: {out:?}"
+        );
+        assert!(
+            !out.contains('A'),
+            "no CUU — the caret is on the bottom row: {out:?}"
+        );
+    }
+
+    /// The caret in a multi-line buffer lands on the row containing the
+    /// cursor — the renderer emits CUU (move up) past the later rows.
+    #[test]
+    fn caret_moves_to_the_row_with_the_cursor() {
+        let mut app = App::new();
+        app.input = "aaaa\nbbbb\ncccc".into();
+        app.cursor = 5; // start of "bbbb" (after the first newline)
+        let mut s = Screen::new(Buf::default(), 40, 10);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        let buf = s.take_out();
+        let out = String::from_utf8_lossy(&buf.0);
+        // The tail spans status + 3 input rows; the caret is on the
+        // middle input row, one row above the tail's bottom.
+        assert!(out.contains("\x1b[1A"), "move up one row: {out:?}");
+        assert!(
+            out.contains("\x1b[4G"),
+            "caret in the prompt column: {out:?}"
+        );
+    }
+
+    /// More input lines than the footer budget: the rows around the
+    /// caret are kept so the caret stays on screen.
+    #[test]
+    fn input_rows_trim_to_the_budget_around_the_caret() {
+        let mut app = App::new();
+        app.input = (0..20)
+            .map(|i| format!("row-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.cursor = app.input.find("row-10").unwrap();
+        let input = input_rows(&app, 40, 6);
+        assert_eq!(input.lines.len(), 6, "trimmed to the budget");
+        let texts: Vec<String> = input.lines.iter().map(input_text).collect();
+        // The caret row is kept; the window is centered on it.
+        assert!(texts.iter().any(|t| t.contains("row-10")), "{texts:?}");
+        // The window is centered on the caret: two rows above, three
+        // below (budget 6).
+        assert_eq!(input.caret.map(|(r, _)| r), Some(3), "{texts:?}");
+        assert!(
+            texts[0].contains("row-7") && texts[5].contains("row-12"),
+            "{texts:?}"
+        );
+    }
+
+    /// The prompt width constant must match the actual prompt pieces.
+    #[test]
+    fn prompt_width_matches_the_rendered_prompt() {
+        let mut app = App::new();
+        app.input = "x".into();
+        app.cursor = 1;
+        let input = input_rows(&app, 40, 24);
+        let text = input_text(&input.lines[0]);
+        // " ●" + "❯ " — the dot plus the prompt symbol.
+        assert_eq!(
+            text.find('x').map(|i| text[..i].chars().count()),
+            Some(PROMPT_WIDTH) // x starts right after the prompt
+        );
+        assert_eq!(INPUT_PROMPT.width() + 1, PROMPT_WIDTH);
+    }
+
+    fn input_text_row(rows: &[String], needle: &str) -> usize {
+        rows.iter().position(|r| r.contains(needle)).unwrap()
     }
 
     #[test]
