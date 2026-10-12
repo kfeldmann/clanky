@@ -3,7 +3,7 @@
 //! Reads a JSON run description (argv[1], `-`, or stdin), launches one
 //! `clanky -pq` subprocess per job with bounded concurrency, captures each
 //! job's stdout/stderr, and prints one JSON result object in input order.
-//! See `parallel-subagents-plan.md` for the design.
+//! See `design-docs/parallel-subagents-plan.md` for the design.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};

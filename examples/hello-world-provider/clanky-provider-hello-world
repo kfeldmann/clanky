@@ -2,7 +2,7 @@
 """Hello-world Clanky provider plugin.
 
 A complete, dependency-free provider plugin: it speaks the JSONL protocol
-from `provider-protocol.md` over stdin/stdout, so Clanky can run it as a
+from `design-docs/provider-protocol.md` over stdin/stdout, so Clanky can run it as a
 subprocess with no configuration beyond putting an executable named
 `clanky-provider-hello-world` on `$PATH`.
 

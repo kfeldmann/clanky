@@ -2,7 +2,7 @@
 //!
 //! Clanky core contains **no** provider-specific code. Every provider is a
 //! separate executable named `clanky-provider-<name>` on `$PATH`, speaking
-//! the JSONL protocol in `provider-protocol.md` over stdin/stdout. This
+//! the JSONL protocol in `design-docs/provider-protocol.md` over stdin/stdout. This
 //! module is the only place core talks about plugins: it discovers them,
 //! spawns them as long-lived processes, and hands back a [`ProviderSession`]
 //! the turn loop can drive.

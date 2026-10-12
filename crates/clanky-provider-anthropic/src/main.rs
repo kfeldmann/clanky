@@ -2,7 +2,7 @@
 //!
 //! Clanky discovers this binary on `$PATH` (name convention
 //! `clanky-provider-*`), spawns it, and speaks the provider protocol over
-//! stdin/stdout (see `provider-protocol.md`). Two modes:
+//! stdin/stdout (see `design-docs/provider-protocol.md`). Two modes:
 //!
 //! - `clanky-provider-anthropic login` — headless OAuth login (PKCE +
 //!   paste; run once per machine, or whenever the refresh token expires).

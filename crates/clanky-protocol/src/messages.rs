@@ -1,6 +1,6 @@
 //! Protocol v2 message and payload types.
 //!
-//! Serialized forms follow `provider-protocol.md`: every message is one JSON
+//! Serialized forms follow `design-docs/provider-protocol.md`: every message is one JSON
 //! object with a `"type"` field, camelCase field names, and unknown fields
 //! ignored on deserialization.
 
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn spec_examples_deserialize() {
-        // Straight out of provider-protocol.md.
+        // Straight out of `design-docs/provider-protocol.md`.
         for (line, expected_type) in [
             (r#"{"type": "hello", "protocolVersion": 2}"#, "hello"),
             (

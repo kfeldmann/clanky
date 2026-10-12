@@ -2,7 +2,7 @@
 //!
 //! Clanky discovers this binary on `$PATH` (name convention
 //! `clanky-provider-*`), spawns it, and speaks the provider protocol over
-//! stdin/stdout (see `provider-protocol.md`). The whole plugin is glue: wire
+//! stdin/stdout (see `design-docs/provider-protocol.md`). The whole plugin is glue: wire
 //! [`LiteLlm`] to [`clanky_protocol::serve_stdio`].
 //!
 //! Auth stays here, never in core: the API key is read from

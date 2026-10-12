@@ -93,7 +93,7 @@ const THINKING_OPTIONS: &[(&str, &str)] = &[
 ];
 
 /// True when the terminal can run the TUI: both stdin and stdout must be
-/// attached to a terminal (plan.md: no TUI when redirected).
+/// attached to a terminal (design-docs/plan.md: no TUI when redirected).
 pub fn available() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }

@@ -143,7 +143,7 @@ copy the ones you want into either scope. Current entries:
 
 Clanky core contains no provider-specific code. Every provider is a separate
 executable named `clanky-provider-<name>` on `$PATH`, speaking a small JSONL
-protocol over stdin/stdout (see `provider-protocol.md`). This means:
+protocol over stdin/stdout (see `design-docs/provider-protocol.md`). This means:
 
 - **Zero config.** Install `clanky` and `clanky-provider-deepinfra` (both from
   the same workspace) and Clanky finds the provider on `$PATH`:
@@ -283,7 +283,7 @@ A plugin is a program that:
 4. Answers `chat` with `chunk` events and exactly one terminal `done`/`error`.
 5. Exits when stdin closes.
 
-See `provider-protocol.md` for the full spec and
+See `design-docs/provider-protocol.md` for the full spec and
 [`examples/hello-world-provider/clanky-provider-hello-world`](examples/hello-world-provider/clanky-provider-hello-world)
 for a minimal working example. To try it:
 
@@ -476,4 +476,4 @@ never shared. Each job is a full Clanky turn with its own tool loop — a
 run of N jobs costs roughly N times a single-turn run in tokens, so use
 it where parallelism earns that.
 
-Design details: `parallel-subagents-plan.md`.
+Design details: `design-docs/parallel-subagents-plan.md`.

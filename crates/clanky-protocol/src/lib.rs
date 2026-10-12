@@ -1,7 +1,7 @@
 //! Clanky provider plugin protocol, version 1.
 //!
 //! This crate defines the message shapes exchanged between Clanky and
-//! provider plugins (see `provider-protocol.md`), a [`Transport`] trait that
+//! provider plugins (see `design-docs/provider-protocol.md`), a [`Transport`] trait that
 //! carries them, and a [`ProviderClient`] that drives a transport through
 //! handshake, `listModels`, and streaming chat turns.
 //!

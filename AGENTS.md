@@ -28,7 +28,7 @@ lynx -dump https://lite.duckduckgo.com/lite?q=<url-encoded-query>
 Milestones are complete through M11 (except for M9 which is deferred, and the first item in M10 which is low priority).
 M12 "Refinements, Bug Fixes" is next.
 
-See milestones.md — checkboxes mark progress, and its "As built" notes record
+See `design-docs/milestones.md` — checkboxes mark progress, and its "As built" notes record
 decisions made during implementation. Check them before redesigning something.
 
 ## Project invariants
@@ -54,12 +54,12 @@ decisions made during implementation. Check them before redesigning something.
 - README.md — user-facing ground truth: config layout, settings.toml, env
   vars, CLI usage, plugin authoring. Update it in the same change as any
   behavior change.
-- milestones.md — the plan. Keep status current when you finish work.
-- provider-protocol.md — the wire protocol between Clanky and provider
+- `design-docs/milestones.md` — the plan. Keep status current when you finish work.
+- `design-docs/provider-protocol.md` — the wire protocol between Clanky and provider
   plugins (target version 1). Update the spec and the implementation
   together.
-- litellm-provider-planning.md, provider-plugins-plan.md,
-  parallel-subagents-plan.md — design notes for specific features.
+- `design-docs/litellm-provider-planning.md`, `design-docs/provider-plugins-plan.md`,
+  `design-docs/parallel-subagents-plan.md` — design notes for specific features.
 
 ## Workspace layout
 
