@@ -18,6 +18,14 @@ use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 pub fn render(text: &str, base: Style) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_code = false;
+    // Tabs are expanded to 8-column tab stops first: `unicode-width`
+    // gives a tab no width, so the wrap math would budget zero columns
+    // for it while a real terminal advances the cursor to the next
+    // stop — off the end of the row and into the pending-wrap hazard
+    // (see `screen::print_line`). Indentation inside code snippets
+    // (common in thinking blocks) survives as spaces the math can see.
+    let expanded = expand_tabs(text);
+    let text: &str = &expanded;
     let source: Vec<&str> = text.split('\n').collect();
     let mut i = 0;
     while i < source.len() {
@@ -97,6 +105,39 @@ pub fn wrap_capped(
     note_style: Style,
 ) -> Vec<Line<'static>> {
     wrap_impl(lines, width, Some(max_lines), note_style)
+}
+
+/// Expand tabs to spaces at 8-column tab stops (per source line).
+/// Display-side only: the transcript's stored text is untouched.
+fn expand_tabs(text: &str) -> String {
+    const TAB: usize = 8;
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if !line.contains('\t') {
+            out.push_str(line);
+            continue;
+        }
+        let mut col = 0usize;
+        for c in line.chars() {
+            if c == '\t' {
+                let spaces = TAB - (col % TAB);
+                out.push_str(&" ".repeat(spaces));
+                col += spaces;
+            } else {
+                // Zero-width characters do not advance the column the
+                // tab stop is measured against.
+                col += c.width().unwrap_or(0);
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 fn wrap_impl(

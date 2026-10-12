@@ -352,6 +352,25 @@ real tenant.
      than fit, the rows around the caret are kept. Coverage in
      `multi_line_input_starts_each_row_at_the_prompt_column` and friends.
 5. In `--help`, it says "piped stdin is picked up in M1". Update that message now that piped stdin is a stable feature.
+6. [x] Terminal corruption while thinking streams (status line duplicated upward ~20
+   rows, then overwritten with the proper content; tool calls printed cleanly)
+   - Root cause was caret parking, not content: the caret's row is a *footer*-relative
+     offset (status + input), but `Screen::render` measured it from the whole tail,
+     which while an entry streams also holds the streaming entry's rows above the
+     footer. Only streamed entries (thinking blocks, assistant text) grow that gap —
+     tool calls are sealed instantly, so they were unaffected. The cursor parked too
+     high; the next render (a relative MoveUp from the caret) started its redraw that
+     many rows early, leaving stale copies of the tail below — the duplicated status
+     line the next render then overwrote. Fixed by skipping the streaming entry's
+     tail rows in the parking math (`entry_tail_rows` in `src/tui/screen.rs`).
+   - Hardened while in there: `print_line` never emits control characters (the wrap
+     math budgets zero columns for them via `unicode-width`, but a real terminal moves
+     the cursor for a tab — potentially onto/past the reserved last column, setting the
+     pending-wrap flag; raw ESC could be taken as a control sequence), and
+     `markdown::render` expands tabs to 8-column stops first so the wrap math and the
+     terminal agree on code-snippet indentation in thinking blocks. Regression tests:
+     `thinking_tabs_expand_to_stable_rows`, `print_line_never_emits_control_characters`,
+     `streaming_thinking_overflow_keeps_one_status_line`.
 
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming

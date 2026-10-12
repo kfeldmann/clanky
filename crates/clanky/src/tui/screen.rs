@@ -191,6 +191,13 @@ impl<W: Write> Screen<W> {
             let start = app.printed(sealed).min(lines.len());
             tail.extend(lines.into_iter().skip(start));
         }
+        // Rows of the streaming entry that stay in the tail, above the
+        // footer. The caret's row is a *footer*-relative offset, so the
+        // distance from the tail's bottom row must skip these — otherwise
+        // the cursor parks too high while an entry streams, and the next
+        // redraw (a relative MoveUp from the caret) starts that many rows
+        // early, leaving stale copies of the tail below it.
+        let entry_tail_rows = tail.len();
         tail.extend(footer.lines);
 
         // Positioning splits by anchor state, because the two states can
@@ -250,8 +257,12 @@ impl<W: Write> Screen<W> {
         if let Some((row, col)) = footer.caret {
             // The caret lives inside the tail (an input row); moving up
             // from the tail's bottom row reaches it without absolute
-            // addressing (a live anchor cannot use CUP — see above).
-            let from_bottom = tail.len().saturating_sub(1 + row);
+            // addressing (a live anchor cannot use CUP — see above). The
+            // caret's row is footer-relative, so the streaming entry's
+            // rows above the footer are skipped: parking above them put
+            // the cursor too high while thinking streamed, and the next
+            // redraw started early, leaving stale tail copies below.
+            let from_bottom = tail.len().saturating_sub(entry_tail_rows + 1 + row);
             if from_bottom > 0 {
                 execute!(self.out, MoveUp(from_bottom as u16))?;
             }
@@ -283,6 +294,19 @@ pub fn print_line<W: Write>(out: &mut W, line: &Line<'_>, width: u16) -> io::Res
             applied = Some(want);
         }
         for c in span.content.chars() {
+            // Control characters are never emitted. `width()` reports
+            // `None` (counted as zero) for them, but a real terminal
+            // does not: a tab jumps the cursor to the next tab stop —
+            // possibly onto or past the reserved last column, setting
+            // the pending-wrap flag so the next CR/LF scrolls the
+            // screen (duplicated status lines); ESC/DEL could be taken
+            // as control sequences; CR would move the cursor invisibly.
+            // Skipping them keeps the emitted row exactly what the
+            // wrapping math budgeted. The transcript text is not
+            // rewritten: this is display-side only.
+            if c.is_control() {
+                continue;
+            }
             let w = c.width().unwrap_or(0);
             if col + w > width {
                 break;
@@ -2115,5 +2139,80 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("one")), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("two")));
         assert!(texts.iter().any(|t| t.contains("complete")));
+    }
+
+    /// Regression (control characters): `print_line` must never emit
+    /// control characters. `unicode-width` reports no width for them, so
+    /// the wrap math budgets zero columns — but a real terminal does
+    /// move the cursor for a tab (to the next tab stop, possibly onto or
+    /// past the reserved last column, setting the pending-wrap flag so
+    /// the following CR/LF scrolls the screen: duplicated status lines
+    /// that the next render overwrites). Raw ESC bytes could likewise be
+    /// taken as control sequences. Symptom: streamed thinking blocks
+    /// (raw, uncapped prose — often containing tabs) made the status line
+    /// duplicate and shift upward while tool-call text printed cleanly.
+    #[test]
+    fn print_line_never_emits_control_characters() {
+        let mut out = Buf::default();
+        let line = Line::from(Span::raw("a\tb\rc\x1b[2Jd\x7f e"));
+        // The ESC of the embedded "\x1b[2J" is dropped, but its printable
+        // "[2J" letters survive (they are not control characters).
+        print_line(&mut out, &line, 40).unwrap();
+        let text = out.0;
+        assert!(!text.contains(&b'\t'), "tab emitted: {text:?}");
+        assert!(!text.contains(&b'\r'), "CR emitted: {text:?}");
+        // Only the SGR reset/attribute bytes we emit ourselves may be ESC.
+        let stripped: Vec<u8> = text
+            .iter()
+            .copied()
+            .filter(|&b| !(0x20..0x7f).contains(&b) && b >= 0x80)
+            .collect();
+        assert!(stripped.is_empty(), "unexpected control bytes: {text:?}");
+        assert!(std::str::from_utf8(&text).unwrap().contains("abc[2Jd e"));
+    }
+
+    /// Thinking text with tabs (code snippets inside reasoning blocks)
+    /// is expanded to tab stops before wrapping, so the wrap math and
+    /// the terminal agree on the row layout — no stale remnants and no
+    /// rows pushed out of place.
+    #[test]
+    fn thinking_tabs_expand_to_stable_rows() {
+        let mut app = App::new();
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "code:\n\tfoo();\n\t\tbar(); done".into(),
+        });
+        let mut s = screen(Buf::default(), 30, 10);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        let rows = s.take_out().emulated_screen(30, 10);
+        let joined = rows.join("\n");
+        assert!(joined.contains("        foo();"), "{rows:?}");
+        assert!(joined.contains("                bar();"), "{rows:?}");
+        assert!(
+            rows.iter().filter(|r| r.contains("commands")).count() == 1,
+            "one status line: {rows:?}"
+        );
+    }
+
+    /// A thinking block streaming past one screenful (committing its
+    /// oldest rows, rewriting the tail every delta) leaves exactly one
+    /// status line on screen and none in scrollback.
+    #[test]
+    fn streaming_thinking_overflow_keeps_one_status_line() {
+        let mut app = App::new();
+        app.busy = true;
+        let mut s = screen(Buf::default(), 40, 10);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        for n in 0..40 {
+            app.on_turn_event(TurnEvent::Thinking {
+                delta: format!("word-{n} "),
+            });
+            s.render(&mut app, &status(), None, None, None).unwrap();
+        }
+        let (rows, history) = s.take_out().emulated(40, 10);
+        let status_rows = rows.iter().filter(|r| r.contains("deepinfra")).count();
+        assert_eq!(status_rows, 1, "screen: {rows:?}");
+        let hist_status = history.iter().filter(|r| r.contains("deepinfra")).count();
+        assert_eq!(hist_status, 0, "scrollback: {history:?}");
     }
 }
