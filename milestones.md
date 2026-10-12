@@ -372,6 +372,29 @@ real tenant.
      `thinking_tabs_expand_to_stable_rows`, `print_line_never_emits_control_characters`,
      `streaming_thinking_overflow_keeps_one_status_line`.
 
+### ✔ M13 — Parallel subagents
+1. [x] `clanky-subagents` binary (`crates/clanky-subagents`, no dependency on
+   clanky core): JSON run description via argv or stdin, one `clanky -pq`
+   subprocess per job, bounded concurrency (`max_parallel`, default all),
+   per-job timeout (`timeout_secs`, default none) killing the job's process
+   group, per-stream 1 MiB tail capture with truncation marker, result JSON in
+   input order. Per-job clanky option overrides (`provider`, `model`,
+   `thinking`, `sampling` string, `max_tool_rounds`, `max_retries`) plus a
+   run-level `defaults` object (job wins per field); options are an
+   allow-list, so `-p`/`-q`/`--resume`/`--help`/`--version` can't appear.
+   Runner exits 0 for any completed batch (per-job exits in JSON), nonzero
+   only for bad input (unknown keys named via `deny_unknown_fields`).
+   - As built: `wait_timeout` + a per-job process group (`process_group(0)`)
+     so a timeout kill reaches clanky's own children, which otherwise inherit
+     the pipes and wedge the capture threads open — the kill happens *before*
+     joining the capture threads. Process-group kill shells out to `kill -TERM
+     -pgid` (no libc dep). Tests stub `clanky` on `PATH`
+     (`crates/clanky-subagents/tests/subagents.rs`); design in
+     `parallel-subagents-plan.md`; user docs in README ("Parallel
+     subagents"). Shipped with `contrib/skills/parallel-subagents/SKILL.md`,
+     an agent-facing skill (when to fan out, how to call the runner, how to
+     read the result) for users to copy into a skills scope.
+
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming
    granularity, cancellation semantics, how `list-models` interacts with

@@ -123,6 +123,22 @@ terminal's own (native scrollbar or wheel, native text selection), and
 the conversation stays in the terminal after clanky quits. `ctrl+l`
 erases the visible screen (scrollback is kept).
 
+## Skills
+
+Skills are reference material for the agent: each is a markdown file listed
+(name, description, path) in the system prompt, and read into the
+conversation only when a task matches its description. Drop them in
+`~/.clanky/skills/<name>.md` (user scope) or `.clanky/skills/<name>.md`
+(project scope; shadows the user one on a name clash). An optional YAML
+front matter block may carry a `description:`.
+
+Optional, ready-made skills live in this repository's `contrib/skills/` —
+copy the ones you want into either scope. Current entries:
+
+- `parallel-subagents` — when and how to fan work out to parallel Clanky
+  subagents via `clanky-subagents` (see also
+  [Parallel subagents](#parallel-subagents-clanky-subagents)).
+
 ## Provider plugins
 
 Clanky core contains no provider-specific code. Every provider is a separate
@@ -389,3 +405,71 @@ agent's response and errors — no thinking, tool calls, or tool results:
 ```sh
 clanky -p -q "summarize this repo" > summary.txt
 ```
+
+## Parallel subagents (`clanky-subagents`)
+
+The `clanky-subagents` binary (built from the same workspace; install it on
+`$PATH` alongside `clanky`, e.g. `cargo install --path crates/clanky-subagents`)
+runs multiple Clanky subagents **in parallel** and returns their outputs as one
+JSON object. It is designed to be invoked through the `bash` tool, but works
+from any shell.
+
+It takes a JSON run description as its single argument, or on stdin (`-`
+or piped):
+
+```sh
+clanky-subagents '{"jobs":[{"id":"a","instruction":"Find all uses of X"}]}'
+clanky-subagents - < jobs.json
+```
+
+Input:
+
+```json
+{
+  "defaults": { "model": "meta-llama/Meta-Llama-3.1-70B-Instruct", "thinking": "off" },
+  "jobs": [
+    { "id": "a", "instruction": "Find all uses of X and summarize." },
+    { "id": "b", "instruction": "Run the test suite and summarize failures.",
+      "model": "Qwen/Qwen2.5-72B-Instruct" }
+  ],
+  "max_parallel": 4,
+  "timeout_secs": 600
+}
+```
+
+- `jobs` (required): each needs a unique caller-chosen `id` and an
+  `instruction`; everything else clanky resolves from settings as usual.
+- Optional per-job overrides, passed to the subagent's `clanky -pq` command
+  line verbatim: `provider`, `model`, `thinking`, `sampling` (string in the
+  `--sampling` CLI format), `max_tool_rounds`, `max_retries`. The provider
+  validates them, never the runner.
+- `defaults` (optional): any of the same fields, applied to jobs that don't
+  set them (job-level wins per field).
+- `max_parallel` (optional): defaults to all jobs at once.
+- `timeout_secs` (optional): per-job timeout; a timed-out job's whole
+  process group is killed and its partial output kept. No default.
+
+Output: one JSON object on stdout, jobs in **input order**:
+
+```json
+{
+  "jobs": [
+    { "id": "a", "exit": 0, "stdout": "…the subagent's response…", "stderr": "" },
+    { "id": "b", "exit": 1, "stdout": "…", "stderr": "…" }
+  ]
+}
+```
+
+Each stream is kept up to 1 MiB (the tail, with a truncation marker). The
+runner itself exits 0 whenever it ran the batch — per-job failures are in
+the JSON — and nonzero only for bad input (malformed JSON, empty `jobs`,
+duplicate ids, unknown keys; the offending key is named). If `clanky` is
+missing from `PATH`, each job reports `"error": "spawn: …"`.
+
+Jobs run in the caller's working directory, so subagents pick up the same
+project `.clanky/` and `~/.clanky` as any `clanky -pq` run; sessions are
+never shared. Each job is a full Clanky turn with its own tool loop — a
+run of N jobs costs roughly N times a single-turn run in tokens, so use
+it where parallelism earns that.
+
+Design details: `parallel-subagents-plan.md`.

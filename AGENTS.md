@@ -58,8 +58,8 @@ decisions made during implementation. Check them before redesigning something.
 - provider-protocol.md — the wire protocol between Clanky and provider
   plugins (target version 1). Update the spec and the implementation
   together.
-- litellm-provider-planning.md, provider-plugins-plan.md — design notes for
-  specific features.
+- litellm-provider-planning.md, provider-plugins-plan.md,
+  parallel-subagents-plan.md — design notes for specific features.
 
 ## Workspace layout
 
@@ -71,8 +71,13 @@ decisions made during implementation. Check them before redesigning something.
 - `crates/clanky-provider-deepinfra` — DeepInfra provider plugin (OpenAI-compatible)
 - `crates/clanky-provider-litellm` — LiteLLM proxy provider plugin
 - `crates/clanky-provider-anthropic` — Anthropic provider plugin
+- `crates/clanky-subagents` — parallel subagent launcher (`clanky-subagents`
+  binary): runs N `clanky -pq` jobs in parallel, returns one JSON result
 - `examples/hello-world-provider/` — dependency-free Python provider plugin;
   the smallest template for writing a new one
+- `contrib/skills/` — optional ready-made agent skills (copy into
+  `~/.clanky/skills/` or `.clanky/skills/`); currently just
+  `parallel-subagents`
 - `crates/clanky/tests/` — integration tests: golden session transcripts
   (tests/golden/), plugin e2e and pipe tests
 - `target/replay`, `target/tmp` — scratch space; never commit
