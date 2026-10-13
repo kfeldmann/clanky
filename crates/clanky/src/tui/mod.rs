@@ -1047,7 +1047,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
             let thinking = launch
                 .thinking
                 .as_deref()
-                .filter(|value| !value.is_empty() && *value != "off");
+                .filter(|value| !value.is_empty() && *value != "off" && *value != "0");
             let status = screen::Status {
                 provider: &launch.provider,
                 model: launch.model.as_deref(),
@@ -1302,13 +1302,17 @@ fn apply_picker_selection(
         }
         PickerKind::Thinking => {
             if let Some((value, _)) = THINKING_OPTIONS.get(index) {
-                launch.thinking = crate::turn::parse_thinking(value)
-                    .ok()
-                    .flatten()
-                    .map(|_| value.to_string());
-                app.entries.push(app::Entry::Info(match launch.thinking {
-                    Some(_) => format!("thinking set to `{value}`"),
-                    None => "thinking disabled".into(),
+                // `off` still occupies `launch.thinking` — the zero budget
+                // it parses to must reach the provider, so the provider
+                // sends its explicit "no reasoning" knob instead of
+                // falling back to the backend default.
+                let parsed = crate::turn::parse_thinking(value).ok();
+                launch.thinking = parsed.map(|_| value.to_string());
+                let disabled = parsed.is_some_and(|t| t.budget_tokens == Some(0));
+                app.entries.push(app::Entry::Info(if disabled {
+                    "thinking disabled".into()
+                } else {
+                    format!("thinking set to `{value}`")
                 }));
             }
         }
@@ -1410,15 +1414,21 @@ fn handle_command(
             Action::OpenPicker(PickerKind::Providers)
         }
         Command::Thinking(Some(raw)) => {
-            match crate::turn::parse_thinking(&raw) {
+            match crate::turn::parse_thinking(&raw).map_err(|e| e.to_string()) {
                 Ok(parsed) => {
-                    launch.thinking = parsed.map(|_| raw.clone());
-                    app.entries.push(app::Entry::Info(match parsed {
-                        Some(_) => format!("thinking set to `{raw}`"),
-                        None => "thinking disabled".into(),
+                    // `off` still occupies `launch.thinking` — the zero
+                    // budget it parses to must reach the provider, so the
+                    // provider sends its explicit "no reasoning" knob
+                    // instead of falling back to the backend default.
+                    launch.thinking = Some(raw.clone());
+                    let disabled = parsed.budget_tokens == Some(0);
+                    app.entries.push(app::Entry::Info(if disabled {
+                        "thinking disabled".into()
+                    } else {
+                        format!("thinking set to `{raw}`")
                     }));
                 }
-                Err(err) => app.entries.push(app::Entry::Error(err.to_string())),
+                Err(err) => app.entries.push(app::Entry::Error(err)),
             }
             Action::None
         }
@@ -2262,7 +2272,11 @@ mod tests {
             Command::Thinking(Some("off".into())),
             &tx,
         );
-        assert_eq!(cfg.thinking, None, "off clears thinking");
+        assert_eq!(
+            cfg.thinking.as_deref(),
+            Some("off"),
+            "off is kept (as an explicit zero budget on the wire)"
+        );
 
         handle_command(
             &mut app,
@@ -2273,7 +2287,11 @@ mod tests {
             &tx,
         );
         assert!(matches!(app.entries.last(), Some(app::Entry::Error(_))));
-        assert_eq!(cfg.thinking, None, "rejected value is not applied");
+        assert_eq!(
+            cfg.thinking.as_deref(),
+            Some("off"),
+            "rejected value is not applied; the previous setting is kept"
+        );
     }
 
     #[test]

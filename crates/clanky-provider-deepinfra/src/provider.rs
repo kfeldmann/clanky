@@ -910,6 +910,35 @@ mod tests {
     }
 
     #[test]
+    fn thinking_off_sends_reasoning_effort_none() {
+        // This is the payload `clanky --thinking off` produces: an explicit
+        // zero budget, mapped onto the backend's "disable reasoning" knob.
+        // An omitted `thinking` field (budget `None`) sends no
+        // `reasoning_effort` at all, which falls back to DeepInfra's
+        // default — reasoning models *do* produce a reasoning trace then.
+        let mut provider = DeepInfraProvider::new(
+            MockBackend::new(vec![done_chunk("stop")], "[]"),
+            "https://x.invalid",
+        );
+        let mut request = simple_request();
+        request.thinking = Some(Thinking {
+            budget_tokens: Some(0),
+        });
+        provider.chat(&request, &mut |_| {}).unwrap();
+        let (_, body) = provider.backend.posts.borrow()[0].clone();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["reasoning_effort"], "none");
+
+        // Unset: no reasoning_effort key at all (backend default).
+        let mut request = simple_request();
+        request.thinking = None;
+        provider.chat(&request, &mut |_| {}).unwrap();
+        let (_, body) = provider.backend.posts.borrow()[1].clone();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn tools_map_to_openai_function_format() {
         let mut provider = DeepInfraProvider::new(
             MockBackend::new(vec![done_chunk("stop")], "[]"),

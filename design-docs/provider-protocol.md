@@ -162,6 +162,13 @@ Field rules:
   fine; overwriting a key the user did set is not.
 - `sampling` and `thinking` are optional; `thinking` is only sent if
   `capabilities.thinking`.
+- `thinking.budgetTokens: 0` means the user explicitly disabled thinking
+  (`--thinking off`); an absent `thinking` means "unset" — the backend's
+  default applies (which on reasoning models *enables* reasoning). A plugin
+  that has an explicit "off" knob should send it for a zero budget instead
+  of omitting its backend parameter (e.g. DeepInfra/LiteLLM
+  `reasoning_effort: "none"`; Anthropic omits its `thinking` block either
+  way, since an absent block is that API's documented "off").
 - Any other top-level `chat` field is reserved for future versions; ignore
   unknown fields.
 

@@ -458,23 +458,32 @@ fn decode_value(value: &serde_json::Value) -> serde_json::Value {
 /// adapter maps budgets onto its own vocabulary.
 fn thinking_from(value: &Option<String>) -> Result<Option<Thinking>> {
     match value.as_deref() {
-        Some(raw) => parse_thinking(raw),
+        Some(raw) => parse_thinking(raw).map(Some),
         None => Ok(None),
     }
 }
 
 /// Validate one thinking value: `off`/empty disables thinking, otherwise a
 /// non-negative integer token budget. Shared by `--thinking` and `/thinking`.
-pub fn parse_thinking(raw: &str) -> Result<Option<Thinking>> {
+///
+/// "Disabled" is carried on the wire as an explicit zero budget rather than an
+/// omitted `thinking` field: an omitted field means "unset" (the backend
+/// default — which *enables* reasoning on reasoning models, e.g. DeepInfra's
+/// documented default), while `budgetTokens: 0` tells the provider adapter to
+/// send its backend's explicit "off" knob (DeepInfra/LiteLLM
+/// `reasoning_effort: "none"`, Anthropic no `thinking` block).
+pub fn parse_thinking(raw: &str) -> Result<Thinking> {
     match raw.trim() {
-        "" | "off" => Ok(None),
+        "" | "off" => Ok(Thinking {
+            budget_tokens: Some(0),
+        }),
         other => {
             let budget: u32 = other
                 .parse()
                 .map_err(|_| Error::InvalidThinking(other.into()))?;
-            Ok(Some(Thinking {
+            Ok(Thinking {
                 budget_tokens: Some(budget),
-            }))
+            })
         }
     }
 }
@@ -486,6 +495,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     /// Records the requests it receives and plays back scripted responses.
     struct MockHandler {
@@ -762,6 +772,74 @@ mod tests {
                 usage_event(3, 2),
             ]
         );
+    }
+
+    /// Records the `thinking` payload of every request it receives and
+    /// answers with a plain text turn.
+    struct ThinkingRecorder {
+        seen: Rc<RefCell<Vec<Option<Thinking>>>>,
+    }
+
+    impl Handler for ThinkingRecorder {
+        fn info(&self) -> PluginInfo {
+            PluginInfo {
+                name: "recorder".into(),
+                capabilities: Capabilities {
+                    list_models: false,
+                    thinking: true,
+                    tools: true,
+                },
+                default_model: None,
+            }
+        }
+
+        fn list_models(&mut self) -> std::result::Result<Vec<ModelInfo>, clanky_protocol::Error> {
+            Ok(Vec::new())
+        }
+
+        fn chat(
+            &mut self,
+            request: &ChatRequest,
+            sink: &mut dyn FnMut(ChunkPayload),
+        ) -> std::result::Result<ChatDone, clanky_protocol::Error> {
+            self.seen.borrow_mut().push(request.thinking);
+            sink(ChunkPayload::Text { text: "ok".into() });
+            Ok(ChatDone {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+            })
+        }
+    }
+
+    #[test]
+    fn thinking_off_reaches_the_wire_as_an_explicit_zero_budget() {
+        // `--thinking off` must not be indistinguishable from "unset" on the
+        // wire: an omitted `thinking` field falls back to the backend
+        // default, which *enables* reasoning on reasoning models
+        // (DeepInfra's documented default). The zero budget lets provider
+        // adapters send their backend's explicit "off" knob instead.
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let handler = Box::new(ThinkingRecorder {
+            seen: Rc::clone(&seen),
+        });
+        let mut off = config("mock/model");
+        off.thinking = Some("off".into());
+        run(handler, &toolset(), vec![], "hi", &off).0.unwrap();
+        assert_eq!(
+            *seen.borrow(),
+            vec![Some(Thinking {
+                budget_tokens: Some(0)
+            })]
+        );
+
+        // Unset stays unset: no thinking field at all.
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let handler = Box::new(ThinkingRecorder {
+            seen: Rc::clone(&seen),
+        });
+        let unset = config("mock/model");
+        run(handler, &toolset(), vec![], "hi", &unset).0.unwrap();
+        assert_eq!(*seen.borrow(), vec![None]);
     }
 
     #[test]
@@ -1145,7 +1223,28 @@ mod tests {
     #[test]
     fn thinking_values_convert() {
         assert_eq!(thinking_from(&None).unwrap(), None);
-        assert_eq!(thinking_from(&Some("off".into())).unwrap(), None);
+        // `off` is an explicit zero budget, not an omitted field: the
+        // provider must be able to tell "disabled" from "unset" (an
+        // omitted field falls back to the backend default, which enables
+        // reasoning on reasoning models).
+        assert_eq!(
+            thinking_from(&Some("off".into())).unwrap(),
+            Some(Thinking {
+                budget_tokens: Some(0)
+            })
+        );
+        assert_eq!(
+            thinking_from(&Some("".into())).unwrap(),
+            Some(Thinking {
+                budget_tokens: Some(0)
+            })
+        );
+        assert_eq!(
+            thinking_from(&Some("0".into())).unwrap(),
+            Some(Thinking {
+                budget_tokens: Some(0)
+            })
+        );
         assert_eq!(
             thinking_from(&Some("2048".into())).unwrap(),
             Some(Thinking {

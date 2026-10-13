@@ -72,6 +72,13 @@ repetition_penalty = 1.1
 
 Notes:
 
+- `thinking = "off"` really turns thinking off: it is sent to the provider
+  as an explicit zero budget, which each provider maps onto its backend's
+  "disable reasoning" knob (DeepInfra and LiteLLM send
+  `reasoning_effort: "none"`; Anthropic omits the `thinking` block, which
+  that API treats as off). Leaving `thinking` unset is *not* the same thing:
+  the backend's default then applies, which on reasoning models (e.g.
+  DeepSeek, GLM) means a reasoning trace **is** produced.
 - Sampling keys and values are passed to the provider backend **verbatim**:
   any parameter the backend accepts works here (`seed`,
   `repetition_penalty`, `reasoning_effort`, `top_k`, …) and the backend
@@ -173,6 +180,14 @@ The provider's default model (used when neither settings nor `--model` name
 one) is advertised by the plugin at handshake, so Clanky keeps no hardcoded
 per-provider table.
 
+### DeepInfra
+
+Reasoning models on DeepInfra (DeepSeek, GLM, Kimi, Ling, …) produce a
+reasoning trace by default, which streams as Clanky's thinking. To disable
+it, set `thinking = "off"` (or pass `--thinking off`): the provider sends
+DeepInfra's documented `reasoning_effort: "none"`. Leaving `thinking` unset
+does **not** disable it — DeepInfra's default is to reason.
+
 ### Built-in providers
 
 | Provider | Binary | Credentials |
@@ -215,7 +230,8 @@ Notes:
   the bare form, so a restricted key can be denied the alias with a 403.)
 - **Thinking maps to `reasoning_effort`.** Clanky's `--thinking <budget>` is
   translated onto LiteLLM's effort ladder (`none`/`minimal`/`low`/`medium`/
-  `high`/`xhigh`/`max`); `--thinking off` omits the field. Values pass
+  `high`/`xhigh`/`max`); `--thinking off` maps to `none` (the proxy's
+  documented "disable reasoning" value). Values pass
   through unconditionally and the proxy validates them: asking a model for
   thinking or tools it cannot handle surfaces the proxy's own error (which
   tells you to turn thinking off, or that tools are not supported) — nothing

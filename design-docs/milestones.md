@@ -389,6 +389,26 @@ real tenant.
      terminal agree on code-snippet indentation in thinking blocks. Regression tests:
      `thinking_tabs_expand_to_stable_rows`, `print_line_never_emits_control_characters`,
      `streaming_thinking_overflow_keeps_one_status_line`.
+7. [x] `--thinking off` did not disable thinking on reasoning models
+   - Bug (hit via DeepInfra): `parse_thinking` mapped `off` to `Ok(None)`, so the
+     `chat` wire message omitted `thinking` entirely — indistinguishable from "unset".
+     An omitted field falls back to the backend default, and DeepInfra's documented
+     default for reasoning models *enables* the reasoning trace, so `--thinking off`
+     still showed thinking. (`--thinking 0` — an explicit zero budget — worked, because
+     every adapter already mapped `budgetTokens: 0` onto its backend's "off" knob.)
+   - Fix: `off` (and an empty value) now parse to `Thinking { budgetTokens: 0 }`, which
+     reaches the provider as an explicit zero budget. All three adapters already handle
+     it (DeepInfra/LiteLLM → `reasoning_effort: "none"`; Anthropic omits the `thinking`
+     block, which is that API's "off"), so the change lives in core only. TUI status
+     line still hides the thinking chip for `off`/`0`; `/thinking off` keeps `off` in
+     `launch.thinking` (a rejected value no longer clears the previous setting, which is
+     the correct behavior anyway). Protocol spec §5 now documents that
+     `budgetTokens: 0` means "explicitly disabled" and an absent `thinking` means
+     "unset, backend default applies"; README documents the semantics in the
+     `settings.toml` notes and a new DeepInfra section, and corrects the LiteLLM section
+     (which claimed `off` omitted the field). Tests:
+     `thinking_off_reaches_the_wire_as_an_explicit_zero_budget` (core),
+     `thinking_off_sends_reasoning_effort_none` (DeepInfra).
 
 ### ✔ M13 — Parallel subagents
 1. [x] `clanky-subagents` binary (`crates/clanky-subagents`, no dependency on
