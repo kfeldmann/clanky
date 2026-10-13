@@ -188,6 +188,13 @@ it, set `thinking = "off"` (or pass `--thinking off`): the provider sends
 DeepInfra's documented `reasoning_effort: "none"`. Leaving `thinking` unset
 does **not** disable it — DeepInfra's default is to reason.
 
+A thinking budget is quantized onto DeepInfra's `reasoning_effort` ladder
+(`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`, per the per-model
+docs in DeepInfra's model browser — the chat-completions API reference
+still documents only a subset): `0`→`none`, `<500`→`minimal`, `<1682`→`low`,
+`<5661`→`medium`, `<19051`→`high`, `<64107`→`xhigh`, else `max`. A
+`reasoning_effort` set in `[sampling]` wins over the derived value.
+
 ### Built-in providers
 
 | Provider | Binary | Credentials |

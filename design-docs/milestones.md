@@ -409,6 +409,17 @@ real tenant.
      (which claimed `off` omitted the field). Tests:
      `thinking_off_reaches_the_wire_as_an_explicit_zero_budget` (core),
      `thinking_off_sends_reasoning_effort_none` (DeepInfra).
+8. [x] DeepInfra thinking → `reasoning_effort` ladder extended
+   - The chat-completions API reference documents only none/low/medium/high, but
+     the per-model docs in DeepInfra's model browser (validated against the live
+     API) expose six effort levels plus `none`:
+     `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`.
+   - As built: the ladder in `reasoning_effort` (`deepinfra/provider.rs`) is now
+     0→`none`, <500→`minimal`, <1682→`low`, <5661→`medium`, <19051→`high`,
+     <64107→`xhigh`, else `max` (boundaries as observed). A `reasoning_effort`
+     set in `[sampling]` still wins over the derived value. README's DeepInfra
+     section documents the ladder. Tests: `thinking_budget_maps_to_reasoning_effort`
+     and `thinking_fills_reasoning_effort_only_when_unset` updated to the new rungs.
 
 ### ✔ M13 — Parallel subagents
 1. [x] `clanky-subagents` binary (`crates/clanky-subagents`, no dependency on

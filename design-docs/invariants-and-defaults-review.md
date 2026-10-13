@@ -22,7 +22,7 @@
 
 ### ⚪ Gray areas / minor (noted, arguably fine)
 
-- **Thinking budget → `reasoning_effort` quantization** (DeepInfra: ≤2048→`low`, ≤8192→`medium`, else `high`; LiteLLM: ≤512 `minimal`, ≤4096 `low`, ≤16384 `medium`, ≤32768 `high`, ≤65536 `xhigh`, else `max`, 0→`none`). Unavoidable API translation, documented in README; but budget 2049 and 8192 both become `medium` — the exact user number is not honored, and the rung boundaries are arbitrary.
+- **Thinking budget → `reasoning_effort` quantization** (DeepInfra: <500 `minimal`, <1682 `low`, <5661 `medium`, <19051 `high`, <64107 `xhigh`, else `max`; LiteLLM: ≤512 `minimal`, ≤4096 `low`, ≤16384 `medium`, ≤32768 `high`, ≤65536 `xhigh`, else `max`, 0→`none`). Unavoidable API translation, documented in README; but budget 2049 and 8192 both become `medium` — the exact user number is not honored, and the rung boundaries are arbitrary.
 - **✅ FIXED - `[sampling]` map merged per key across scopes/CLI** — `Settings::overlay` used to treat the whole map as one field: user scope `temperature = "0.7"` + project scope `top_p = "0.9"` → `temperature` silently dropped (same for `--sampling`). *Resolution: per-key merge — later layers win key-by-key, keys set only in a lower layer are kept, so every supplied value reaches the provider. Locked in by `sampling_merges_per_key_across_scopes` and `sampling_merges_per_key_from_cli`; documented in README (precedence) and milestones.md (M2).*
 - **Prompt text is trimmed** (`prompt.rs:36`); whitespace-only prompts become "no prompt".
 - **Context files are trimmed and re-wrapped** with a `# Context — <path>` heading (`context.rs` `push_part`) — user text altered (mildly) and annotated.
@@ -85,7 +85,7 @@
 | Anthropic default `max_tokens` | 64 000 (only when user unset) | `anthropic/adapter.rs:21` |
 | Anthropic API version / beta / UA | `2023-06-01` / `claude-code-20250219,oauth-2025-04-20` / `claude-cli/2.1.280` | `anthropic/provider.rs:26-30` |
 | Anthropic pricing table ($/Mtok) | opus 5/25, sonnet 2/10, "fable" 10/50 | `anthropic/provider.rs:36-39` |
-| Thinking→effort ladder (DeepInfra) | 0→`none`, ≤2048→`low`, ≤8192→`medium`, else `high` | `deepinfra/provider.rs:186` |
+| Thinking→effort ladder (DeepInfra) | 0→`none`, <500 `minimal`, <1682 `low`, <5661 `medium`, <19051 `high`, <64107 `xhigh`, else `max` | `deepinfra/provider.rs:186` |
 | Thinking→effort ladder (LiteLLM) | 0→`none`, ≤512 `minimal`, ≤4096 `low`, ≤16384 `medium`, ≤32768 `high`, ≤65536 `xhigh`, else `max` | `litellm/provider.rs:310` |
 | Error message truncation | 400 chars (`truncate_body`); OAuth bodies 200 chars | `*/provider.rs`, `anthropic/oauth.rs:261` |
 

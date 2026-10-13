@@ -183,7 +183,9 @@ impl<B: Backend> DeepInfraProvider<B> {
 }
 
 /// Map a protocol thinking budget onto DeepInfra's `reasoning_effort`
-/// (none/low/medium/high). `None` means "let the backend decide" (or the
+/// ladder (none/minimal/low/medium/high/xhigh/max; see the per-model docs in
+/// DeepInfra's model browser — the chat-completions API reference still
+/// documents only a subset). `None` means "let the backend decide" (or the
 /// model does not reason); an explicit budget of 0 maps to `"none"`, which
 /// DeepInfra documents as disabling reasoning when the model supports it —
 /// unlike omitting the field, which falls back to the backend default.
@@ -191,9 +193,12 @@ fn reasoning_effort(thinking: Thinking) -> Option<&'static str> {
     match thinking.budget_tokens {
         None => None,
         Some(0) => Some("none"),
-        Some(n) if n <= 2048 => Some("low"),
-        Some(n) if n <= 8192 => Some("medium"),
-        Some(_) => Some("high"),
+        Some(n) if n < 500 => Some("minimal"),
+        Some(n) if n < 1682 => Some("low"),
+        Some(n) if n < 5661 => Some("medium"),
+        Some(n) if n < 19051 => Some("high"),
+        Some(n) if n < 64107 => Some("xhigh"),
+        Some(_) => Some("max"),
     }
 }
 
@@ -896,7 +901,7 @@ mod tests {
         provider.chat(&request, &mut |_| {}).unwrap();
         let (_, body) = provider.backend.posts.borrow()[1].clone();
         let body: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body["reasoning_effort"], "medium");
+        assert_eq!(body["reasoning_effort"], "high");
 
         // An explicit zero budget maps to `none` (reasoning disabled),
         // not to an omitted field (backend default).
