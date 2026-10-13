@@ -317,6 +317,24 @@ real tenant.
        was deleted. Print-mode events go through `PrintSink` in `main.rs` (testable against
        captured streams). `-q` in TUI mode is a usage error (`Error::QuietRequiresPrint`); in
        quiet mode retry notices are suppressed too (they're activity, not errors).
+   - [x] Every print-mode entry gets exactly one blank line after it. Assistant
+     text blocks previously ended with whatever trailing whitespace the stream
+     happened to deliver (often none at all), so `clanky -p` printed a response
+     with no final newline. Text blocks now accumulate with trailing whitespace
+     held back — the same mechanism thinking blocks already used — and close on
+     a clean trim plus one blank line, on both stdout and stderr. A close is
+     triggered by the next discrete event (tool call, tool result, retry notice,
+     thinking, or a new round's text — each closed block reopens as a fresh
+     paragraph) and once at end of turn, on both success and error. The blank
+     line is emitted even in `-q` mode, so a quiet response is always a
+     well-formed paragraph (`clanky -p -q` output ends with `\n\n`).
+     Discrete stderr entries (tool calls, tool results, retry notices) already
+     ended with a blank line; they were verified and are now pinned by tests.
+     `flush_partial_round` already fed the streamed text back into the
+     conversation on a mid-stream error, so the held-back whitespace being
+     dropped had no effect on what the model sees. The old post-turn
+     "finish the line" `writeln!` in `run_pipe` is gone — `close_blocks` owns
+     all separators now, so stdout formatting lives in one place.
 3. [x] Status line should de-content gracefully as terminal narrows
    - Drop one element at a time from the status line when the width is too narrow. Drop elements in the following order:
        - provider

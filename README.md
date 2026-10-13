@@ -396,12 +396,20 @@ the agent's response goes to **stdout**, and activity — thinking, tool
 calls, tool results, retry notices — to **stderr**, so
 `clanky -p ... | grep` style pipes stay clean.
 
-- Thinking blocks are printed as they stream and closed with a trimmed
-  line plus a blank line, so each block reads as a unit.
+Every printed entry ends with exactly one blank line, so consecutive
+entries read as units:
+
+- The answer text streams to stdout as it arrives. When the block ends
+  (a tool round starts, or the turn finishes) it is trimmed and closed
+  with a blank line. Tool-round texts are each closed this way, so a
+  multi-round turn prints one paragraph per round.
+- Thinking blocks print the same way, on stderr.
+- Tool calls print as `● name {arguments…}` (arguments preview-capped).
 - Tool results render like the TUI transcript, without the color: a
   `└─ name: …` header, continuation lines aligned under the first output
   character, newlines kept, and the preview capped at a few lines with
   a `… (+N more lines)` note.
+- Retry notices print as `  ↻ message — retrying in Ns (attempt/max)`.
 
 `-q` / `--quiet` (print mode only; rejected in TUI mode) prints just the
 agent's response and errors — no thinking, tool calls, or tool results:

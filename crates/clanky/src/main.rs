@@ -87,7 +87,7 @@ fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
     let mut sink = PrintSink::new(quiet);
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
-    let output = {
+    let result = {
         let mut out = stdout.lock();
         let mut err = stderr.lock();
         let result = turn::run_turn_with(
@@ -97,20 +97,20 @@ fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
             &config,
             &mut |event: TurnEvent| sink.event(event, &mut out, &mut err),
         );
-        // A thinking block that ran to the end of the turn still needs
-        // its closing separator.
-        sink.close_thinking(&mut err);
+        // A block that ran to the end of the turn (a thinking block, or
+        // the answer text) still needs its closing separator: the trim
+        // plus blank line were held back while it was open.
+        sink.close_blocks(&mut out, &mut err);
         result
-    }?;
+    };
 
-    // The response text was streamed incrementally; finish the line.
+    // The response text was streamed incrementally; its closing blank
+    // line was written by `close_blocks` above (on both success and
+    // error), so stdout just needs its final flush.
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
-    if !output.text.ends_with('\n') {
-        writeln!(stdout)?;
-    }
     stdout.flush()?;
-    Ok(())
+    result.map(|_| ())
 }
 
 /// Print-mode event sink: response text to stdout, activity to stderr so
@@ -118,16 +118,29 @@ fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
 /// only the response text and errors are printed — no thinking, tool
 /// calls, or tool results.
 ///
+/// Every printed entry gets one blank line after it. Assistant text and
+/// thinking arrive as arbitrary streaming chunks, so their trailing
+/// whitespace is held back while the block is open and dropped when it
+/// closes — the block then ends on a clean trim and the close adds two
+/// newlines: one to end the block's last line, one blank line after it.
+/// The discrete entries (tool calls, tool results, retry notices) are
+/// written with `writeln!`, so a single trailing `writeln!` produces the
+/// blank line.
+///
 /// `event` writes into the callers' streams so tests can capture output;
 /// the real run passes the process stdout/stderr.
 struct PrintSink {
     quiet: bool,
+    /// Whether an assistant text block is currently streaming (to
+    /// `out`). `false` between blocks, so a text event that arrives
+    /// after another entry opens a fresh block.
+    in_text: bool,
     /// Whether a thinking block is currently streaming (to `err`).
     in_thinking: bool,
-    /// Trailing whitespace held back from the thinking stream so the
-    /// block can be closed with a clean trim (the milestone asks for the
-    /// thinking text trimmed, then two newlines: one to end the block's
-    /// last line and one blank line after it).
+    /// Trailing whitespace held back from the stream currently being
+    /// written (`out` while `in_text`, `err` while `in_thinking`): if the
+    /// block ends here it is dropped so the close can trim cleanly; if
+    /// more text arrives, the held whitespace is emitted first.
     pending_ws: String,
 }
 
@@ -135,6 +148,7 @@ impl PrintSink {
     fn new(quiet: bool) -> Self {
         Self {
             quiet,
+            in_text: false,
             in_thinking: false,
             pending_ws: String::new(),
         }
@@ -144,26 +158,21 @@ impl PrintSink {
         match event {
             TurnEvent::Text { delta } => {
                 self.close_thinking(err);
-                write!(out, "{delta}").ok();
-                out.flush().ok();
+                // Hold trailing whitespace back: if the block ends here,
+                // it is dropped so the close can trim cleanly. If more
+                // text arrives, the held whitespace is emitted first.
+                self.in_text = true;
+                self.hold_ws(out, delta);
             }
             TurnEvent::Thinking { delta } => {
                 if self.quiet {
                     return;
                 }
+                // The thinking text ends when the answer text (or the
+                // next event) starts; close that block first.
+                self.close_text(out);
                 self.in_thinking = true;
-                // Hold trailing whitespace back: if the block ends here,
-                // it is dropped so the close can trim cleanly. If more
-                // text arrives, the held whitespace is emitted first.
-                let trimmed = delta.trim_end_matches(char::is_whitespace);
-                let ws = &delta[trimmed.len()..];
-                if !self.pending_ws.is_empty() && !trimmed.is_empty() {
-                    write!(err, "{}", self.pending_ws).ok();
-                }
-                if !trimmed.is_empty() {
-                    write!(err, "{trimmed}").ok();
-                }
-                self.pending_ws.push_str(ws);
+                self.hold_ws(err, delta);
             }
             // Round summaries are for the session recorder (M4); pipe
             // mode has already streamed the text deltas.
@@ -178,7 +187,7 @@ impl PrintSink {
                 delay,
                 message,
             } => {
-                self.close_thinking(err);
+                self.close_blocks(out, err);
                 if self.quiet {
                     return;
                 }
@@ -188,20 +197,22 @@ impl PrintSink {
                     delay.as_secs_f64()
                 )
                 .ok();
+                writeln!(err).ok();
             }
             // Activity entries end with a blank line so consecutive tool
             // rounds and the following answer text breathe, matching the
             // TUI transcript's one-blank-line-per-entry spacing.
             TurnEvent::ToolCall { name, arguments } => {
-                self.close_thinking(err);
+                self.close_blocks(out, err);
                 if self.quiet {
                     return;
                 }
                 let preview = tools::truncate_call_arguments(&arguments, tools::CALL_PREVIEW_CHARS);
-                writeln!(err, "● {name} {preview}\n").ok();
+                writeln!(err, "● {name} {preview}").ok();
+                writeln!(err).ok();
             }
             TurnEvent::ToolResult { name, output } => {
-                self.close_thinking(err);
+                self.close_blocks(out, err);
                 if self.quiet {
                     return;
                 }
@@ -223,15 +234,49 @@ impl PrintSink {
         }
     }
 
-    /// Close an open thinking block: the held-back trailing whitespace is
+    /// Stream a delta to `w`, holding trailing whitespace back so an open
+    /// block can close on a clean trim.
+    fn hold_ws<W: Write>(&mut self, w: &mut W, delta: String) {
+        let trimmed = delta.trim_end_matches(char::is_whitespace);
+        let ws = &delta[trimmed.len()..];
+        if !self.pending_ws.is_empty() && !trimmed.is_empty() {
+            write!(w, "{}", self.pending_ws).ok();
+        }
+        if !trimmed.is_empty() {
+            write!(w, "{trimmed}").ok();
+        }
+        self.pending_ws.push_str(ws);
+        w.flush().ok();
+    }
+
+    /// Close an open text block: the held-back trailing whitespace is
     /// dropped (the block ends trimmed) and two newlines are added — one
     /// to end the block's last line, one blank line after it.
+    fn close_text<O: Write>(&mut self, out: &mut O) {
+        if self.in_text {
+            self.in_text = false;
+            self.pending_ws.clear();
+            write!(out, "\n\n").ok();
+            out.flush().ok();
+        }
+    }
+
+    /// Close an open thinking block the same way (on stderr).
     fn close_thinking<E: Write>(&mut self, err: &mut E) {
         if self.in_thinking {
             self.in_thinking = false;
             self.pending_ws.clear();
             write!(err, "\n\n").ok();
         }
+    }
+
+    /// Close whichever block is open. The discrete entries call this so
+    /// an open block ends with its blank line before the new entry
+    /// prints, and `run_pipe` calls it once more at end of turn to close
+    /// a block that streamed to the last chunk.
+    fn close_blocks<O: Write, E: Write>(&mut self, out: &mut O, err: &mut E) {
+        self.close_text(out);
+        self.close_thinking(err);
     }
 }
 
@@ -247,7 +292,7 @@ mod tests {
             sink.event(event.clone(), &mut out, &mut err);
         }
         // Mirror the post-turn behavior of `run_pipe`.
-        sink.close_thinking(&mut err);
+        sink.close_blocks(&mut out, &mut err);
         (
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
@@ -286,6 +331,113 @@ mod tests {
             ],
         );
         assert_eq!(err, "a\nb\n\n");
+    }
+
+    #[test]
+    fn text_block_is_trimmed_and_gets_a_blank_line_after() {
+        let (out, _) = run_events(
+            false,
+            &[
+                TurnEvent::Text {
+                    delta: "the answer\n  ".into(),
+                },
+                TurnEvent::Text {
+                    delta: "  \n".into(),
+                },
+            ],
+        );
+        assert_eq!(out, "the answer\n\n");
+    }
+
+    #[test]
+    fn text_held_whitespace_is_emitted_when_more_text_follows() {
+        let (out, _) = run_events(
+            false,
+            &[
+                TurnEvent::Text {
+                    delta: "a\n".into(),
+                },
+                TurnEvent::Text { delta: "b".into() },
+            ],
+        );
+        assert_eq!(out, "a\nb\n\n");
+    }
+
+    #[test]
+    fn tool_activity_after_answer_text_separates_the_blocks() {
+        // A tool round's activity closes the open answer block with its
+        // blank line; the next round's answer starts fresh on stdout.
+        let (out, err) = run_events(
+            false,
+            &[
+                TurnEvent::Text {
+                    delta: "let me check\n\n".into(),
+                },
+                TurnEvent::ToolCall {
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
+                TurnEvent::ToolResult {
+                    name: "bash".into(),
+                    output: "ok".into(),
+                },
+                TurnEvent::Text {
+                    delta: "done".into(),
+                },
+            ],
+        );
+        assert_eq!(out, "let me check\n\ndone\n\n");
+        assert_eq!(err, "● bash {}\n\n  └─ bash: ok\n\n");
+    }
+
+    #[test]
+    fn thinking_between_rounds_closes_the_answer_block() {
+        // Thinking never follows answer text mid-turn, but if a provider
+        // interleaves them the answer block must still close cleanly
+        // rather than swallowing the stderr thinking text.
+        let (out, err) = run_events(
+            false,
+            &[
+                TurnEvent::Text {
+                    delta: "first\n".into(),
+                },
+                TurnEvent::Thinking {
+                    delta: "hmm".into(),
+                },
+                TurnEvent::Text {
+                    delta: "second".into(),
+                },
+            ],
+        );
+        assert_eq!(out, "first\n\nsecond\n\n");
+        assert_eq!(err, "hmm\n\n");
+    }
+
+    #[test]
+    fn retry_notice_gets_a_blank_line_after() {
+        use std::time::Duration;
+        let (_, err) = run_events(
+            false,
+            &[TurnEvent::Retrying {
+                attempt: 1,
+                max_retries: 3,
+                delay: Duration::from_secs(2),
+                message: "Model busy".into(),
+            }],
+        );
+        assert!(err.ends_with("\n\n"), "{err:?}");
+    }
+
+    #[test]
+    fn tool_call_gets_a_blank_line_after() {
+        let (_, err) = run_events(
+            false,
+            &[TurnEvent::ToolCall {
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        assert_eq!(err, "● bash {}\n\n");
     }
 
     #[test]
@@ -338,7 +490,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(out, "answer");
+        assert_eq!(out, "answer\n\n");
         assert_eq!(err, "");
     }
 }
