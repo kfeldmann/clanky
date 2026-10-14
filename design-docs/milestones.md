@@ -304,7 +304,7 @@ real tenant.
   tests + a mock-backend chat pinned to the same fixtures); first live
   key-user should sanity-check against the real API.
 
-### ☐ M12 — Refinements, Bug Fixes
+### ✔ M12 — Refinements, Bug Fixes
 1. [x] Add support for ctl+u in the input field (clear from cursor to beginning of line)
 2. [x] Print-mode (-p) output changes
    - [x] Thinking text seems to end with no newline (should trim and add two newlines so there is a blank after the thinking block)
@@ -443,6 +443,89 @@ real tenant.
      subagents"). Shipped with `contrib/skills/parallel-subagents/SKILL.md`,
      an agent-facing skill (when to fan out, how to call the runner, how to
      read the result) for users to copy into a skills scope.
+
+## ☐ M14 — Unified sessions: print mode records, `--no-session`, `--resume` everywhere
+Session recording has so far been a TUI feature only (it was specified in M4
+when the pipe path from M1 was already frozen), so `clanky -p` runs left no
+transcript and could not resume. The turn layer was always shared — both front
+ends drive the same `run_turn_with` and consume the same `TurnEvent` stream —
+so this milestone moves the event→record mapping out of the TUI and gives both
+front ends the same session behavior. A run of `-p` then leaves exactly the
+JSONL a TUI run would, which in particular makes subagent (`clanky -pq`) work
+inspectable afterward.
+
+Principles:
+- **One recorder, two front ends.** The `TurnEvent`→`session::Record` mapping
+  (round consolidation, delta accumulation, partial flush on cut-short turns,
+  tool results, usage) lives once, next to the session code (`src/session.rs`
+  or a sibling); the TUI and pipe mode both feed it their turn events. The TUI
+  keeps only its presentation concerns (error surfacing as transcript entries,
+  `/name` display, `/md` snapshot).
+- **Same features, same flags, both modes.** Sessions are recorded by default
+  in print mode too. `--no-session` (CLI flag + `session = false` in
+  `settings.toml`, precedence as always: CLI > project > user) disables
+  recording in **both** modes — the TUI is not forced to save, print mode is
+  not forced to lose. `--resume NAME` works in both modes: the TUI keeps its
+  picker (`--resume` with no NAME), print mode requires a NAME (no picker in a
+  pipe). With `--no-session`, `--resume` is rejected in both modes (nothing to
+  load into, nothing would be saved) — one shared error message, not two.
+  A resumed print-mode turn appends to the resumed file (reopen semantics),
+  exactly like a resumed TUI turn.
+- **User values pass through untouched.** The resume NAME is validated by the
+  same `session::validate_name` used everywhere; no new local validation beyond
+  "a session file with that name must exist" (which `--resume` already errors
+  on in the TUI).
+- **`-q` stays print-mode-only** (it is an output filter, not a session
+  feature); sessions are orthogonal to it. `--no-session` is the orthogonal
+  on/off, usable everywhere.
+- **No behavior change when nothing is set.** Default remains "record in both
+  modes"; existing TUI sessions, `/name`, `/resume`, `/md` behave exactly as
+  before.
+
+Tasks:
+1. [ ] Extract the session recorder: move `record_turn_event` /
+   `flush_partial` / partial-accumulator logic out of `tui/mod.rs` into a
+   shared module, decoupled from `&mut app::App` (error surfacing becomes a
+   callback or return value). The TUI delegates to it unchanged.
+2. [ ] Print mode records by default: `run_pipe` creates a `SessionWriter`
+   (default name from `session::default_name`, provider/model stamped in the
+   header like the TUI) and feeds its turn events through the shared recorder.
+   A print-mode turn cut short by an error or ctrl+c gets the same
+   consolidated partial flush the TUI has. Pipe mode today has no SIGINT handling
+   — the default disposition just kills the process. To flush on ctrl+c you need
+   a signal handler (signal-hook is a new dependency; no unsafe needed in our
+   code, so the workspace ban holds).
+3. [ ] `--no-session` flag + `session` settings field, overlaying through the
+   existing precedence machinery. In the TUI, recording off means no session
+   file, no `/name` target (the command reports it politely), and `/md`
+   exports what the screen showed (fresh header, screen-derived records — the
+   existing no-file path). In pipe mode it means no file is created. The
+   status line replaces the session name with "(no session)" when there is no session file.
+4. [ ] `--resume NAME` in print mode: load the named session
+   (`session::load`), seed `messages` via `history_from_records`, print what
+   is being continued (a one-line note on stderr, keep stdout clean), run the
+   turn, and append records to the same file (reopen). Remove the
+   `ResumeNonInteractive` error. A TUI `--resume NAME` with no such session
+   and a pipe-mode one must fail with the same message.
+5. [ ] README: settings table gets `session`; print-mode section documents
+   that sessions are saved by default, `--no-session`, and `--resume NAME`;
+   session-precedence note updated (both modes record). Subagents section
+   notes that `clanky -pq` jobs now leave session files unless the run
+   description passes a `--no-session` override (and that the runner's
+   allow-list needs it added, so subagents can opt out per job).
+6. [ ] Tests: golden/pipe test that a `-p` run writes a session file with the
+   same records the TUI would write for the same transcript; partial flush on
+   mid-stream error in pipe mode; `--no-session` writes nothing in both
+   modes; `--resume NAME` in pipe mode continues a session (records appended,
+   context restored); shared-error test for `--resume` + `--no-session`.
+
+Done when: `clanky -p "count files in /tmp"` leaves a resumable session file;
+`clanky -pq --no-session` leaves none; a TUI session resumed with `clanky -p
+--resume NAME` continues with full context and appends to the same file — and
+the TUI's session behavior is unchanged.
+
+As built notes:
+- (record decisions here as implemented)
 
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming

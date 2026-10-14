@@ -2,7 +2,7 @@
 
 The clanky project is in `/work`.
 
-You do not have `git` available. You are in an Alpine Linux container with the following packages installed: 
+You do not have `git` available. You are working in an Alpine Linux container with the following packages installed: 
 
 - bash
 - python3
@@ -25,8 +25,7 @@ lynx -dump https://lite.duckduckgo.com/lite?q=<url-encoded-query>
 
 ## Project state
 
-Milestones are complete through M11 (except for M9 which is deferred, and the first item in M10 which is low priority).
-M12 "Refinements, Bug Fixes" is next.
+Milestones are complete through M13 (except for M9 which is deferred, and the first item in M10 which is low priority). M14 is next.
 
 See `design-docs/milestones.md` — checkboxes mark progress, and its "As built" notes record
 decisions made during implementation. Check them before redesigning something.
