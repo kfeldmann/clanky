@@ -11,6 +11,7 @@ pub mod export;
 pub mod prompt;
 pub mod prompts;
 pub mod provider;
+pub mod recorder;
 pub mod session;
 pub mod settings;
 pub mod skills;

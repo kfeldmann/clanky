@@ -78,7 +78,8 @@ use crate::error::Result;
 use crate::export::{self, ExportOptions};
 use crate::prompts::{self, Template};
 use crate::provider::ProviderSession;
-use crate::session::{self, SessionInfo, SessionWriter};
+use crate::recorder;
+use crate::session::{self, SessionInfo};
 use crate::settings::{SamplingParams, Settings};
 use crate::turn::{TurnConfig, TurnEvent, TurnOutput};
 use commands::{Command, SamplingEdit};
@@ -162,6 +163,33 @@ enum WorkerEvent {
     /// Model list for the [`Catalog`], plus the plugin's advertised default
     /// model (from the handshake).
     Models(crate::error::Result<CatalogFetch>),
+}
+
+/// The shared session recorder (crate::recorder), wired to surface its
+/// write failures as transcript errors.
+type SessionState = recorder::Recorder;
+
+/// `recorder::ErrorSink` that pushes session write failures onto the
+/// transcript, so a broken session file is visible but never aborts the
+/// turn. The queue is drained into `app.entries` by the render pass.
+#[derive(Default)]
+struct TranscriptErrors {
+    messages: Vec<String>,
+}
+
+impl TranscriptErrors {
+    /// Move the pending messages onto the transcript.
+    fn drain(&mut self, app: &mut app::App) {
+        for message in self.messages.drain(..) {
+            app.entries.push(app::Entry::Error(message));
+        }
+    }
+}
+
+impl recorder::ErrorSink for TranscriptErrors {
+    fn report(&mut self, message: String) {
+        self.messages.push(message);
+    }
 }
 
 /// One catalog fetch: the provider it was for, its models, and its default
@@ -539,163 +567,6 @@ fn picker_for(kind: &PickerKind) -> picker::Picker {
     picker::Picker::new(title, items)
 }
 
-/// Streamed deltas of the chat round currently in flight. Deltas are
-/// shown as they arrive but only recorded once the round completes (as
-/// one consolidated record), so this accumulator is what an interrupted
-/// turn — a provider error, or ctrl+c mid-stream — consolidates and
-/// writes to make sure nothing shown on screen is lost (see
-/// [`SessionState::flush_partial`]).
-#[derive(Debug, Default)]
-struct PartialRound {
-    thinking: String,
-    text: String,
-}
-
-/// Autosave state: the open session file, lazily created on the first
-/// record. All file access happens on the UI thread; the worker only
-/// streams events over the channel.
-struct SessionState {
-    dir: PathBuf,
-    launch: Launch,
-    writer: Option<SessionWriter>,
-    /// Name requested via `/name` before any file exists yet.
-    pending_name: Option<String>,
-    /// Streamed deltas not yet consolidated into a round record.
-    partial: PartialRound,
-}
-
-impl SessionState {
-    fn new(launch: Launch) -> Self {
-        Self {
-            dir: session::sessions_dir(),
-            launch,
-            writer: None,
-            pending_name: None,
-            partial: PartialRound::default(),
-        }
-    }
-
-    /// The current display name: the open file's stem, else the pending
-    /// `/name` request.
-    fn current_name(&self) -> Option<String> {
-        self.writer
-            .as_ref()
-            .and_then(|w| w.path().file_stem().and_then(|s| s.to_str()))
-            .map(str::to_string)
-            .or_else(|| self.pending_name.clone())
-    }
-
-    /// Ensure a writer exists (using a pending `/name` if one was given)
-    /// and append a record. Write failures surface as transcript errors.
-    fn record(&mut self, app: &mut app::App, record: session::Record) {
-        if let Err(err) = self
-            .ensure_writer()
-            .and_then(|writer| writer.append(&record))
-        {
-            app.entries
-                .push(app::Entry::Error(format!("session not saved: {err}")));
-        }
-    }
-
-    /// Accumulate one streamed delta into the in-flight round.
-    fn accumulate(&mut self, delta: &str, thinking: bool) {
-        let slot = if thinking {
-            &mut self.partial.thinking
-        } else {
-            &mut self.partial.text
-        };
-        slot.push_str(delta);
-    }
-
-    /// The round completed and its records were written; they supersede
-    /// the deltas accumulated for the same content.
-    fn clear_partial(&mut self) {
-        self.partial = PartialRound::default();
-    }
-
-    /// Consolidate the in-flight round's accumulated deltas into the same
-    /// records a completed round writes (thinking first, then text), so a
-    /// turn cut short by an error or ctrl+c loses nothing. Writes nothing
-    /// when the last round completed normally. Partial tool calls are not
-    /// kept: they never reached the screen and nothing executed them.
-    fn flush_partial(&mut self, app: &mut app::App) {
-        let partial = std::mem::take(&mut self.partial);
-        if !partial.thinking.is_empty() {
-            self.record(
-                app,
-                session::Record::Thinking {
-                    text: partial.thinking,
-                },
-            );
-        }
-        if !partial.text.is_empty() {
-            self.record(
-                app,
-                session::Record::Assistant {
-                    text: partial.text,
-                    calls: Vec::new(),
-                },
-            );
-        }
-    }
-
-    fn ensure_writer(&mut self) -> Result<&mut SessionWriter> {
-        if self.writer.is_none() {
-            let name = self
-                .pending_name
-                .take()
-                .unwrap_or_else(session::default_name);
-            self.writer = Some(SessionWriter::new(
-                self.dir.join(format!("{name}.jsonl")),
-                session::Header {
-                    version: session::FORMAT_VERSION,
-                    created: 0, // stamped when the file is created
-                    provider: Some(self.launch.provider.clone()),
-                    model: self.launch.model.clone(),
-                },
-            ));
-        }
-        Ok(self.writer.as_mut().expect("just set"))
-    }
-
-    /// `/name [name]`: rename the open file, or remember the name for the
-    /// file that will be created with the next prompt.
-    fn set_name(&mut self, app: &mut app::App, name: Option<String>) {
-        let Some(name) = name else {
-            app.entries
-                .push(app::Entry::Info("usage: /name <new-name>".into()));
-            return;
-        };
-        match self.writer.as_mut() {
-            Some(writer) => match writer.rename(&name) {
-                Ok(_) => app
-                    .entries
-                    .push(app::Entry::Info(format!("session saved as `{name}`"))),
-                Err(err) => app.entries.push(app::Entry::Error(err.to_string())),
-            },
-            None => match session::validate_name(&name) {
-                Ok(()) => {
-                    self.pending_name = Some(name.clone());
-                    app.entries.push(app::Entry::Info(format!(
-                        "session will be saved as `{name}`"
-                    )));
-                }
-                Err(err) => app.entries.push(app::Entry::Error(err.to_string())),
-            },
-        }
-    }
-
-    /// A session header stamped now, for a session with no records yet.
-    fn fresh_header(launch: &Launch) -> session::Header {
-        session::Header {
-            version: session::FORMAT_VERSION,
-            created: session::now_millis(),
-            provider: Some(launch.provider.clone()),
-            model: launch.model.clone(),
-        }
-    }
-}
-
 /// The complete input of one `/md` export, captured when the command runs
 /// so a modal that is still open exports what the command saw rather than
 /// whatever the session looks like when the filename is confirmed.
@@ -714,12 +585,12 @@ impl ExportSource {
     /// exports an empty document with a fresh header.
     fn snapshot(state: &SessionState, options: ExportOptions) -> Result<Self> {
         let name = state.current_name();
-        let (header, records) = match state.writer.as_ref() {
-            Some(writer) if writer.path().exists() => {
-                let data = session::load(writer.path())?;
+        let (header, records) = match state.open_file() {
+            Some(path) if path.exists() => {
+                let data = session::load(path)?;
                 (data.header, data.records)
             }
-            _ => (SessionState::fresh_header(&state.launch), Vec::new()),
+            _ => (state.fresh_header(), Vec::new()),
         };
         Ok(Self {
             name,
@@ -771,8 +642,7 @@ fn load_session(info: &SessionInfo, app: &mut app::App, state: &mut SessionState
     let conversation = app.restore(&data.records);
     app.history = crate::context::system_messages();
     app.history.extend(conversation);
-    state.writer = Some(SessionWriter::reopen(info.path.clone()));
-    state.pending_name = None;
+    state.reopen(info.path.clone());
     app.entries.push(app::Entry::Info(format!(
         "resumed `{}` ({} records)",
         info.name,
@@ -802,7 +672,8 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     // Fresh session: seed the system context so the first turn sends it
     // (resumed sessions rebuild it inside `load_session`).
     app.history = crate::context::system_messages();
-    let mut state = SessionState::new(launch.clone());
+    let mut state = SessionState::new(&launch.provider, launch.model.as_deref());
+    let mut transcript_errors = TranscriptErrors::default();
     // Prefetch the provider's model catalog in the background: it prices
     // the session-cost display and makes `/model` instant. The fetch also
     // reports the plugin's advertised default model.
@@ -823,7 +694,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     // the terminal on the first render.
     match launch.resume.as_deref() {
         Some("") => {
-            let kind = PickerKind::Resume(session::list(&state.dir));
+            let kind = PickerKind::Resume(session::list(state.dir()));
             picker = Some((picker_for(&kind), kind));
         }
         Some(name) => {
@@ -837,7 +708,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     if let Some(prompt) = launch.initial_prompt.clone() {
         app.push_user(&prompt);
         state.record(
-            &mut app,
+            &mut transcript_errors,
             session::Record::User {
                 text: prompt.clone(),
             },
@@ -933,7 +804,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                                     } else {
                                         app.push_user(&prompt);
                                         state.record(
-                                            &mut app,
+                                            &mut transcript_errors,
                                             session::Record::User {
                                                 text: prompt.clone(),
                                             },
@@ -977,14 +848,17 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
             match event {
                 WorkerEvent::Turn(turn_event) => {
                     app.on_turn_event(turn_event.clone());
-                    record_turn_event(&mut state, &mut app, &turn_event);
+                    recorder::record_turn_event(&mut state, &turn_event);
                 }
                 WorkerEvent::Done(mut done) => {
                     // Reclaim the long-lived plugin process for the next turn.
                     if let Some(session) = done.session.take() {
                         session_owner = Some(session);
                     }
-                    record_done(&mut state, &mut app, &done);
+                    state.record_done(&mut transcript_errors, &done.result);
+                    // Adopt the conversation as the turn left it, even on
+                    // error: the partial context stays continuable.
+                    app.history = done.history.clone();
                     app.on_turn_done(&done.result);
                     turn_finished = true;
                 }
@@ -1025,7 +899,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
             // record it, and count it into the estimate.
             app.push_user(&prompt);
             state.record(
-                &mut app,
+                &mut transcript_errors,
                 session::Record::User {
                     text: prompt.clone(),
                 },
@@ -1041,6 +915,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
         }
 
         if dirty {
+            transcript_errors.drain(&mut app);
             let session_name = state.current_name();
             let cost = session_cost(&catalog, launch, &app);
             // `off`/empty mean disabled and are not shown.
@@ -1073,8 +948,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     // Ctrl+C/Ctrl+Q/Ctrl+D quits mid-turn without waiting for the worker:
     // record what it already sent, then consolidate the in-flight round's
     // deltas, so `/resume` restores exactly what the terminal showed.
-    drain_turn_events(&rx, &mut state, &mut app);
-    state.flush_partial(&mut app);
+    drain_turn_events(&rx, &mut state, &mut transcript_errors);
     Ok(())
 }
 
@@ -1086,13 +960,14 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
 fn drain_turn_events(
     rx: &mpsc::Receiver<WorkerEvent>,
     state: &mut SessionState,
-    app: &mut app::App,
+    errors: &mut dyn recorder::ErrorSink,
 ) {
     while let Ok(event) = rx.try_recv() {
         if let WorkerEvent::Turn(turn_event) = event {
-            record_turn_event(state, app, &turn_event);
+            recorder::record_turn_event(state, &turn_event);
         }
     }
+    state.flush_partial(errors);
 }
 
 /// ctrl+e (M7): suspend the TUI, edit the prompt buffer in `$EDITOR`,
@@ -1121,81 +996,6 @@ fn run_editor(app: &mut app::App, screen: &mut screen::Screen<Stdout>) -> Result
         Err(err) => return Err(err),
     }
     Ok(())
-}
-
-/// Map one turn event onto session records (autosave).
-fn record_turn_event(state: &mut SessionState, app: &mut app::App, event: &TurnEvent) {
-    match event {
-        TurnEvent::Round {
-            text,
-            thinking,
-            calls,
-        } => {
-            // The records written below supersede the deltas accumulated
-            // for this round.
-            state.clear_partial();
-            if !thinking.is_empty() {
-                state.record(
-                    app,
-                    session::Record::Thinking {
-                        text: thinking.clone(),
-                    },
-                );
-            }
-            if !text.is_empty() || !calls.is_empty() {
-                state.record(
-                    app,
-                    session::Record::Assistant {
-                        text: text.clone(),
-                        calls: calls.clone(),
-                    },
-                );
-            }
-        }
-        TurnEvent::ToolResult { name, output } => {
-            state.record(
-                app,
-                session::Record::ToolResult {
-                    name: name.clone(),
-                    output: output.clone(),
-                },
-            );
-        }
-        TurnEvent::Usage { usage } => {
-            state.record(app, session::usage_record(*usage));
-        }
-        // Streaming deltas are accumulated and consolidated into the
-        // round's records when the round completes (or is cut short; see
-        // `SessionState::flush_partial`).
-        TurnEvent::Text { delta } => state.accumulate(delta, false),
-        TurnEvent::Thinking { delta } => state.accumulate(delta, true),
-        // Retry notices are UI-only: they are not conversation content,
-        // so nothing is recorded in the session file.
-        TurnEvent::ToolCall { .. } | TurnEvent::Retrying { .. } => {}
-    }
-}
-
-/// Map a finished turn onto session records (error; usage is recorded
-/// round-by-round in `record_turn_event`) and update the conversation
-/// history. Anything the last round streamed without completing — an
-/// error or a quit usually cuts it short — is consolidated and written
-/// first (content, then the error), as on screen. The history is adopted
-/// even when the turn failed, so the model sees the partial context (its
-/// prompt, rounds and tool results) on the next turn.
-fn record_done(state: &mut SessionState, app: &mut app::App, done: &TurnEnd) {
-    state.flush_partial(app);
-    match &done.result {
-        Ok(_) => {}
-        Err(err) => {
-            state.record(
-                app,
-                session::Record::Error {
-                    message: err.to_string(),
-                },
-            );
-        }
-    }
-    app.history = done.history.clone();
 }
 
 /// The modal that asks for the `/md` export filename (the options the
@@ -1367,7 +1167,10 @@ fn handle_command(
 ) -> Action {
     match command {
         Command::Name(name) => {
-            state.set_name(app, name);
+            match state.set_name(name) {
+                Ok(info) => app.entries.push(app::Entry::Info(info)),
+                Err(message) => app.entries.push(app::Entry::Error(message)),
+            }
             Action::None
         }
         Command::Resume => {
@@ -1377,7 +1180,7 @@ fn handle_command(
                 ));
                 return Action::None;
             }
-            let infos = session::list(&state.dir);
+            let infos = session::list(state.dir());
             if infos.is_empty() {
                 app.entries
                     .push(app::Entry::Info("no saved sessions".into()));
@@ -1795,6 +1598,14 @@ mod tests {
     fn launch() -> Launch {
         Launch::from_settings("deepinfra", &Settings::default())
     }
+    /// An `ErrorSink` for tests where write failures cannot happen.
+    struct NoErrors;
+
+    impl recorder::ErrorSink for NoErrors {
+        fn report(&mut self, message: String) {
+            panic!("unexpected session write failure: {message}");
+        }
+    }
 
     /// Install a fake discovered-plugin list for the duration of one test.
     /// The cache is process-wide, so the lock serializes these tests; tests
@@ -1817,7 +1628,7 @@ mod tests {
     #[test]
     fn ctrl_u_clears_from_cursor_to_start() {
         let mut cfg = launch();
-        let mut state = SessionState::new(cfg.clone());
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
         let mut app = app::App::new();
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -1836,7 +1647,7 @@ mod tests {
     #[test]
     fn ctrl_t_toggles_thinking_display() {
         let mut cfg = launch();
-        let mut state = SessionState::new(cfg.clone());
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
         let mut app = app::App::new();
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2248,7 +2059,7 @@ mod tests {
     #[test]
     fn thinking_commands_set_and_clear() {
         let mut cfg = launch();
-        let mut state = SessionState::new(cfg.clone());
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
         let mut app = app::App::new();
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2297,7 +2108,7 @@ mod tests {
     #[test]
     fn model_and_provider_commands_reconfigure_the_launch() {
         let mut cfg = launch();
-        let mut state = SessionState::new(cfg.clone());
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
         let mut app = app::App::new();
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2328,7 +2139,7 @@ mod tests {
     #[test]
     fn template_commands_fill_the_input_line() {
         let mut cfg = launch();
-        let mut state = SessionState::new(cfg.clone());
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
         let mut app = app::App::new();
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2388,7 +2199,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.jsonl");
-        let mut writer = SessionWriter::new(
+        let mut writer = recorder::SessionWriter::new(
             path.clone(),
             session::Header {
                 version: session::FORMAT_VERSION,
@@ -2411,13 +2222,8 @@ mod tests {
         ] {
             writer.append(&record).unwrap();
         }
-        let state = SessionState {
-            dir: dir.clone(),
-            launch: launch(),
-            writer: Some(writer),
-            pending_name: None,
-            partial: PartialRound::default(),
-        };
+        let mut state = SessionState::with_dir(dir.clone(), "session", "deepinfra", None);
+        state.reopen(path);
         (state, dir)
     }
 
@@ -2453,8 +2259,8 @@ mod tests {
 
     #[test]
     fn md_export_without_a_session_writes_an_empty_document() {
-        let mut state = SessionState::new(launch());
-        state.dir = std::env::temp_dir();
+        let mut state = SessionState::new("deepinfra", None);
+        *(state.dir_mut()) = std::env::temp_dir();
         let mut app = app::App::new();
         let source = ExportSource::snapshot(&state, ExportOptions::default()).unwrap();
         let target =
@@ -2479,7 +2285,7 @@ mod tests {
     #[test]
     fn md_command_without_a_filename_opens_the_modal() {
         let mut cfg = launch();
-        let mut state = SessionState::new(cfg.clone());
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
         let mut app = app::App::new();
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2562,10 +2368,10 @@ mod tests {
         ));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let mut state = SessionState::new(launch());
-        state.dir = dir.clone();
-        state.pending_name = Some("session".into());
-        (state, dir)
+        (
+            SessionState::with_dir(dir.clone(), "session", "deepinfra", None),
+            dir,
+        )
     }
 
     #[test]
@@ -2575,7 +2381,6 @@ mod tests {
         // completed round writes, thinking first, so nothing shown on
         // screen is lost and `/resume` restores the conversation.
         let (mut state, dir) = recording_state("quit");
-        let mut app = app::App::new();
         for event in [
             TurnEvent::Thinking {
                 delta: "let me ".into(),
@@ -2587,9 +2392,9 @@ mod tests {
                 delta: "The answer".into(),
             },
         ] {
-            record_turn_event(&mut state, &mut app, &event);
+            recorder::record_turn_event(&mut state, &event);
         }
-        state.flush_partial(&mut app);
+        state.flush_partial(&mut NoErrors);
         let data = session::load(&dir.join("session.jsonl")).unwrap();
         assert_eq!(
             data.records,
@@ -2611,24 +2416,21 @@ mod tests {
         // The round's records and the accumulated deltas describe the
         // same content; flushing after a `Round` event must be a no-op.
         let (mut state, dir) = recording_state("round");
-        let mut app = app::App::new();
-        record_turn_event(
+        recorder::record_turn_event(
             &mut state,
-            &mut app,
             &TurnEvent::Text {
                 delta: "done".into(),
             },
         );
-        record_turn_event(
+        recorder::record_turn_event(
             &mut state,
-            &mut app,
             &TurnEvent::Round {
                 text: "done".into(),
                 thinking: String::new(),
                 calls: vec![],
             },
         );
-        state.flush_partial(&mut app);
+        state.flush_partial(&mut NoErrors);
         let data = session::load(&dir.join("session.jsonl")).unwrap();
         assert_eq!(
             data.records,
@@ -2643,25 +2445,21 @@ mod tests {
     #[test]
     fn a_turn_error_keeps_the_partial_round_before_the_error_record() {
         let (mut state, dir) = recording_state("error");
-        let mut app = app::App::new();
-        record_turn_event(
+        recorder::record_turn_event(
             &mut state,
-            &mut app,
             &TurnEvent::Text {
                 delta: "partial".into(),
             },
         );
-        let done = TurnEnd {
-            result: Err(clanky_protocol::Error::provider(
+        state.record_done(
+            &mut NoErrors,
+            &Err(clanky_protocol::Error::provider(
                 clanky_protocol::ErrorCode::Backend,
                 "timed out reading response",
                 true,
             )
             .into()),
-            history: Vec::new(),
-            session: None,
-        };
-        record_done(&mut state, &mut app, &done);
+        );
         let data = session::load(&dir.join("session.jsonl")).unwrap();
         assert_eq!(
             data.records,
@@ -2684,7 +2482,6 @@ mod tests {
         // loop would: a round that completed just before ctrl+c is kept,
         // deltas after it still flush, and the turn's `Done` is dropped.
         let (mut state, dir) = recording_state("drain");
-        let mut app = app::App::new();
         let (tx, rx) = mpsc::channel::<WorkerEvent>();
         tx.send(WorkerEvent::Turn(TurnEvent::Round {
             text: "first".into(),
@@ -2707,8 +2504,8 @@ mod tests {
             session: None,
         }))
         .unwrap();
-        drain_turn_events(&rx, &mut state, &mut app);
-        state.flush_partial(&mut app);
+        drain_turn_events(&rx, &mut state, &mut NoErrors);
+        state.flush_partial(&mut NoErrors);
         let data = session::load(&dir.join("session.jsonl")).unwrap();
         assert_eq!(
             data.records,
