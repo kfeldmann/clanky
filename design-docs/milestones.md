@@ -483,11 +483,11 @@ Principles:
   before.
 
 Tasks:
-1. [ ] Extract the session recorder: move `record_turn_event` /
+1. [x] Extract the session recorder: move `record_turn_event` /
    `flush_partial` / partial-accumulator logic out of `tui/mod.rs` into a
    shared module, decoupled from `&mut app::App` (error surfacing becomes a
    callback or return value). The TUI delegates to it unchanged.
-2. [ ] Print mode records by default: `run_pipe` creates a `SessionWriter`
+2. [x] Print mode records by default: `run_pipe` creates a `SessionWriter`
    (default name from `session::default_name`, provider/model stamped in the
    header like the TUI) and feeds its turn events through the shared recorder.
    A print-mode turn cut short by an error or ctrl+c gets the same
@@ -525,7 +525,25 @@ Done when: `clanky -p "count files in /tmp"` leaves a resumable session file;
 the TUI's session behavior is unchanged.
 
 As built notes:
-- (record decisions here as implemented)
+- The shared recorder is `crates/clanky/src/recorder.rs`. Its `ErrorSink`
+  trait is the "error surfacing becomes a callback" mechanism: the TUI
+  pushes failures onto the transcript (`TranscriptErrors`), print mode
+  prints them to stderr (`StderrErrors`), keeping stdout clean.
+- Every session write reports its own failure through the front end's
+  sink — no internal silent sink. A persistently broken session file
+  therefore floods one error per failed write (deliberate: if writing to
+  disk is failing, the user should see it loudly).
+- Ctrl+c in print mode (task 2): two `AtomicBool` flags registered with
+  signal-hook. The first SIGINT sets `interrupted`, which wakes a listener
+  thread that kills the (possibly SIGINT-ignoring) plugin — the turn then
+  fails and `record_done` runs the same partial flush an error gets,
+  after which the thread arms the shutdown flag. A second SIGINT hits
+  `register_conditional_shutdown` keyed on that armed flag and exits
+  immediately, so a hung plugin can never hang the exit. The armed flag
+  must be separate from `interrupted`: both flags run as actions in the
+  signal handler in registration order, so keying the conditional
+  shutdown on `interrupted` itself would make the *first* ctrl+c exit
+  instantly with no flush (this was found and fixed in review).
 
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming

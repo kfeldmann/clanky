@@ -9,6 +9,11 @@
 
 use std::io::{IsTerminal as _, Write};
 use std::process::ExitCode;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 
 use clap::{CommandFactory as _, Parser as _};
 
@@ -16,6 +21,7 @@ use clanky::cli;
 use clanky::context;
 use clanky::error::Result;
 use clanky::provider;
+use clanky::session;
 use clanky::settings::Settings;
 use clanky::tools;
 use clanky::tui;
@@ -68,6 +74,10 @@ fn run(cli: &cli::Cli) -> Result<()> {
 
 /// Non-interactive single turn: prompt from argv or stdin, response to
 /// stdout, activity to stderr.
+///
+/// The turn is recorded into a session file exactly as a TUI run would
+/// (M14): same recorder, same partial flush when the turn is cut short —
+/// by an error or by ctrl+c.
 fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
     let prompt_text = clanky::prompt::resolve(settings.prompt.take())?;
     let provider_name = settings
@@ -77,12 +87,67 @@ fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
 
     // One long-lived plugin process for the turn (M8). It is shut down when
     // the session drops (stdin EOF per spec §1).
-    let mut session = provider::create(&provider_name)?;
-    let default_model = session.default_model().map(str::to_string);
+    let mut provider_session = provider::create(&provider_name)?;
+    let default_model = provider_session.default_model().map(str::to_string);
     let config = turn::TurnConfig::from_settings(settings, default_model.as_deref());
 
     let mut messages = context::system_messages();
     messages.push(clanky_protocol::ChatMessage::user(&prompt_text));
+
+    // Same session behavior as the TUI (M14): records by default, the
+    // user prompt first, everything the turn produces appended as it
+    // happens.
+    let mut recorder =
+        clanky::recorder::Recorder::new(provider_session.name(), config.model.as_deref());
+    let mut errors = clanky::recorder::StderrErrors;
+    recorder.record(
+        &mut errors,
+        session::Record::User {
+            text: prompt_text.clone(),
+        },
+    );
+
+    // Ctrl+C must flush the partial round instead of killing the process
+    // mid-write (M14). The terminal delivers SIGINT to the whole process
+    // group, so the plugin usually exits on its own; the turn then fails
+    // and `record_done` below writes the normal partial flush. The
+    // listener thread covers the gap — a provider plugin that ignores
+    // SIGINT: it kills the plugin (idempotent), arms the immediate
+    // shutdown, and the turn fails so the same flush runs.
+    //
+    // Both flags are registered as SIGINT actions, and signal-hook runs
+    // its actions in the handler in registration order. The first ctrl+c
+    // only sets `interrupted` — the listener thread's cue — because
+    // `shutdown_armed` is still false. The second ctrl+c sets it again
+    // and then, finding `shutdown_armed` set, exits the process
+    // immediately, so an unkillable or hung plugin can never hang the
+    // exit: by then the graceful flush already had its chance.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let shutdown_armed = Arc::new(AtomicBool::new(false));
+    let sigint = Arc::clone(&interrupted);
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))?;
+    signal_hook::flag::register_conditional_shutdown(
+        signal_hook::consts::SIGINT,
+        EXIT_ERROR.into(),
+        Arc::clone(&shutdown_armed),
+    )?;
+    let killer = provider_session.cancel_handle();
+    let armed = Arc::clone(&shutdown_armed);
+    std::thread::Builder::new()
+        .name("clanky-interrupt".into())
+        .spawn(move || {
+            // The flag is also what makes `chat` fail fast: the turn
+            // loop's request goes to a dead plugin and errors out.
+            while !sigint.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Idempotent, so a stray extra wakeup (or a SIGINT that
+            // raced the first one here) cannot double-kill.
+            killer.kill();
+            // The graceful flush had its chance; a further ctrl+c may
+            // kill the process immediately.
+            armed.store(true, Ordering::Relaxed);
+        })?;
 
     let mut sink = PrintSink::new(quiet);
     let stdout = std::io::stdout();
@@ -91,11 +156,17 @@ fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
         let mut out = stdout.lock();
         let mut err = stderr.lock();
         let result = turn::run_turn_with(
-            session.client_mut(),
+            provider_session.client_mut(),
             &tools::default_tools(),
             &mut messages,
             &config,
-            &mut |event: TurnEvent| sink.event(event, &mut out, &mut err),
+            &mut |event: TurnEvent| {
+                // Both consumers see the event in order: the recorder
+                // turns it into session records, the sink turns it into
+                // output.
+                clanky::recorder::record_turn_event(&mut recorder, &mut errors, &event);
+                sink.event(event, &mut out, &mut err);
+            },
         );
         // A block that ran to the end of the turn (a thinking block, or
         // the answer text) still needs its closing separator: the trim
@@ -103,6 +174,11 @@ fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
         sink.close_blocks(&mut out, &mut err);
         result
     };
+
+    // The turn ended (success, error, or the ctrl+c-induced plugin
+    // death): record its final state — partial flush plus the error
+    // record — before the process exits.
+    recorder.record_done(&mut errors, &result);
 
     // The response text was streamed incrementally; its closing blank
     // line was written by `close_blocks` above (on both success and

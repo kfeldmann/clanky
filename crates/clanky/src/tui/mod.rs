@@ -848,7 +848,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
             match event {
                 WorkerEvent::Turn(turn_event) => {
                     app.on_turn_event(turn_event.clone());
-                    recorder::record_turn_event(&mut state, &turn_event);
+                    recorder::record_turn_event(&mut state, &mut transcript_errors, &turn_event);
                 }
                 WorkerEvent::Done(mut done) => {
                     // Reclaim the long-lived plugin process for the next turn.
@@ -964,7 +964,7 @@ fn drain_turn_events(
 ) {
     while let Ok(event) = rx.try_recv() {
         if let WorkerEvent::Turn(turn_event) = event {
-            recorder::record_turn_event(state, &turn_event);
+            recorder::record_turn_event(state, errors, &turn_event);
         }
     }
     state.flush_partial(errors);
@@ -2392,7 +2392,7 @@ mod tests {
                 delta: "The answer".into(),
             },
         ] {
-            recorder::record_turn_event(&mut state, &event);
+            recorder::record_turn_event(&mut state, &mut NoErrors, &event);
         }
         state.flush_partial(&mut NoErrors);
         let data = session::load(&dir.join("session.jsonl")).unwrap();
@@ -2418,12 +2418,14 @@ mod tests {
         let (mut state, dir) = recording_state("round");
         recorder::record_turn_event(
             &mut state,
+            &mut NoErrors,
             &TurnEvent::Text {
                 delta: "done".into(),
             },
         );
         recorder::record_turn_event(
             &mut state,
+            &mut NoErrors,
             &TurnEvent::Round {
                 text: "done".into(),
                 thinking: String::new(),
@@ -2447,6 +2449,7 @@ mod tests {
         let (mut state, dir) = recording_state("error");
         recorder::record_turn_event(
             &mut state,
+            &mut NoErrors,
             &TurnEvent::Text {
                 delta: "partial".into(),
             },

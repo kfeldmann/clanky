@@ -236,8 +236,10 @@ impl Recorder {
     }
 }
 
-/// Map one turn event onto session records (autosave).
-pub fn record_turn_event(recorder: &mut Recorder, event: &TurnEvent) {
+/// Map one turn event onto session records (autosave). Write failures
+/// surface through the caller's sink, one report per failed write, so a
+/// persistently broken session file cannot fail silently.
+pub fn record_turn_event(recorder: &mut Recorder, errors: &mut dyn ErrorSink, event: &TurnEvent) {
     match event {
         TurnEvent::Round {
             text,
@@ -249,7 +251,7 @@ pub fn record_turn_event(recorder: &mut Recorder, event: &TurnEvent) {
             recorder.clear_partial();
             if !thinking.is_empty() {
                 recorder.record(
-                    &mut NoSink,
+                    errors,
                     session::Record::Thinking {
                         text: thinking.clone(),
                     },
@@ -257,7 +259,7 @@ pub fn record_turn_event(recorder: &mut Recorder, event: &TurnEvent) {
             }
             if !text.is_empty() || !calls.is_empty() {
                 recorder.record(
-                    &mut NoSink,
+                    errors,
                     session::Record::Assistant {
                         text: text.clone(),
                         calls: calls.clone(),
@@ -267,7 +269,7 @@ pub fn record_turn_event(recorder: &mut Recorder, event: &TurnEvent) {
         }
         TurnEvent::ToolResult { name, output } => {
             recorder.record(
-                &mut NoSink,
+                errors,
                 session::Record::ToolResult {
                     name: name.clone(),
                     output: output.clone(),
@@ -275,7 +277,7 @@ pub fn record_turn_event(recorder: &mut Recorder, event: &TurnEvent) {
             );
         }
         TurnEvent::Usage { usage } => {
-            recorder.record(&mut NoSink, session::usage_record(*usage));
+            recorder.record(errors, session::usage_record(*usage));
         }
         // Streaming deltas are accumulated and consolidated into the
         // round's records when the round completes (or is cut short; see
@@ -289,10 +291,16 @@ pub fn record_turn_event(recorder: &mut Recorder, event: &TurnEvent) {
     }
 }
 
-/// A sink that drops the messages (tests, and the write-error path a test
-/// drives through the plain record helpers).
-struct NoSink;
+/// `recorder::ErrorSink` for print mode: write failures go to stderr,
+/// keeping stdout a clean stream of the answer (a session file that
+/// cannot be written is a logging problem, not part of the response).
+/// Every failure prints, one per failed write — no damping: a broken
+/// session file should be loudly obvious.
+#[derive(Default)]
+pub struct StderrErrors;
 
-impl ErrorSink for NoSink {
-    fn report(&mut self, _message: String) {}
+impl ErrorSink for StderrErrors {
+    fn report(&mut self, message: String) {
+        eprintln!("{message}");
+    }
 }

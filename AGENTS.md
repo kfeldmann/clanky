@@ -25,7 +25,7 @@ lynx -dump https://lite.duckduckgo.com/lite?q=<url-encoded-query>
 
 ## Project state
 
-Milestones are complete through M13 (except for M9 which is deferred, and the first item in M10 which is low priority). M14 is next.
+Milestones are complete through M13 (except for M9 which is deferred, and the first item in M10 which is low priority). M14 is in progress.
 
 See `design-docs/milestones.md` — checkboxes mark progress, and its "As built" notes record
 decisions made during implementation. Check them before redesigning something.
@@ -93,6 +93,8 @@ decisions made during implementation. Check them before redesigning something.
   binary; `./run` executes it (requires `DEEPINFRA_TOKEN` or
   `LITELLM_API_KEY`).
 
+**Warning:** Today we're working from an NFS volume, so a full release build takes over 35 minutes! You may want to target your tests and builds to only the component you're changing.
+
 ## Environment variables
 
 - DeepInfra: `DEEPINFRA_API_KEY` (fallback `DEEPINFRA_TOKEN`), optional
@@ -103,7 +105,7 @@ decisions made during implementation. Check them before redesigning something.
   `ANTHROPIC_BASE_URL`
 - Provider keys are read by the provider plugin, never by Clanky core.
 
-## DeepInfra (first supported provider)
+## DeepInfra Documentation
 
 - OpenAI Chat Completions API:
   https://docs.deepinfra.com/api-reference/chat-completions/openai-chat-completions.md
