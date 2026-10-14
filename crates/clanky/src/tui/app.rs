@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use clanky_protocol::{ChatMessage, Usage};
+use clanky_protocol::{ChatMessage, ToolCall, Usage};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr as _;
@@ -422,6 +422,76 @@ impl App {
     }
 
     // --- session (M4) -------------------------------------------------------
+
+    /// Derive session records from the transcript entries — what the
+    /// screen showed. Used by `/md` when there is no session file
+    /// (recording off, or nothing recorded yet): the export then reflects
+    /// the visible conversation, not an empty file that was never made.
+    ///
+    /// UI-only entries (`Info`, `Queued`, `SystemPart`) and
+    /// `ThinkingHidden` placeholders (their text was discarded) are
+    /// skipped. Consecutive assistant text and tool-call entries merge
+    /// into one [`Record::Assistant`] with the calls attached, mirroring
+    /// how a live round is recorded.
+    pub fn screen_records(&self) -> Vec<Record> {
+        let mut records: Vec<Record> = Vec::new();
+        let mut round: Option<(String, Vec<ToolCall>)> = None;
+        let flush_round = |records: &mut Vec<Record>,
+                           round: &mut Option<(String, Vec<ToolCall>)>| {
+            if let Some((text, calls)) = round.take() {
+                records.push(Record::Assistant { text, calls });
+            }
+        };
+        for entry in &self.entries {
+            match entry {
+                Entry::User(text) => {
+                    flush_round(&mut records, &mut round);
+                    records.push(Record::User { text: text.clone() });
+                }
+                Entry::Thinking(text) => {
+                    flush_round(&mut records, &mut round);
+                    records.push(Record::Thinking { text: text.clone() });
+                }
+                Entry::Assistant(text) => {
+                    let r = round.get_or_insert_with(|| (String::new(), Vec::new()));
+                    if !r.0.is_empty() {
+                        r.0.push('\n');
+                    }
+                    r.0.push_str(text);
+                }
+                Entry::ToolCall { name, arguments } => {
+                    let r = round.get_or_insert_with(|| (String::new(), Vec::new()));
+                    let id = format!("screen-{}", r.1.len());
+                    let arguments = serde_json::from_str(arguments)
+                        .unwrap_or_else(|_| serde_json::Value::String(arguments.clone()));
+                    r.1.push(ToolCall {
+                        id,
+                        name: name.clone(),
+                        arguments,
+                    });
+                }
+                Entry::ToolResult { name, output } => {
+                    flush_round(&mut records, &mut round);
+                    records.push(Record::ToolResult {
+                        name: name.clone(),
+                        output: output.clone(),
+                    });
+                }
+                Entry::Error(message) => {
+                    flush_round(&mut records, &mut round);
+                    records.push(Record::Error {
+                        message: message.clone(),
+                    });
+                }
+                Entry::Info(_)
+                | Entry::Queued { .. }
+                | Entry::SystemPart { .. }
+                | Entry::ThinkingHidden => {}
+            }
+        }
+        flush_round(&mut records, &mut round);
+        records
+    }
 
     /// Replace the transcript with a loaded session's records and return
     /// the rebuilt conversation history (system context excluded; the

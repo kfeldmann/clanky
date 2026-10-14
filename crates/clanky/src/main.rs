@@ -48,6 +48,12 @@ fn run(cli: &cli::Cli) -> Result<()> {
     // CLI flags win over both scopes.
     settings.overlay(cli.overrides());
 
+    // One shared rejection for both front ends: with recording off there
+    // is no session to load into and none would be saved.
+    if !settings.record_sessions() && cli.resume.is_some() {
+        return Err(clanky::error::Error::ResumeWithNoSession);
+    }
+
     if cli.print || !tui::available() {
         if cli.resume.is_some() {
             return Err(clanky::error::Error::ResumeNonInteractive);
@@ -96,9 +102,11 @@ fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
 
     // Same session behavior as the TUI (M14): records by default, the
     // user prompt first, everything the turn produces appended as it
-    // happens.
+    // happens. `--no-session` (or `session = false`) disables the file:
+    // every record call becomes a no-op and nothing is created.
     let mut recorder =
-        clanky::recorder::Recorder::new(provider_session.name(), config.model.as_deref());
+        clanky::recorder::Recorder::new(provider_session.name(), config.model.as_deref())
+            .recording(settings.record_sessions());
     let mut errors = clanky::recorder::StderrErrors;
     recorder.record(
         &mut errors,

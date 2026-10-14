@@ -114,3 +114,82 @@ fn unknown_provider_lists_discovered_plugins() {
 
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn no_session_creates_no_session_file_in_pipe_mode() {
+    let dir = fake_path_dir();
+    let output = Command::new(env!("CARGO_BIN_EXE_clanky"))
+        .args(["--provider", "hello-world", "-p", "--no-session", "say hi"])
+        .current_dir(&dir)
+        .env("PATH", path_with(&dir))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run clanky");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "clanky failed: status {:?}\nstderr: {stderr}",
+        output.status
+    );
+    let sessions = dir.join(".clanky/sessions");
+    assert!(
+        !sessions.exists() || std::fs::read_dir(&sessions).unwrap().next().is_none(),
+        "--no-session must not leave a session file"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn print_mode_records_a_session_by_default() {
+    let dir = fake_path_dir();
+    let output = Command::new(env!("CARGO_BIN_EXE_clanky"))
+        .args(["--provider", "hello-world", "-p", "say hi"])
+        .current_dir(&dir)
+        .env("PATH", path_with(&dir))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run clanky");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "clanky failed: status {:?}\nstderr: {stderr}",
+        output.status
+    );
+    let sessions = dir.join(".clanky/sessions");
+    let files: Vec<_> = std::fs::read_dir(&sessions)
+        .unwrap_or_else(|_| panic!("session dir must exist at {}", sessions.display()))
+        .collect();
+    assert_eq!(files.len(), 1, "exactly one session file");
+    let text = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
+    assert!(text.contains("\"type\":\"header\""), "{text}");
+    assert!(text.contains("\"type\":\"user\""), "{text}");
+    assert!(text.contains("Hello from a plugin!"), "{text}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn resume_with_no_session_is_rejected_with_one_shared_message() {
+    let dir = fake_path_dir();
+    for extra in [&[][..], &["-p"][..]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_clanky"))
+            .args(["--resume", "old"])
+            .args(extra)
+            .args(["--no-session", "hi"])
+            .current_dir(&dir)
+            .env("PATH", path_with(&dir))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run clanky");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cannot use --resume with session recording off"),
+            "shared message expected; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("--no-session"),
+            "the message must name the flag: {stderr}"
+        );
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

@@ -45,6 +45,10 @@ pub struct Settings {
     pub max_retries: Option<u32>,
     /// Prompt, when supplied on the command line.
     pub prompt: Option<String>,
+    /// Whether sessions are recorded. `session = false` (or the CLI
+    /// `--no-session` flag) turns recording off in both front ends;
+    /// unset means recorded.
+    pub session: Option<bool>,
 }
 
 impl Settings {
@@ -117,6 +121,16 @@ impl Settings {
         if over.prompt.is_some() {
             self.prompt = over.prompt;
         }
+        if over.session.is_some() {
+            self.session = over.session;
+        }
+    }
+
+    /// Whether conversations are recorded into session files. Sessions
+    /// are on unless explicitly disabled (`session = false` in
+    /// settings.toml, or the `--no-session` flag — the flag wins).
+    pub fn record_sessions(&self) -> bool {
+        self.session.unwrap_or(true)
     }
 }
 
@@ -246,6 +260,35 @@ mod tests {
         assert_eq!(sampling["temperature"], serde_json::json!("0.7"));
         assert_eq!(sampling["top_p"], serde_json::json!("0.9"));
         assert_eq!(sampling["seed"], serde_json::json!("7"));
+    }
+
+    #[test]
+    fn session_field_parses_and_defaults_to_recording() {
+        let tmp = std::env::temp_dir().join("clanky-test-session-field");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = write_temp_settings(&tmp, "session = false\n");
+        let merged = Settings::load_from_paths(std::slice::from_ref(&path)).unwrap();
+        assert!(!merged.record_sessions(), "`session = false` must disable");
+
+        std::fs::remove_file(path).unwrap();
+        assert!(Settings::default().record_sessions(), "unset means on");
+    }
+
+    #[test]
+    fn session_field_overlays_per_layer() {
+        // Project `session = false`, then CLI leaving it unset keeps the
+        // off state; the CLI flag (an overlay of `Some(false)`) wins.
+        let mut settings = Settings {
+            session: Some(false),
+            ..Settings::default()
+        };
+        settings.overlay(Settings::default());
+        assert!(!settings.record_sessions());
+        settings.overlay(Settings {
+            session: Some(false),
+            ..Settings::default()
+        });
+        assert!(!settings.record_sessions());
     }
 
     #[test]

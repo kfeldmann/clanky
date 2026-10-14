@@ -39,10 +39,17 @@ struct PartialRound {
 /// Session recorder shared by the TUI and print mode: the open session
 /// file (lazily created on the first record), the deltas accumulated for
 /// the round in flight, and the pending `/name` rename.
+///
+/// With recording off (`--no-session` / `session = false`) the recorder
+/// keeps its provider/model for the `/md` fresh header but writes
+/// nothing: every record call is a no-op, no file is ever created, and
+/// the name/resume operations report that sessions are off.
 pub struct Recorder {
     dir: PathBuf,
     provider: String,
     model: Option<String>,
+    /// Whether records are written at all (`--no-session` turns it off).
+    recording: bool,
     writer: Option<SessionWriter>,
     /// Name requested via `/name` before any file exists yet.
     pending_name: Option<String>,
@@ -58,10 +65,28 @@ impl Recorder {
             dir: session::sessions_dir(),
             provider: provider.to_string(),
             model: model.map(str::to_string),
+            recording: true,
             writer: None,
             pending_name: None,
             partial: PartialRound::default(),
         }
+    }
+
+    /// Builder: turn recording off (`--no-session`). Everything the
+    /// front end feeds the recorder is then accepted but discarded —
+    /// including any pending `/name`, which must not surface as a
+    /// session name when no file will ever be created.
+    pub fn recording(mut self, on: bool) -> Self {
+        self.recording = on;
+        if !on {
+            self.pending_name = None;
+        }
+        self
+    }
+
+    /// Whether records are being written (`false` = `--no-session`).
+    pub fn recording_enabled(&self) -> bool {
+        self.recording
     }
 
     /// Record into a specific directory, under a known file name (tests;
@@ -72,6 +97,12 @@ impl Recorder {
         state.dir = dir;
         state.pending_name = Some(name.to_string());
         state
+    }
+
+    /// The message `/name` and `/resume` report when recording is off:
+    /// one wording for every session command.
+    pub fn disabled_message() -> String {
+        "sessions are off (--no-session)".into()
     }
 
     /// The directory saved sessions live in (the `/resume` picker lists
@@ -115,7 +146,12 @@ impl Recorder {
 
     /// Ensure a writer exists (using a pending `/name` if one was given)
     /// and append a record. Write failures surface through the sink.
+    /// A no-op when recording is off: nothing is created, nothing is
+    /// written, and no failure is reported (there is no file to fail).
     pub fn record(&mut self, errors: &mut dyn ErrorSink, record: session::Record) {
+        if !self.recording {
+            return;
+        }
         if let Err(err) = self
             .ensure_writer()
             .and_then(|writer| writer.append(&record))
@@ -190,6 +226,9 @@ impl Recorder {
     /// TUI should show: `Ok(Some(…))` is an info line, `Err(…)` an error
     /// line (the strings are this recorder's own user-facing messages).
     pub fn set_name(&mut self, name: Option<String>) -> std::result::Result<String, String> {
+        if !self.recording {
+            return Err(Self::disabled_message());
+        }
         let Some(name) = name else {
             return Err("usage: /name <new-name>".into());
         };
@@ -210,8 +249,13 @@ impl Recorder {
 
     /// Continue an existing session file: subsequent records append to
     /// `--resume`d sessions (no new header), and the pending `/name` is
-    /// cleared — the file already has its name.
+    /// cleared — the file already has its name. A no-op when recording
+    /// is off: the caller rejects resuming into a disabled session, and
+    /// even a stray reopen must not start writing again.
     pub fn reopen(&mut self, path: PathBuf) {
+        if !self.recording {
+            return;
+        }
         self.writer = Some(SessionWriter::reopen(path));
         self.pending_name = None;
     }
@@ -302,5 +346,84 @@ pub struct StderrErrors;
 impl ErrorSink for StderrErrors {
     fn report(&mut self, message: String) {
         eprintln!("{message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::turn::TurnEvent;
+
+    struct PanickySink;
+    impl ErrorSink for PanickySink {
+        fn report(&mut self, message: String) {
+            panic!("unexpected sink report: {message}");
+        }
+    }
+
+    /// A disabled recorder recording into a scratch directory (the
+    /// directory would be where the file would appear, so its absence
+    /// proves nothing was created).
+    fn disabled(tag: &str) -> (Recorder, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-nosession-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Recorder::with_dir(dir.clone(), "session", "deepinfra", None).recording(false);
+        (state, dir)
+    }
+
+    #[test]
+    fn a_disabled_recorder_writes_nothing() {
+        let (mut state, dir) = disabled("silent");
+        let mut errors = PanickySink;
+        state.record(&mut errors, session::Record::User { text: "hi".into() });
+        recorder_turn_events(&mut state, &mut errors);
+        state.record_done(&mut errors, &Err(crate::error::Error::NoPrompt));
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "no file may be created"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_disabled_recorder_has_no_name_and_declines_commands() {
+        let (mut state, dir) = disabled("name");
+        assert_eq!(state.current_name(), None);
+        assert!(state.open_file().is_none());
+        assert!(!state.recording_enabled());
+        assert_eq!(
+            state.set_name(Some("renamed".into())).unwrap_err(),
+            Recorder::disabled_message()
+        );
+        state.reopen(dir.join("session.jsonl"));
+        assert!(state.open_file().is_none(), "reopen must not start writing");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A little turn worth recording, for the tests above.
+    fn recorder_turn_events(state: &mut Recorder, errors: &mut dyn ErrorSink) {
+        for event in [
+            TurnEvent::Text {
+                delta: "partial".into(),
+            },
+            TurnEvent::Round {
+                text: "done".into(),
+                thinking: String::new(),
+                calls: vec![],
+            },
+            TurnEvent::ToolResult {
+                name: "bash".into(),
+                output: "ok".into(),
+            },
+        ] {
+            record_turn_event(state, errors, &event);
+        }
     }
 }

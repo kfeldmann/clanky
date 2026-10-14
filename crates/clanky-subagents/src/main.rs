@@ -32,6 +32,9 @@ struct Options {
     sampling: Option<String>,
     max_tool_rounds: Option<usize>,
     max_retries: Option<u32>,
+    /// Opt a job out of session recording: passes `--no-session`
+    /// (default clanky behavior now records `-pq` runs too, M14).
+    no_session: Option<bool>,
 }
 
 impl Options {
@@ -58,6 +61,9 @@ impl Options {
         }
         if let Some(v) = self.max_retries {
             flag(args, "max-retries", &v.to_string());
+        }
+        if self.no_session.unwrap_or(false) {
+            args.push("--no-session".to_string());
         }
     }
 }
@@ -92,6 +98,7 @@ fn effective(job: &Options, defaults: &Options) -> Options {
         sampling: job.sampling.clone().or_else(|| defaults.sampling.clone()),
         max_tool_rounds: job.max_tool_rounds.or(defaults.max_tool_rounds),
         max_retries: job.max_retries.or(defaults.max_retries),
+        no_session: job.no_session.or(defaults.no_session),
     }
 }
 

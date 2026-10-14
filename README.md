@@ -56,6 +56,7 @@ All fields are optional; unknown keys are rejected with a parse error.
 | `max_tool_rounds` | integer  | Cap on chat rounds per turn (`0` = unlimited)       |
 | `max_retries` | integer       | Retries for a retryable provider error (`0` = never retry; default `5`) |
 | `prompt`   | string           | Prompt text (mainly useful on the CLI, not in a file) |
+| `session`  | boolean          | `false` disables session recording in every mode (default: on) |
 
 Example:
 
@@ -115,6 +116,13 @@ model is capped at 20 000 characters (then `… (output truncated)`).
 
 Sessions always live in the **project scope** (`./.clanky/sessions/`);
 there is no user-scope session store.
+
+Sessions are recorded in **both** modes — the TUI and print mode (`-p`)
+autosave alike. `--no-session` (or `session = false` in settings.toml;
+the flag wins) turns recording off in every mode: no session file is
+created, `--resume` is rejected, the TUI's `/name` and `/resume`
+commands report that sessions are off, and the status line shows
+`(no session)`. `/md` still works: it exports what the screen showed.
 
 Sessions autosave as the conversation happens. When a turn is cut short —
 a provider error mid-stream, or `ctrl+c` quitting while the answer is
@@ -441,6 +449,13 @@ agent's response and errors — no thinking, tool calls, or tool results:
 clanky -p -q "summarize this repo" > summary.txt
 ```
 
+Like the TUI, a print-mode run records a session file under
+`.clanky/sessions/` — the same records a TUI run would leave, including
+the partial flush when the turn is cut short by an error or ctrl+c, so
+`clanky -p "count files in /tmp"` leaves a resumable session and
+subagent jobs stay inspectable afterwards. Pass `--no-session` (or set
+`session = false` in settings.toml) to run without recording anything.
+
 ## Parallel subagents (`clanky-subagents`)
 
 The `clanky-subagents` binary (built from the same workspace; install it on
@@ -476,8 +491,9 @@ Input:
   `instruction`; everything else clanky resolves from settings as usual.
 - Optional per-job overrides, passed to the subagent's `clanky -pq` command
   line verbatim: `provider`, `model`, `thinking`, `sampling` (string in the
-  `--sampling` CLI format), `max_tool_rounds`, `max_retries`. The provider
-  validates them, never the runner.
+  `--sampling` CLI format), `max_tool_rounds`, `max_retries`, and
+  `no_session` (boolean → `--no-session`). The provider validates them,
+  never the runner.
 - `defaults` (optional): any of the same fields, applied to jobs that don't
   set them (job-level wins per field).
 - `max_parallel` (optional): defaults to all jobs at once.
@@ -503,8 +519,10 @@ missing from `PATH`, each job reports `"error": "spawn: …"`.
 
 Jobs run in the caller's working directory, so subagents pick up the same
 project `.clanky/` and `~/.clanky` as any `clanky -pq` run; sessions are
-never shared. Each job is a full Clanky turn with its own tool loop — a
-run of N jobs costs roughly N times a single-turn run in tokens, so use
-it where parallelism earns that.
+never shared — but each job now records its own session file (as any
+`-pq` run does), so pass `"no_session": true` per job (or in `defaults`)
+when the batch should leave no files behind. Each job is a full Clanky
+turn with its own tool loop — a run of N jobs costs roughly N times a
+single-turn run in tokens, so use it where parallelism earns that.
 
 Design details: `design-docs/parallel-subagents-plan.md`.

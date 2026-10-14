@@ -100,6 +100,23 @@ fn passes_options_and_defaults_to_argv() {
 }
 
 #[test]
+fn no_session_opt_out_reaches_argv() {
+    let bin = setup();
+    let input = r#"{"defaults":{"no_session":true},
+      "jobs":[
+        {"id":"a","instruction":"job a","no_session":false},
+        {"id":"b","instruction":"job b"}
+    ]}"#;
+    let out = run(&bin, input);
+    assert!(out.status.success());
+    let v = jobs_of(&out);
+    let a = v["jobs"][0]["stdout"].as_str().unwrap();
+    assert!(!a.contains("--no-session"), "job opt-out false wins: {a}");
+    let b = v["jobs"][1]["stdout"].as_str().unwrap();
+    assert!(b.contains("--no-session"), "default applies: {b}");
+}
+
+#[test]
 fn parallel_jobs_overlap_in_time() {
     let bin = setup();
     // Two 4-second jobs at the default max_parallel (= job count) must

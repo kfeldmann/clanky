@@ -116,6 +116,11 @@ pub struct Launch {
     /// `--resume NAME` loads that session; `--resume` (empty string) opens
     /// the picker at startup.
     pub resume: Option<String>,
+    /// Whether the session is recorded (`--no-session` / `session =
+    /// false` turns recording off): no file is created, `/name` and
+    /// `/resume` report that sessions are off, and the status line shows
+    /// `(no session)`.
+    pub recording: bool,
 }
 
 impl Launch {
@@ -138,6 +143,7 @@ impl Launch {
                 .filter(|p| !p.is_empty())
                 .map(str::to_string),
             resume: None,
+            recording: settings.record_sessions(),
         }
     }
 }
@@ -481,6 +487,20 @@ const PALETTE_BUILTINS: &[(&str, &str)] = &[
     ("/resume", "load a saved session"),
 ];
 
+/// Status-line text shown in place of the session name while session
+/// recording is off (`--no-session`): there is no session file.
+const NO_SESSION_STATUS: &str = "(no session)";
+
+/// The status line's session element: the open session file's name while
+/// recording, `(no session)` when recording is off.
+fn status_session_name(state: &SessionState) -> Option<String> {
+    if state.recording_enabled() {
+        state.current_name()
+    } else {
+        Some(NO_SESSION_STATUS.to_string())
+    }
+}
+
 /// The palette picker kind: built-ins first, then templates by name.
 fn palette_kind(templates: Vec<Template>) -> PickerKind {
     let mut items: Vec<PaletteItem> = PALETTE_BUILTINS
@@ -581,16 +601,17 @@ struct ExportSource {
 impl ExportSource {
     /// Capture the current session. A session with an open file exports
     /// exactly the records that file holds — the same stream `/resume`
-    /// would restore — while a session that has not recorded anything yet
-    /// exports an empty document with a fresh header.
-    fn snapshot(state: &SessionState, options: ExportOptions) -> Result<Self> {
+    /// would restore — while a session with no file (nothing recorded
+    /// yet, or recording off) exports what the screen showed: a fresh
+    /// header plus records derived from the transcript entries.
+    fn snapshot(state: &SessionState, app: &app::App, options: ExportOptions) -> Result<Self> {
         let name = state.current_name();
         let (header, records) = match state.open_file() {
             Some(path) if path.exists() => {
                 let data = session::load(path)?;
                 (data.header, data.records)
             }
-            _ => (state.fresh_header(), Vec::new()),
+            _ => (state.fresh_header(), app.screen_records()),
         };
         Ok(Self {
             name,
@@ -672,7 +693,8 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     // Fresh session: seed the system context so the first turn sends it
     // (resumed sessions rebuild it inside `load_session`).
     app.history = crate::context::system_messages();
-    let mut state = SessionState::new(&launch.provider, launch.model.as_deref());
+    let mut state =
+        SessionState::new(&launch.provider, launch.model.as_deref()).recording(launch.recording);
     let mut transcript_errors = TranscriptErrors::default();
     // Prefetch the provider's model catalog in the background: it prices
     // the session-cost display and makes `/model` instant. The fetch also
@@ -916,7 +938,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
 
         if dirty {
             transcript_errors.drain(&mut app);
-            let session_name = state.current_name();
+            let session_name = status_session_name(&state);
             let cost = session_cost(&catalog, launch, &app);
             // `off`/empty mean disabled and are not shown.
             let thinking = launch
@@ -1167,6 +1189,11 @@ fn handle_command(
 ) -> Action {
     match command {
         Command::Name(name) => {
+            if !state.recording_enabled() {
+                app.entries
+                    .push(app::Entry::Info(recorder::Recorder::disabled_message()));
+                return Action::None;
+            }
             match state.set_name(name) {
                 Ok(info) => app.entries.push(app::Entry::Info(info)),
                 Err(message) => app.entries.push(app::Entry::Error(message)),
@@ -1174,6 +1201,11 @@ fn handle_command(
             Action::None
         }
         Command::Resume => {
+            if !state.recording_enabled() {
+                app.entries
+                    .push(app::Entry::Info(recorder::Recorder::disabled_message()));
+                return Action::None;
+            }
             if app.busy {
                 app.entries.push(app::Entry::Info(
                     "wait for the current turn to finish".into(),
@@ -1245,7 +1277,7 @@ fn handle_command(
             Action::None
         }
         Command::Export { options, path } => {
-            let source = match ExportSource::snapshot(state, options) {
+            let source = match ExportSource::snapshot(state, app, options) {
                 Ok(source) => source,
                 Err(err) => {
                     app.entries
@@ -2231,7 +2263,7 @@ mod tests {
     fn md_export_writes_the_default_selection() {
         let (state, dir) = session_with_file("default");
         let mut app = app::App::new();
-        let source = ExportSource::snapshot(&state, ExportOptions::default()).unwrap();
+        let source = ExportSource::snapshot(&state, &app, ExportOptions::default()).unwrap();
         let target = dir.join("out/session.md");
         apply_export(&mut app, target.to_str().unwrap(), &source);
 
@@ -2248,7 +2280,7 @@ mod tests {
     fn md_export_all_includes_thinking() {
         let (state, dir) = session_with_file("all");
         let mut app = app::App::new();
-        let source = ExportSource::snapshot(&state, ExportOptions::ALL).unwrap();
+        let source = ExportSource::snapshot(&state, &app, ExportOptions::ALL).unwrap();
         let target = dir.join("all.md");
         apply_export(&mut app, target.to_str().unwrap(), &source);
         let doc = std::fs::read_to_string(&target).unwrap();
@@ -2262,7 +2294,7 @@ mod tests {
         let mut state = SessionState::new("deepinfra", None);
         *(state.dir_mut()) = std::env::temp_dir();
         let mut app = app::App::new();
-        let source = ExportSource::snapshot(&state, ExportOptions::default()).unwrap();
+        let source = ExportSource::snapshot(&state, &app, ExportOptions::default()).unwrap();
         let target =
             std::env::temp_dir().join(format!("clanky-md-empty-{}.md", std::process::id()));
         apply_export(&mut app, target.to_str().unwrap(), &source);
@@ -2275,7 +2307,7 @@ mod tests {
     fn md_export_reports_write_failures() {
         let (state, dir) = session_with_file("unwritable");
         let mut app = app::App::new();
-        let source = ExportSource::snapshot(&state, ExportOptions::default()).unwrap();
+        let source = ExportSource::snapshot(&state, &app, ExportOptions::default()).unwrap();
         // A directory cannot be written as a file.
         apply_export(&mut app, dir.to_str().unwrap(), &source);
         assert!(matches!(app.entries.last(), Some(app::Entry::Error(_))));
@@ -2525,5 +2557,105 @@ mod tests {
             "the un-displayed error must not reach the resumed transcript"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn name_and_resume_report_politely_when_recording_is_off() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref()).recording(false);
+        let mut app = app::App::new();
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+
+        let action = handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::Name(Some("renamed".into())),
+            &tx,
+        );
+        assert!(matches!(action, Action::None));
+        assert!(
+            matches!(app.entries.last(), Some(app::Entry::Info(_))),
+            "/name must report politely: {:?}",
+            app.entries.last()
+        );
+        assert!(
+            app.entries
+                .last()
+                .map(|e| match e {
+                    app::Entry::Info(t) => t.clone(),
+                    other => format!("{other:?}"),
+                })
+                .unwrap_or_default()
+                .contains("--no-session"),
+            "the note must say why: {:?}",
+            app.entries.last()
+        );
+
+        let action = handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::Resume,
+            &tx,
+        );
+        assert!(matches!(action, Action::None), "no picker may open");
+        assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
+    }
+
+    #[test]
+    fn status_session_name_shows_no_session_when_recording_is_off() {
+        let cfg = launch();
+        let state = SessionState::new(&cfg.provider, cfg.model.as_deref()).recording(false);
+        assert_eq!(status_session_name(&state).as_deref(), Some("(no session)"));
+        // Recording on keeps the existing display: the name once the file
+        // exists, nothing before it.
+        let state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        assert_eq!(status_session_name(&state), None);
+        let dir = std::env::temp_dir().join(format!("clanky-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = SessionState::with_dir(dir.clone(), "named", "deepinfra", None);
+        state.record(&mut NoErrors, session::Record::User { text: "hi".into() });
+        assert_eq!(status_session_name(&state).as_deref(), Some("named"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn md_export_without_a_file_uses_screen_records() {
+        // With recording off the screen shows a conversation no file
+        // ever held: `/md` must export what the screen showed.
+        let cfg = launch();
+        let state = SessionState::new(&cfg.provider, cfg.model.as_deref()).recording(false);
+        let mut app = app::App::new();
+        app.push_user("count files");
+        app.on_turn_event(TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: "{\"cmd\":\"ls\"}".into(),
+        });
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "3 files".into(),
+        });
+        app.on_turn_event(TurnEvent::Text {
+            delta: "There are 3".into(),
+        });
+        let source = ExportSource::snapshot(&state, &app, ExportOptions::ALL).unwrap();
+        assert!(source.name.is_none(), "no session file, no name");
+        let doc = {
+            let target =
+                std::env::temp_dir().join(format!("clanky-md-screen-{}.md", std::process::id()));
+            let count = source.write(target.to_str().unwrap()).unwrap();
+            assert_eq!(count, 4, "user, assistant(calls), tool result, assistant");
+            let doc = std::fs::read_to_string(&target).unwrap();
+            std::fs::remove_file(target).unwrap();
+            doc
+        };
+        assert!(doc.contains("## User\n\ncount files"), "{doc}");
+        assert!(doc.contains("There are 3"), "{doc}");
+        assert!(doc.contains("### Tool call: `bash`"), "{doc}");
+        assert!(doc.contains("### Tool result: `bash`"), "{doc}");
     }
 }

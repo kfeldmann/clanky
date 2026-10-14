@@ -122,6 +122,11 @@ pub enum Error {
     #[error("cannot use --resume in non-interactive mode")]
     ResumeNonInteractive,
 
+    #[error(
+        "cannot use --resume with session recording off (--no-session): nothing to load into and nothing would be saved"
+    )]
+    ResumeWithNoSession,
+
     #[error("$EDITOR is not set; set it to edit the prompt buffer (ctrl+e)")]
     NoEditor,
 

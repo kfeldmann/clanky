@@ -52,6 +52,12 @@ pub struct Cli {
     #[arg(long)]
     pub max_retries: Option<u32>,
 
+    /// Disable session recording in every mode: no session file is
+    /// created, `--resume` is rejected, and the TUI's `/name`, `/resume`
+    /// and status line reflect that sessions are off.
+    #[arg(long)]
+    pub no_session: bool,
+
     /// Resume a saved session (interactive mode only). With a NAME, load
     /// it directly; without, show a picker of saved sessions.
     #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
@@ -80,6 +86,7 @@ impl Cli {
             max_tool_rounds: self.max_tool_rounds,
             max_retries: self.max_retries,
             prompt,
+            session: self.no_session.then_some(false),
         }
     }
 }
@@ -164,6 +171,15 @@ mod tests {
         assert!(over.thinking.is_none());
         assert!(over.sampling.is_none());
         assert!(over.prompt.is_some());
+    }
+
+    #[test]
+    fn no_session_flag_maps_to_the_settings_field() {
+        let over = cli_with(&["-p", "--no-session", "hi"]).overrides();
+        assert_eq!(over.session, Some(false));
+        // Without the flag the field stays unset (recording stays on).
+        let over = cli_with(&["-p", "hi"]).overrides();
+        assert_eq!(over.session, None);
     }
 
     #[test]

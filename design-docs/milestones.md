@@ -495,7 +495,7 @@ Tasks:
    — the default disposition just kills the process. To flush on ctrl+c you need
    a signal handler (signal-hook is a new dependency; no unsafe needed in our
    code, so the workspace ban holds).
-3. [ ] `--no-session` flag + `session` settings field, overlaying through the
+3. [x] `--no-session` flag + `session` settings field, overlaying through the
    existing precedence machinery. In the TUI, recording off means no session
    file, no `/name` target (the command reports it politely), and `/md`
    exports what the screen showed (fresh header, screen-derived records — the
@@ -544,6 +544,25 @@ As built notes:
   signal handler in registration order, so keying the conditional
   shutdown on `interrupted` itself would make the *first* ctrl+c exit
   instantly with no flush (this was found and fixed in review).
+
+- Task 3 (`--no-session`): the `session = false` setting and the CLI flag
+  land in one `Settings::session: Option<bool>` field (`--no-session`
+  overlays `Some(false)`; unset means on, resolved via
+  `Settings::record_sessions`). The shared recorder gained a
+  `.recording(bool)` builder: with it off, every record call is a no-op
+  (no file is ever created, `reopen` is refused so a stray resume cannot
+  restart writing), `/name` reports "sessions are off (--no-session)", and
+  the TUI status line shows "(no session)" — while recording stays on,
+  the display is unchanged (a fresh session shows nothing until its file
+  exists). `/resume` in the TUI reports the same message when recording
+  is off. `--resume` together with recording off (flag or setting) is
+  rejected up front in `main::run` with one `ResumeWithNoSession` error
+  for both front ends. `/md` with no session file now derives its records
+  from the transcript entries (`app.screen_records`): UI-only entries are
+  skipped and consecutive assistant/tool-call entries merge into one
+  `Assistant` record, so recording a conversation off still exports what
+  the screen showed. The subagent runner's option allow-list gained
+  `no_session` (boolean, defaults-aware) passing `--no-session`.
 
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming
