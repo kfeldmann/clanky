@@ -658,33 +658,22 @@ fn write_export(target: &str, document: &str) -> std::io::Result<()> {
 
 /// Load a saved session into the app: transcript, usage and history;
 /// subsequent records continue the same file.
-fn load_session(info: &SessionInfo, app: &mut app::App, state: &mut SessionState) -> Result<()> {
-    let data = session::load(&info.path)?;
+fn load_session(
+    path: &std::path::Path,
+    name: &str,
+    app: &mut app::App,
+    state: &mut SessionState,
+) -> Result<()> {
+    let data = session::load(path)?;
     let conversation = app.restore(&data.records);
     app.history = crate::context::system_messages();
     app.history.extend(conversation);
-    state.reopen(info.path.clone());
+    state.reopen(path.to_path_buf());
     app.entries.push(app::Entry::Info(format!(
-        "resumed `{}` ({} records)",
-        info.name,
+        "resumed `{name}` ({} records)",
         data.records.len()
     )));
     Ok(())
-}
-
-/// Find a session by display name for `--resume NAME`.
-fn session_by_name(name: &str) -> Result<SessionInfo> {
-    session::validate_name(name)?;
-    let path = session::sessions_dir().join(format!("{name}.jsonl"));
-    if !path.exists() {
-        return Err(crate::error::Error::SessionNotFound(name.into()));
-    }
-    Ok(SessionInfo {
-        path,
-        name: name.to_string(),
-        modified: 0,
-        turns: 0,
-    })
 }
 
 fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Result<()> {
@@ -720,8 +709,8 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
             picker = Some((picker_for(&kind), kind));
         }
         Some(name) => {
-            let info = session_by_name(name)?;
-            load_session(&info, &mut app, &mut state)?;
+            let path = session::find_by_name(name)?;
+            load_session(&path, name, &mut app, &mut state)?;
         }
         None => {}
     }
@@ -1103,7 +1092,7 @@ fn apply_picker_selection(
     match kind {
         PickerKind::Resume(infos) => {
             if let Some(info) = infos.get(index)
-                && let Err(err) = load_session(info, app, state)
+                && let Err(err) = load_session(&info.path, &info.name, app, state)
             {
                 app.entries.push(app::Entry::Error(err.to_string()));
             }

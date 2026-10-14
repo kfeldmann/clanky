@@ -62,7 +62,9 @@ stays because it's the convenient one-liner.
   - `instruction` (required). The subagent's prompt.
   - Optional clanky option overrides (see Decision 1):
     `provider`, `model`, `thinking`, `sampling`, `max_tool_rounds`,
-    `max_retries`.
+    `max_retries`, `no_session` (boolean → `--no-session`; since M14 a
+    `-pq` job records a session file like any print-mode run, so a batch
+    that should leave no files passes this per job or via `defaults`).
 - `defaults` (optional). Any of the same option overrides, applied to every
   job that doesn't set that option itself. Job-level wins per field; nothing
   is merged or clamped — a field is either the job's own, the run default, or
@@ -110,6 +112,9 @@ relevant CLI flags, as optional JSON fields:
 - `provider` (string), `model` (string), `thinking` (string, e.g. `"1024"`
   or `"off"`), `max_tool_rounds` (integer), `max_retries` (integer) — passed
   to the subprocess as `--provider`, `--model`, etc., verbatim.
+- `no_session` (boolean): when true, `--no-session` is appended (M14:
+  print-mode runs record sessions by default, so a subagent batch otherwise
+  leaves one file per job).
 - `sampling` (string in clanky's CLI format, e.g.
   `"temperature=0.7,top_p=0.9"`). We deliberately do **not** accept a JSON
   object here: the string form is exactly what `--sampling` takes, is parsed

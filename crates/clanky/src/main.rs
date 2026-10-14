@@ -55,16 +55,13 @@ fn run(cli: &cli::Cli) -> Result<()> {
     }
 
     if cli.print || !tui::available() {
-        if cli.resume.is_some() {
-            return Err(clanky::error::Error::ResumeNonInteractive);
-        }
         // No prompt on the command line and no piped stdin: nothing to do
         // in command-line mode, so show usage instead of a cryptic error.
         if cli.prompt.is_empty() && !cli.print && std::io::stdin().is_terminal() {
             eprint!("{}", cli::Cli::command().render_help());
             std::process::exit(2);
         }
-        return run_pipe(&mut settings, cli.quiet);
+        return run_pipe(&mut settings, cli.resume.as_deref(), cli.quiet);
     }
 
     // Interactive mode. A prompt given on the command line starts the
@@ -84,7 +81,7 @@ fn run(cli: &cli::Cli) -> Result<()> {
 /// The turn is recorded into a session file exactly as a TUI run would
 /// (M14): same recorder, same partial flush when the turn is cut short —
 /// by an error or by ctrl+c.
-fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
+fn run_pipe(settings: &mut Settings, resume: Option<&str>, quiet: bool) -> Result<()> {
     let prompt_text = clanky::prompt::resolve(settings.prompt.take())?;
     let provider_name = settings
         .provider
@@ -97,9 +94,6 @@ fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
     let default_model = provider_session.default_model().map(str::to_string);
     let config = turn::TurnConfig::from_settings(settings, default_model.as_deref());
 
-    let mut messages = context::system_messages();
-    messages.push(clanky_protocol::ChatMessage::user(&prompt_text));
-
     // Same session behavior as the TUI (M14): records by default, the
     // user prompt first, everything the turn produces appended as it
     // happens. `--no-session` (or `session = false`) disables the file:
@@ -108,6 +102,20 @@ fn run_pipe(settings: &mut Settings, quiet: bool) -> Result<()> {
         clanky::recorder::Recorder::new(provider_session.name(), config.model.as_deref())
             .recording(settings.record_sessions());
     let mut errors = clanky::recorder::StderrErrors;
+
+    // `--resume NAME`: load the session, rebuild the conversation the next
+    // turn continues (system context fresh, records' history appended), and
+    // reopen the same file so the turn's records append to it. The note
+    // goes to stderr, keeping stdout a clean stream of the answer.
+    let mut messages = context::system_messages();
+    if let Some(name) = resume {
+        let path = session::find_by_name(name)?;
+        let data = session::load(&path)?;
+        messages.extend(session::history_from_records(&data.records));
+        eprintln!("resuming `{name}` ({} records)", data.records.len());
+        recorder.reopen(path);
+    }
+    messages.push(clanky_protocol::ChatMessage::user(&prompt_text));
     recorder.record(
         &mut errors,
         session::Record::User {

@@ -120,9 +120,15 @@ there is no user-scope session store.
 Sessions are recorded in **both** modes — the TUI and print mode (`-p`)
 autosave alike. `--no-session` (or `session = false` in settings.toml;
 the flag wins) turns recording off in every mode: no session file is
-created, `--resume` is rejected, the TUI's `/name` and `/resume`
-commands report that sessions are off, and the status line shows
-`(no session)`. `/md` still works: it exports what the screen showed.
+created, `--resume` is rejected (nothing to load into, nothing would be
+saved), the TUI's `/name` and `/resume` commands report that sessions are
+off, and the status line shows `(no session)`. `/md` still works: it
+exports what the screen showed.
+
+`--resume NAME` resumes a saved session in both modes (the TUI also opens
+a picker of saved sessions when `NAME` is omitted): the transcript and the
+full conversation history are restored, and the turn's records append to
+the same file.
 
 Sessions autosave as the conversation happens. When a turn is cut short —
 a provider error mid-stream, or `ctrl+c` quitting while the answer is
@@ -455,6 +461,13 @@ the partial flush when the turn is cut short by an error or ctrl+c, so
 `clanky -p "count files in /tmp"` leaves a resumable session and
 subagent jobs stay inspectable afterwards. Pass `--no-session` (or set
 `session = false` in settings.toml) to run without recording anything.
+
+`--resume NAME` works in print mode too: the named session is loaded, the
+turn continues it with the full prior conversation as context, and its
+records append to the same file. A one-line note (`resuming …`) goes to
+stderr, keeping stdout a clean stream of the answer. There is no picker in
+a pipe, so print mode requires a NAME (the TUI's bare `--resume` opens the
+picker).
 
 ## Parallel subagents (`clanky-subagents`)
 

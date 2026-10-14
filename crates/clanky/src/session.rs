@@ -359,6 +359,19 @@ fn count_user_turns(path: &Path) -> usize {
         .count()
 }
 
+/// Find a saved session by display name (the file stem), for
+/// `--resume NAME` in both front ends. Validates the name the same way
+/// `/name` does and requires the file to exist; anything else is the
+/// caller's problem (a pipe has no picker to offer).
+pub fn find_by_name(name: &str) -> Result<PathBuf> {
+    validate_name(name)?;
+    let path = sessions_dir().join(format!("{name}.jsonl"));
+    if !path.exists() {
+        return Err(Error::SessionNotFound(name.into()));
+    }
+    Ok(path)
+}
+
 /// Read and parse a session file. Tolerates unknown record types and
 /// malformed lines (skipped); the header must be present and known.
 pub fn load(path: &Path) -> Result<SessionData> {

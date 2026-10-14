@@ -58,8 +58,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_session: bool,
 
-    /// Resume a saved session (interactive mode only). With a NAME, load
-    /// it directly; without, show a picker of saved sessions.
+    /// Resume a saved session. In the TUI, without a NAME a picker of
+    /// saved sessions opens; with a NAME (and in print mode, which has
+    /// no picker) that session is loaded, the turn continues it, and
+    /// records append to the same file.
     #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
     pub resume: Option<String>,
 

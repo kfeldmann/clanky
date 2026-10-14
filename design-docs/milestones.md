@@ -501,7 +501,7 @@ Tasks:
    exports what the screen showed (fresh header, screen-derived records — the
    existing no-file path). In pipe mode it means no file is created. The
    status line replaces the session name with "(no session)" when there is no session file.
-4. [ ] `--resume NAME` in print mode: load the named session
+4. [x] `--resume NAME` in print mode: load the named session
    (`session::load`), seed `messages` via `history_from_records`, print what
    is being continued (a one-line note on stderr, keep stdout clean), run the
    turn, and append records to the same file (reopen). Remove the
@@ -563,6 +563,17 @@ As built notes:
   `Assistant` record, so recording a conversation off still exports what
   the screen showed. The subagent runner's option allow-list gained
   `no_session` (boolean, defaults-aware) passing `--no-session`.
+
+- Task 4 (`--resume` everywhere): the "find a session by name" logic moved
+  out of the TUI into `session::find_by_name` (same `validate_name`, same
+  `SessionNotFound` error for both front ends — a pipe just has no picker,
+  so it requires a NAME). Print mode loads the session before building the
+  turn context: fresh system messages, then the records' rebuilt history,
+  then the new user prompt; the stderr note (`resuming <name> (N records)`)
+  keeps stdout clean, and `recorder.reopen(path)` makes the turn's records
+  append to the resumed file exactly as the TUI does. `ResumeNonInteractive`
+  is gone. The TUI's `load_session` took the path/name instead of a
+  `SessionInfo` (that type stays for the `/resume` picker).
 
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming

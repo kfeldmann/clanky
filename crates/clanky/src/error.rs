@@ -119,9 +119,6 @@ pub enum Error {
     #[error("no session named `{0}` in .clanky/sessions")]
     SessionNotFound(String),
 
-    #[error("cannot use --resume in non-interactive mode")]
-    ResumeNonInteractive,
-
     #[error(
         "cannot use --resume with session recording off (--no-session): nothing to load into and nothing would be saved"
     )]
