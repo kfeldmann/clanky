@@ -507,7 +507,7 @@ Tasks:
    turn, and append records to the same file (reopen). Remove the
    `ResumeNonInteractive` error. A TUI `--resume NAME` with no such session
    and a pipe-mode one must fail with the same message.
-5. [ ] README: settings table gets `session`; print-mode section documents
+5. [x] README: settings table gets `session`; print-mode section documents
    that sessions are saved by default, `--no-session`, and `--resume NAME`;
    session-precedence note updated (both modes record). Subagents section
    notes that `clanky -pq` jobs now leave session files unless the run
@@ -563,7 +563,13 @@ As built notes:
   `Assistant` record, so recording a conversation off still exports what
   the screen showed. The subagent runner's option allow-list gained
   `no_session` (boolean, defaults-aware) passing `--no-session`.
-
+- Task 5 (README): the README already carried all four required updates
+  from the tasks 3-4 work; task 5 verified every claim against the built
+  binaries (settings `session` row, session-precedence note covering both
+  modes, print-mode section documenting default recording / `--no-session`
+  / `--resume NAME` with the stderr note and no picker, and the subagents
+  section documenting `no_session` per job and in `defaults`). No edits
+  were needed.
 - Task 4 (`--resume` everywhere): the "find a session by name" logic moved
   out of the TUI into `session::find_by_name` (same `validate_name`, same
   `SessionNotFound` error for both front ends — a pipe just has no picker,
