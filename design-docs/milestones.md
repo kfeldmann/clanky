@@ -456,7 +456,7 @@ real tenant.
      an agent-facing skill (when to fan out, how to call the runner, how to
      read the result) for users to copy into a skills scope.
 
-## ☐ M14 — Unified sessions: print mode records, `--no-session`, `--resume` everywhere
+## ✔ M14 — Unified sessions: print mode records, `--no-session`, `--resume` everywhere
 Session recording has so far been a TUI feature only (it was specified in M4
 when the pipe path from M1 was already frozen), so `clanky -p` runs left no
 transcript and could not resume. The turn layer was always shared — both front
@@ -525,7 +525,7 @@ Tasks:
    notes that `clanky -pq` jobs now leave session files unless the run
    description passes a `--no-session` override (and that the runner's
    allow-list needs it added, so subagents can opt out per job).
-6. [ ] Tests: golden/pipe test that a `-p` run writes a session file with the
+6. [x] Tests: golden/pipe test that a `-p` run writes a session file with the
    same records the TUI would write for the same transcript; partial flush on
    mid-stream error in pipe mode; `--no-session` writes nothing in both
    modes; `--resume NAME` in pipe mode continues a session (records appended,
