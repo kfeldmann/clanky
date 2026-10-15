@@ -22,6 +22,13 @@ use crate::turn::{TurnEvent, TurnOutput};
 /// result is always what the model receives).
 const TOOL_PREVIEW_LINES: usize = 8;
 
+/// Background colors for block-styled transcript entries (see
+/// `App::with_block_bg`). Text colors live at the rendering sites (they
+/// pair with the foreground choice); these are the block fills.
+const USER_BG: Color = Color::Indexed(159); // 256-color light cyan
+const ERROR_BG: Color = Color::Red;
+const INFO_BG: Color = Color::Gray;
+
 /// Conservative tokens-per-character ratio for live usage estimates.
 /// English prose runs ~4 chars/token (incl. the space); code, JSON and
 /// identifier-heavy text run ~3. Assuming 3 overestimates prose by ~25%
@@ -771,6 +778,65 @@ impl App {
         }
     }
 
+    /// Apply a full-width background to already-wrapped display lines:
+    /// every span is patched to add `bg`, and each row in the block is
+    /// padded to `width` with bg-only spaces (see `screen::print_line`
+    /// for why the padding lives in the spans rather than in the
+    /// renderer). The block runs from the first row through the last
+    /// populated row: paragraph breaks inside the entry are filled too,
+    /// so the whole message reads as one seamless background. Only the
+    /// entry's trailing blank rows (the separator appended after the
+    /// block) stay uncolored, so a block never touches the entry below
+    /// it.
+    ///
+    /// The caller must pass the same width the lines were wrapped at:
+    /// padding wider would overflow the renderer's truncation (the row
+    /// count math depends on rows never wrapping).
+    fn with_block_bg(lines: Vec<Line<'static>>, bg: Color, width: u16) -> Vec<Line<'static>> {
+        let width = width.max(1) as usize;
+        let bg_style = Style::new().bg(bg);
+        // The block ends at the last populated row; blanks after it are
+        // the entry's trailing separator(s) and stay uncolored.
+        let last_text = lines
+            .iter()
+            .rposition(|line| line.spans.iter().any(|s| !s.content.trim().is_empty()));
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut line)| {
+                let in_block = last_text.is_some_and(|last| i <= last);
+                let mut text_width = 0usize;
+                for span in &mut line.spans {
+                    span.style = span.style.patch(bg_style);
+                    text_width += span.content.width();
+                }
+                let has_text = line.spans.iter().any(|s| !s.content.trim().is_empty());
+                if in_block {
+                    if has_text {
+                        let text_width = text_width.min(width);
+                        if text_width < width {
+                            let pad = " ".repeat(width - text_width);
+                            line.spans.push(Span::styled(pad, bg_style));
+                        }
+                    } else {
+                        // A paragraph break inside the entry: one
+                        // full-width row of background (no text), so
+                        // the block stays seamless across paragraphs.
+                        line.spans = vec![Span::styled(" ".repeat(width), bg_style)];
+                    }
+                } else {
+                    // Trailing blanks (the separator line at the end of
+                    // every entry) carry no background: a block never
+                    // touches the entry below it.
+                    for span in &mut line.spans {
+                        span.style.bg = None;
+                    }
+                }
+                line
+            })
+            .collect()
+    }
+
     /// Wrapped display lines for one transcript entry.
     pub fn entry_lines(&self, index: usize, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -793,7 +859,16 @@ impl App {
                 if src.is_empty() {
                     src.push(Line::from(Span::styled("❯ ", prompt)));
                 }
-                lines.extend(markdown::wrap(&src, width));
+                // The bg goes on the source lines: wrapping preserves
+                // per-character styles, so wrapped continuation rows
+                // inherit it.
+                for line in &mut src {
+                    for span in &mut line.spans {
+                        span.style = span.style.patch(Style::new().bg(USER_BG));
+                    }
+                }
+                let wrapped = markdown::wrap(&src, width);
+                lines.extend(Self::with_block_bg(wrapped, USER_BG, width));
                 lines.push(Line::default());
             }
             // Assistant text: internal blank lines (paragraph breaks) are
@@ -916,19 +991,29 @@ impl App {
             // `wrap_text` so they split into separate rows (see the
             // `Entry::ToolResult` note on raw LF reaching the terminal).
             Entry::Error(message) => {
-                lines.extend(markdown::wrap_text(
-                    &format!("✗ {message}"),
-                    Style::new().fg(Color::Red),
+                let mut text = Self::with_block_bg(
+                    markdown::wrap_text(
+                        &format!("✗ {message}"),
+                        Style::new().fg(Color::White).bg(ERROR_BG),
+                        width,
+                    ),
+                    ERROR_BG,
                     width,
-                ));
+                );
+                lines.append(&mut text);
                 lines.push(Line::default());
             }
             Entry::Info(message) => {
-                lines.extend(markdown::wrap_text(
-                    &format!("· {message}"),
-                    Style::new().fg(Color::DarkGray),
+                let mut text = Self::with_block_bg(
+                    markdown::wrap_text(
+                        &format!("· {message}"),
+                        Style::new().fg(Color::Black).bg(INFO_BG),
+                        width,
+                    ),
+                    INFO_BG,
                     width,
-                ));
+                );
+                lines.append(&mut text);
                 lines.push(Line::default());
             }
             Entry::Queued { preview } => {
@@ -1650,6 +1735,99 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("❯ hi")));
         assert!(texts.iter().any(|t| t.contains("● bash")));
         assert!(texts.iter().any(|t| t.contains("└─ bash: a")));
+    }
+
+    #[test]
+    fn user_error_info_rows_carry_block_bg() {
+        let mut app = App::new();
+        app.push_user("hello");
+        app.entries.push(Entry::Error("boom".into()));
+        app.entries.push(Entry::Info("renamed".into()));
+
+        // User: bg on every populated row, none on the separator.
+        let lines = app.entry_lines(0, 40);
+        assert!(lines.iter().any(|l| {
+            l.spans.iter().any(|s| s.style.bg == Some(USER_BG)) && !l.spans.is_empty()
+        }));
+        let last = lines.last().unwrap();
+        assert!(last.spans.is_empty(), "separator stays unstyled: {last:?}");
+
+        // Error: white on red, full-width fill on populated rows.
+        let lines = app.entry_lines(1, 40);
+        for line in lines.iter().filter(|l| !l.spans.is_empty()) {
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(ERROR_BG)),
+                "error row bg: {line:?}"
+            );
+            assert!(
+                line.spans.iter().any(|s| s.style.fg == Some(Color::White)),
+                "error row fg: {line:?}"
+            );
+            let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
+            assert_eq!(w, 40, "error row padded to width: {line:?}");
+        }
+
+        // Info: black on gray.
+        let lines = app.entry_lines(2, 40);
+        for line in lines.iter().filter(|l| !l.spans.is_empty()) {
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(INFO_BG)),
+                "info row bg: {line:?}"
+            );
+            assert!(
+                line.spans.iter().any(|s| s.style.fg == Some(Color::Black)),
+                "info row fg: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_bg_survives_wrapping() {
+        let mut app = App::new();
+        // One long source line: wraps into several rows at width 10.
+        app.push_user("aaa bbb ccc ddd eee");
+        let lines = app.entry_lines(0, 10);
+        let populated: Vec<_> = lines
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| !s.content.trim().is_empty()))
+            .collect();
+        assert!(
+            populated.len() >= 3,
+            "expected several wrapped rows: {lines:?}"
+        );
+        for line in populated {
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(USER_BG)),
+                "every wrapped row keeps the bg: {line:?}"
+            );
+            let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
+            assert_eq!(w, 10, "wrapped row padded to width: {line:?}");
+        }
+        // The wrap separator (last line) stays unstyled.
+        assert!(lines.last().unwrap().spans.is_empty());
+    }
+
+    #[test]
+    fn internal_blank_rows_are_filled_so_the_block_is_seamless() {
+        let mut app = App::new();
+        app.push_user("para one\n\npara two");
+        let lines = app.entry_lines(0, 40);
+        // Rows: "❯ para one" + pad, a full-width filled paragraph break,
+        // "  para two" + pad, and the uncolored separator.
+        assert_eq!(lines.len(), 4, "rows: {lines:?}");
+        let middle = &lines[1];
+        assert!(
+            middle.spans.iter().all(|s| s.style.bg == Some(USER_BG)),
+            "paragraph break is filled: {middle:?}"
+        );
+        assert!(
+            middle.spans.iter().all(|s| s.content.trim().is_empty()),
+            "the break row has no text: {middle:?}"
+        );
+        let w: usize = middle.spans.iter().map(|s| s.content.width()).sum();
+        assert_eq!(w, 40, "break row fills the width: {middle:?}");
+        // The trailing separator stays uncolored.
+        assert!(lines[3].spans.is_empty(), "separator: {:?}", lines[3]);
     }
 
     #[test]

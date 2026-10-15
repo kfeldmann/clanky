@@ -539,6 +539,12 @@ fn resume_in_pipe_mode_sends_the_full_prior_context() {
     // can be checked: a resumed turn must carry the prior conversation.
     let dir = plugin_dir("hello-world", TOOL_PLUGIN);
     write_session(&dir, "saved");
+    // Pin one system part in the test's own project scope, so the
+    // assertion below holds on machines whose user scope has no
+    // SYSTEM.md/AGENTS.md (the context is best-effort and would
+    // otherwise be empty here).
+    std::fs::create_dir_all(dir.join(".clanky")).unwrap();
+    std::fs::write(dir.join(".clanky/SYSTEM.md"), "test system context.\n").unwrap();
     let output = run_clanky(
         &dir,
         &[

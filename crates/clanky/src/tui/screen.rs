@@ -43,6 +43,8 @@ use std::io::{self, Write};
 use ratatui::crossterm::cursor::{MoveTo, MoveToColumn, MoveUp};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{Clear, ClearType};
+use std::borrow::Cow;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
@@ -278,6 +280,19 @@ impl<W: Write> Screen<W> {
 pub fn print_line<W: Write>(out: &mut W, line: &Line<'_>, width: u16) -> io::Result<()> {
     let width = width as usize;
     let mut col = 0usize;
+    // A styled row (any span carrying a background color) is padded to
+    // the full row width with background-only spaces, so the color forms
+    // one continuous block across the row. The padded width is the
+    // layout width (the last terminal column is reserved, never
+    // painted — see `Screen::render`), and it must be emitted before the
+    // caller's end-of-row erase: `Clear(UntilNewLine)` would otherwise
+    // cut the background at the last visible character. Rows without a
+    // background are not padded (they end at their last character, and
+    // the erase clears the rest).
+    let paints_bg = line
+        .spans
+        .iter()
+        .any(|span| span.style.patch(line.style).bg.is_some());
     // The SGR sequence currently in effect. Every style change must emit
     // the full new state (reset plus the span's own codes): `sgr` only
     // produces codes for attributes a style *has*, so switching to a
@@ -316,50 +331,89 @@ pub fn print_line<W: Write>(out: &mut W, line: &Line<'_>, width: u16) -> io::Res
             col += w;
         }
     }
+    if paints_bg && col < width {
+        // Full-width background: keep the active SGR (bg included) and
+        // fill the rest of the row with spaces. Same edge cases as the
+        // text pass above: control characters never appear (only spaces
+        // are emitted) and the fill cannot overflow `width`.
+        let fill = " ".repeat(width - col);
+        out.write_all(fill.as_bytes())?;
+    }
     out.write_all(b"\x1b[0m")
 }
 
 /// ANSI SGR sequence for a ratatui style (the colors and modifiers the
 /// TUI actually uses; anything else falls back to the default).
 fn sgr(style: Style) -> String {
-    let mut codes: Vec<&str> = Vec::new();
+    let mut codes: Vec<Cow<'static, str>> = Vec::new();
     let fg = match style.fg {
-        Some(Color::Black) => Some("30"),
-        Some(Color::Red) => Some("31"),
-        Some(Color::Green) => Some("32"),
-        Some(Color::Yellow) => Some("33"),
-        Some(Color::Blue) => Some("34"),
-        Some(Color::Magenta) => Some("35"),
-        Some(Color::Cyan) => Some("36"),
-        Some(Color::Gray) => Some("37"),
-        Some(Color::DarkGray) => Some("90"),
-        Some(Color::LightRed) => Some("91"),
-        Some(Color::LightGreen) => Some("92"),
-        Some(Color::LightYellow) => Some("93"),
-        Some(Color::LightBlue) => Some("94"),
-        Some(Color::LightMagenta) => Some("95"),
-        Some(Color::LightCyan) => Some("96"),
-        Some(Color::White) => Some("97"),
+        Some(Color::Black) => Some(Cow::Borrowed("30")),
+        Some(Color::Red) => Some(Cow::Borrowed("31")),
+        Some(Color::Green) => Some(Cow::Borrowed("32")),
+        Some(Color::Yellow) => Some(Cow::Borrowed("33")),
+        Some(Color::Blue) => Some(Cow::Borrowed("34")),
+        Some(Color::Magenta) => Some(Cow::Borrowed("35")),
+        Some(Color::Cyan) => Some(Cow::Borrowed("36")),
+        Some(Color::Gray) => Some(Cow::Borrowed("37")),
+        Some(Color::DarkGray) => Some(Cow::Borrowed("90")),
+        Some(Color::LightRed) => Some(Cow::Borrowed("91")),
+        Some(Color::LightGreen) => Some(Cow::Borrowed("92")),
+        Some(Color::LightYellow) => Some(Cow::Borrowed("93")),
+        Some(Color::LightBlue) => Some(Cow::Borrowed("94")),
+        Some(Color::LightMagenta) => Some(Cow::Borrowed("95")),
+        Some(Color::LightCyan) => Some(Cow::Borrowed("96")),
+        Some(Color::White) => Some(Cow::Borrowed("97")),
+        // 256-color palette entries emit as indexed: `38;5;n`. The
+        // code is dynamically formatted, so it goes out owned (the
+        // static arms borrow theirs).
+        Some(Color::Indexed(i)) => Some(Cow::Owned(format!("38;5;{i}"))),
         _ => None,
     };
     if let Some(code) = fg {
         codes.push(code);
     }
+    // Background colors (40-47 standard, 100-107 bright). Painted only
+    // where the row has characters: the caller pads rows that must look
+    // full-width (see `print_line`).
+    let bg = match style.bg {
+        Some(Color::Black) => Some(Cow::Borrowed("40")),
+        Some(Color::Red) => Some(Cow::Borrowed("41")),
+        Some(Color::Green) => Some(Cow::Borrowed("42")),
+        Some(Color::Yellow) => Some(Cow::Borrowed("43")),
+        Some(Color::Blue) => Some(Cow::Borrowed("44")),
+        Some(Color::Magenta) => Some(Cow::Borrowed("45")),
+        Some(Color::Cyan) => Some(Cow::Borrowed("46")),
+        Some(Color::Gray) => Some(Cow::Borrowed("47")),
+        Some(Color::DarkGray) => Some(Cow::Borrowed("100")),
+        Some(Color::LightRed) => Some(Cow::Borrowed("101")),
+        Some(Color::LightGreen) => Some(Cow::Borrowed("102")),
+        Some(Color::LightYellow) => Some(Cow::Borrowed("103")),
+        Some(Color::LightBlue) => Some(Cow::Borrowed("104")),
+        Some(Color::LightMagenta) => Some(Cow::Borrowed("105")),
+        Some(Color::LightCyan) => Some(Cow::Borrowed("106")),
+        Some(Color::White) => Some(Cow::Borrowed("107")),
+        // As on the fg side: `48;5;n`, owned rather than borrowed.
+        Some(Color::Indexed(i)) => Some(Cow::Owned(format!("48;5;{i}"))),
+        _ => None,
+    };
+    if let Some(code) = bg {
+        codes.push(code);
+    }
     let m = style.add_modifier;
     if m.contains(Modifier::BOLD) {
-        codes.push("1");
+        codes.push(Cow::Borrowed("1"));
     }
     if m.contains(Modifier::DIM) {
-        codes.push("2");
+        codes.push(Cow::Borrowed("2"));
     }
     if m.contains(Modifier::ITALIC) {
-        codes.push("3");
+        codes.push(Cow::Borrowed("3"));
     }
     if m.contains(Modifier::UNDERLINED) {
-        codes.push("4");
+        codes.push(Cow::Borrowed("4"));
     }
     if m.contains(Modifier::REVERSED) {
-        codes.push("7");
+        codes.push(Cow::Borrowed("7"));
     }
     if codes.is_empty() {
         String::new()
@@ -2214,5 +2268,50 @@ mod tests {
         assert_eq!(status_rows, 1, "screen: {rows:?}");
         let hist_status = history.iter().filter(|r| r.contains("deepinfra")).count();
         assert_eq!(hist_status, 0, "scrollback: {history:?}");
+    }
+}
+
+#[cfg(test)]
+mod bg_tests {
+    use super::*;
+
+    #[test]
+    fn sgr_emits_background_codes() {
+        assert_eq!(sgr(Style::new().bg(Color::Blue)), "\x1b[44m");
+        assert_eq!(sgr(Style::new().bg(Color::LightBlue)), "\x1b[104m");
+        // Combined with fg and modifiers, in a stable order: bg after fg,
+        // modifiers last (matching how `codes` is built). Note ratatui's
+        // `White` is the bright variant (97/107); `Gray` is 37/47.
+        assert_eq!(
+            sgr(Style::new()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD)),
+            "\x1b[97;41;1m"
+        );
+    }
+
+    #[test]
+    fn sgr_emits_indexed_256_color_codes() {
+        // Palette colors emit as indexed: fg `38;5;n`, bg `48;5;n`.
+        assert_eq!(sgr(Style::new().fg(Color::Indexed(87))), "\x1b[38;5;87m");
+        assert_eq!(sgr(Style::new().bg(Color::Indexed(87))), "\x1b[48;5;87m");
+        // Both together, in the same order as the static arms.
+        assert_eq!(
+            sgr(Style::new().fg(Color::Indexed(15)).bg(Color::Indexed(87))),
+            "\x1b[38;5;15;48;5;87m"
+        );
+    }
+
+    #[test]
+    fn print_line_pads_bg_rows_to_width() {
+        let line = Line::from(Span::styled("hi", Style::new().bg(Color::Red)));
+        let mut out = Vec::new();
+        print_line(&mut out, &line, 10).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        // One styled run: the pad shares the span's SGR (still active),
+        // so the row is a single continuous background block. Width 10:
+        // "hi" plus 8 pad spaces.
+        assert_eq!(s, "\x1b[0m\x1b[41mhi        \x1b[0m");
     }
 }
