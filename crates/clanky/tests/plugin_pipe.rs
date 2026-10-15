@@ -194,12 +194,18 @@ fn resume_with_no_session_is_rejected_with_one_shared_message() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-/// A plugin that streams a tool call, waits for a second `chat` request,
-/// and answers the final round. Request-scoped non-retryable error (code
-/// `backend`, `retryable: false`) after streaming half a round: the
-/// default retry budget must not swallow it (M14's partial-flush test
-/// needs a failure mid-stream, not a silently successful retry).
+/// A plugin that answers the first chat request of a process with a tool
+/// call, every later one with the final answer. Which branch a request
+/// takes is decided by its own ordinal, not by scanning the request body:
+/// the tool loop re-sends the whole conversation each round, so any
+/// content match (e.g. on the first prompt) would match every later
+/// request too and loop forever.
+///
+/// Every chat request is also dumped to stderr with a `CHAT-REQUEST: `
+/// prefix (never the protocol stream, spec §1), so tests can assert on
+/// exactly what crossed the wire.
 const TOOL_PLUGIN: &str = r#"#!/bin/sh
+n=0
 while IFS= read -r line; do
   case "$line" in
     *'"hello"'*)
@@ -210,8 +216,10 @@ while IFS= read -r line; do
       printf '{"type":"models","id":%s,"models":[{"id":"hello-world/tiny"}]}\n' "$id"
       ;;
     *'"chat"'*)
+      n=$((n+1))
       id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-      if printf '%s' "$line" | grep -q 'run it'; then
+      printf 'CHAT-REQUEST: %s\n' "$line" >&2
+      if [ "$n" -eq 1 ]; then
         printf '{"type":"chunk","requestId":%s,"payload":{"kind":"thinking","text":"let me check"}}\n' "$id"
         printf '{"type":"chunk","requestId":%s,"payload":{"kind":"toolCallStart","index":0,"id":"call_1","name":"bash"}}\n' "$id"
         printf '{"type":"chunk","requestId":%s,"payload":{"kind":"toolCallArgs","index":0,"argsChunk":"{\\"command\\":\\"echo 42\\"}"}}\n' "$id"
@@ -303,14 +311,6 @@ fn session_records(dir: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The `type` tags of a session file's records, in order.
-fn record_types(dir: &Path) -> Vec<String> {
-    session_records(dir)
-        .iter()
-        .map(|record| record["type"].as_str().unwrap().to_string())
-        .collect()
-}
-
 /// A one-line session (user prompt + fixed answer) written by hand, for
 /// `--resume NAME` to continue.
 fn write_session(dir: &Path, name: &str) {
@@ -328,19 +328,33 @@ fn write_session(dir: &Path, name: &str) {
     std::fs::write(sessions.join(format!("{name}.jsonl")), line).unwrap();
 }
 
-/// Run the recorded conversation against `TOOL_PLUGIN`'s plugin and
-/// return the model-side messages of the first chat request (the one
-/// whose turn consumed a resumed session's history).
-fn first_request_messages(dir: &Path, args: &[&str]) -> serde_json::Value {
-    let output = run_clanky(dir, args);
+/// The chat requests the plugin received during a run, as raw JSON
+/// values, in wire order. `TOOL_PLUGIN` logs each request it reads to
+/// stderr with a `CHAT-REQUEST: ` prefix (stderr is never protocol,
+/// spec §1), so tests can assert on exactly what crossed the wire.
+fn chat_requests(output: &std::process::Output) -> Vec<serde_json::Value> {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // The plugin dumps each chat request's messages as a JSON line; the
-    // plugin itself only prints it on stderr in debug mode.
-    let dump = stderr
+    stderr
         .lines()
-        .find(|line| line.starts_with('{'))
-        .unwrap_or_else(|| panic!("no request dump on stderr: {stderr}"));
-    serde_json::from_str(dump).expect("request dump is valid JSON")
+        .filter_map(|line| line.strip_prefix("CHAT-REQUEST: "))
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("chat request is valid JSON ({err}): {line}"))
+        })
+        .collect()
+}
+
+/// The model-side messages of a run's first chat request (the one the
+/// resumed context, if any, was loaded into).
+fn first_request_messages(output: &std::process::Output) -> Vec<serde_json::Value> {
+    let requests = chat_requests(output);
+    let first = requests
+        .first()
+        .unwrap_or_else(|| panic!("no chat request was sent; stderr: {:?}", output.stderr));
+    first["messages"]
+        .as_array()
+        .expect("chat request has a messages array")
+        .clone()
 }
 
 #[test]
@@ -354,6 +368,10 @@ fn print_mode_records_the_same_records_a_tui_run_would() {
         output.status.success(),
         "clanky failed: {:?}\nstderr: {stderr}",
         output.status
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "The tool ran."
     );
     let records = session_records(&dir);
     let types: Vec<&str> = records
@@ -517,7 +535,7 @@ fn resume_in_pipe_mode_continues_a_session_and_appends() {
 
 #[test]
 fn resume_in_pipe_mode_sends_the_full_prior_context() {
-    // The plugin dumps each chat request's messages, so the wire itself
+    // The plugin dumps each chat request it receives, so the wire itself
     // can be checked: a resumed turn must carry the prior conversation.
     let dir = plugin_dir("hello-world", TOOL_PLUGIN);
     write_session(&dir, "saved");
@@ -532,30 +550,36 @@ fn resume_in_pipe_mode_sends_the_full_prior_context() {
             "and again",
         ],
     );
-    assert!(output.status.success());
-    // TOOL_PLUGIN answers the second-style prompt ("and again") with the
-    // final-round branch, so the first request's messages are the
-    // resumed context; the dump records the request's messages array.
-    let dump = {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        stderr
-            .lines()
-            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .expect("the plugin dumped the chat request")
-    };
-    let messages = dump["messages"].as_array().expect("messages array");
-    let roles: Vec<&str> = messages
+    assert!(
+        output.status.success(),
+        "clanky failed: {output:?}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let messages = first_request_messages(&output);
+    // The system context is rebuilt fresh, so it leads the request; how
+    // many parts it has depends on the machine's user-scope files, so
+    // only its placement is pinned — everything before the history must
+    // be system messages.
+    let history_start = messages
+        .iter()
+        .position(|m| m["role"] != "system")
+        .unwrap_or(messages.len());
+    assert!(
+        history_start >= 1,
+        "the fresh system context is sent first: {messages:?}"
+    );
+    let roles: Vec<&str> = messages[history_start..]
         .iter()
         .map(|m| m["role"].as_str().unwrap())
         .collect();
     assert_eq!(
         roles,
-        ["system", "user", "assistant", "user"],
-        "system context fresh, records' history, then the new prompt: {messages:?}"
+        ["user", "assistant", "user"],
+        "records' history, then the new prompt: {messages:?}"
     );
-    assert_eq!(messages[1]["content"], "run it");
-    assert_eq!(messages[2]["content"], "It said: echoed.");
-    assert_eq!(messages[3]["content"], "and again");
+    assert_eq!(messages[history_start]["content"], "run it");
+    assert_eq!(messages[history_start + 1]["content"], "It said: echoed.");
+    assert_eq!(messages[history_start + 2]["content"], "and again");
     std::fs::remove_dir_all(dir).ok();
 }
 
@@ -568,7 +592,7 @@ fn resume_with_a_missing_session_fails_the_same_way_in_both_modes() {
             &["--provider", "hello-world", "--resume", "nosuch"]
                 .iter()
                 .chain(extra.iter())
-                .map(|s| *s)
+                .copied()
                 .chain(["hi"])
                 .collect::<Vec<_>>(),
         );
