@@ -17,6 +17,10 @@ You do not have `git` available. You are working in an Alpine Linux container wi
 - cargo
 - rust-clippy
 - rustfmt
+- coreutils
+- procps
+- strace
+- psmisc
 
 You have network access and can search the web using:
 ```

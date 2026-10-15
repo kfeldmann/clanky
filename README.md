@@ -109,7 +109,10 @@ Notes:
 Commands run in the project directory with **no timeout**: they run until
 they finish. If the model wants a deadline it passes `timeout_seconds`
 (any positive number of seconds) on the call — that voluntary timeout is
-honored, and the command is killed when it expires. Output sent to the
+honored, and the command's **whole process tree** is killed (TERM, then
+KILL) when it expires, so grandchildren cannot outlive the deadline and
+wedge the call. A command run without `timeout_seconds` shares Clanky's
+process group, so terminal ctrl+c still reaches it. Output sent to the
 model is capped at 20 000 characters (then `… (output truncated)`).
 
 ### Session precedence note

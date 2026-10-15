@@ -146,17 +146,29 @@ impl BashTool {
         command: &str,
         timeout: Option<Duration>,
     ) -> Result<String, ToolError> {
-        let mut child = Command::new("bash")
+        let mut shell = Command::new("bash");
+        shell
             .arg("-c")
             .arg(command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| ToolError::Failed {
-                tool: "bash".into(),
-                message: format!("failed to spawn bash: {e}"),
-            })?;
+            .stderr(Stdio::piped());
+        // A command with a deadline runs in its own process group so the
+        // timeout can kill the whole tree: the direct `bash -c` child
+        // only — never its grandchildren (`cargo test` and friends) —
+        // would otherwise survive, hold the output pipes, and wedge the
+        // reader joins below forever. Without a deadline there is nothing
+        // for us to kill, and sharing Clanky's group keeps the terminal's
+        // ctrl+c escape hatch reaching the command.
+        #[cfg(unix)]
+        if timeout.is_some() {
+            use std::os::unix::process::CommandExt as _;
+            shell.process_group(0);
+        }
+        let mut child = shell.spawn().map_err(|e| ToolError::Failed {
+            tool: "bash".into(),
+            message: format!("failed to spawn bash: {e}"),
+        })?;
         let stdout_pipe = child.stdout.take().ok_or_else(|| pipe_error("stdout"))?;
         let stderr_pipe = child.stderr.take().ok_or_else(|| pipe_error("stderr"))?;
 
@@ -173,6 +185,19 @@ impl BashTool {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => {
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        // Kill the whole process group (TERM, then KILL if
+                        // the group lingers): grandchildren inherited the
+                        // output pipes, and the reader joins below would
+                        // block until every writer is gone. The direct
+                        // child's group was set at spawn.
+                        #[cfg(unix)]
+                        {
+                            let _ = kill_process_group(child.id(), "TERM");
+                            // A short grace: processes that catch TERM get
+                            // a chance to exit before the hard kill.
+                            let _ = child.wait_timeout(Duration::from_millis(500));
+                            let _ = kill_process_group(child.id(), "KILL");
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
                         break Err(format!(
@@ -185,10 +210,14 @@ impl BashTool {
             }
         };
 
-        // Killing the child closes the pipes, so the readers finish even on
-        // timeout (unless grandchildren inherited them).
-        let stdout = stdout_reader.join().unwrap_or_default();
-        let stderr = stderr_reader.join().unwrap_or_default();
+        // Killing the group closes the pipes, so the readers finish even
+        // on timeout. The joins are still deadline-aware: a backgrounded
+        // grandchild can outlive the direct child holding a pipe (the
+        // direct child exited before the deadline, `kill -KILL` missed
+        // because the child was not in our group, ...) — whatever
+        // slipped through must not wedge the call past its deadline.
+        let (stdout, stderr) =
+            join_with_deadline([stdout_reader, stderr_reader], deadline, child.id());
         let status = status.map_err(|message| ToolError::Failed {
             tool: "bash".into(),
             message,
@@ -226,6 +255,87 @@ impl BashTool {
             output.push_str("(no output)");
         }
         truncate_chars(&output, self.max_output_chars)
+    }
+}
+
+/// How long the reader joins may wait past a missed deadline before
+/// giving up on an escaped writer and returning what was captured.
+const JOIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Join the output reader threads, but never past `deadline` (plus
+/// [`JOIN_GRACE`]): a writer that slipped through every kill — typically
+/// a backgrounded grandchild that outlived the direct child — would
+/// otherwise wedge the tool call indefinitely. On grace expiry the
+/// group is signalled once more (TERM, then KILL) and whatever was
+/// captured is returned; the stuck reader threads stay detached and die
+/// with the process.
+fn join_with_deadline(
+    readers: [std::thread::JoinHandle<Vec<u8>>; 2],
+    deadline: Option<Instant>,
+    pgid: u32,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut outputs = (Vec::new(), Vec::new());
+    let mut pending: Vec<(usize, std::thread::JoinHandle<Vec<u8>>)> =
+        readers.into_iter().enumerate().collect();
+    let Some(deadline) = deadline else {
+        // Unbounded command: the pipes close when the child tree exits;
+        // a plain join is the honest wait.
+        pending.sort_by_key(|(index, _)| *index);
+        for (index, reader) in pending.drain(..) {
+            let bytes = reader.join().unwrap_or_default();
+            if index == 0 {
+                outputs.0 = bytes;
+            } else {
+                outputs.1 = bytes;
+            }
+        }
+        return outputs;
+    };
+    let grace_end = deadline + JOIN_GRACE;
+    while !pending.is_empty() {
+        if Instant::now() >= grace_end {
+            // Last resort: the group survived TERM+KILL (or the writer
+            // daemonized into another group). Return what was captured;
+            // the detached readers can no longer wedge anything.
+            #[cfg(unix)]
+            {
+                let _ = kill_process_group(pgid, "TERM");
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = kill_process_group(pgid, "KILL");
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        for i in (0..pending.len()).rev() {
+            if pending[i].1.is_finished() {
+                let (index, reader) = pending.swap_remove(i);
+                let bytes = reader.join().unwrap_or_default();
+                if index == 0 {
+                    outputs.0 = bytes;
+                } else {
+                    outputs.1 = bytes;
+                }
+            }
+        }
+    }
+    outputs
+}
+
+/// Signal a command's whole process group by running `kill -<SIG> -PGID`
+/// (no `libc` dependency; the same technique as `clanky-subagents`). The
+/// group is a real group leader because it was spawned with
+/// `process_group(0)`.
+#[cfg(unix)]
+fn kill_process_group(pgid: u32, signal: &str) -> std::io::Result<()> {
+    let status = Command::new("kill")
+        .args([format!("-{signal}"), format!("-{pgid}")])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "kill -{signal} -{pgid} exited with {status:?}"
+        )))
     }
 }
 
@@ -497,6 +607,54 @@ mod tests {
         let tool = BashTool::new(Duration::from_millis(300), 20_000);
         let err = tool.execute(&json!({"command": "sleep 30"})).unwrap_err();
         assert!(err.to_string().contains("timeout"), "{err}");
+    }
+
+    #[test]
+    fn timeout_kills_grandchildren_holding_the_pipes() {
+        // The wedge this regression test guards: the direct `bash -c`
+        // child exits, but its grandchildren inherit the stdout pipe and
+        // keep it open. Killing only the direct child used to leave them
+        // alive, wedging the reader join forever (a real `cargo test |
+        // tail` run hung for hours). The process-group kill must reap the
+        // whole tree, so the call returns the timeout error promptly.
+        let tool = BashTool::new(Duration::from_millis(500), 20_000);
+        let started = Instant::now();
+        // The direct child (`tail`) blocks on a pipe whose writer is a
+        // grandchild; other grandchildren hold the stdout/stderr pipes.
+        // All of them must die with the group when the deadline hits.
+        let err = tool
+            .execute(&json!({
+                "command": "sleep 30 > /dev/null & sleep 30 1>&2 & sleep 30 | tail -1"
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn timeout_returns_even_when_a_daemon_escapes_the_group() {
+        // Second wedge, same class: the direct child stays alive until
+        // the deadline, but one grandchild daemonized out of the process
+        // group (`setsid`) and holds the stdout pipe. The group kill
+        // cannot reach it, so the reader join would block forever
+        // without the deadline-aware join.
+        let tool = BashTool::new(Duration::from_millis(500), 20_000);
+        let started = Instant::now();
+        let err = tool
+            .execute(&json!({
+                "command": "setsid sh -c 'sleep 300' & sleep 30"
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "returned promptly, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

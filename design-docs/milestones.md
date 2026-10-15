@@ -201,6 +201,18 @@ Architectural decisions already made:
   positive integer (schema `minimum: 1`, no `maximum`; 0 or non-integer →
   error). Trade-off accepted: a stuck upstream or hanging command holds the
   turn indefinitely (ctrl+c is the escape hatch).
+  As built (timeout kill fix): a command run with `timeout_seconds` is
+  spawned in its own process group; on expiry the whole group gets TERM
+  (then KILL after a short grace). Killing only the direct `bash -c`
+  child left grandchildren alive — they inherit the output pipes, so the
+  tool's reader joins blocked forever (a `cargo test … | tail` run wedged
+  for 90+ minutes). The reader joins are also deadline-aware (2 s grace
+  past the deadline, then TERM+KILL and return what was captured): a
+  grandchild that daemonized out of the group (`setsid`) survives the
+  group kill and would otherwise wedge the join forever. A command
+  without a timeout stays in Clanky's process group, so terminal ctrl+c
+  keeps reaching it (the group technique is the same as the subagents
+  launcher, M12).
 - DONE - TUI rendering stability (status-line duplication on `$EDITOR`
   return and resize; invisible last column under GNU screen): the tail
   repositioning now uses absolute cursor addressing (CUP, clamped by every

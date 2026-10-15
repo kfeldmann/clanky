@@ -1,0 +1,54 @@
+{
+  "output": {
+    "finishReason": "stop",
+    "text": "Let me use the tool.The tool said: fake ran with input=hello",
+    "usage": {
+      "cachedTokens": 0,
+      "completionTokens": 12,
+      "promptTokens": 19
+    }
+  },
+  "records": [
+    {
+      "text": "use the tool on hello",
+      "type": "user"
+    },
+    {
+      "text": "Running the tool.",
+      "type": "thinking"
+    },
+    {
+      "calls": [
+        {
+          "arguments": {
+            "input": "hello"
+          },
+          "id": "call_1",
+          "name": "fake"
+        }
+      ],
+      "text": "Let me use the tool.",
+      "type": "assistant"
+    },
+    {
+      "completionTokens": 9,
+      "promptTokens": 12,
+      "type": "usage"
+    },
+    {
+      "name": "fake",
+      "output": "fake ran with input=hello",
+      "type": "toolResult"
+    },
+    {
+      "calls": [],
+      "text": "The tool said: fake ran with input=hello",
+      "type": "assistant"
+    },
+    {
+      "completionTokens": 3,
+      "promptTokens": 7,
+      "type": "usage"
+    }
+  ]
+}

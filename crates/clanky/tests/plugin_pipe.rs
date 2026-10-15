@@ -193,3 +193,391 @@ fn resume_with_no_session_is_rejected_with_one_shared_message() {
     }
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// A plugin that streams a tool call, waits for a second `chat` request,
+/// and answers the final round. Request-scoped non-retryable error (code
+/// `backend`, `retryable: false`) after streaming half a round: the
+/// default retry budget must not swallow it (M14's partial-flush test
+/// needs a failure mid-stream, not a silently successful retry).
+const TOOL_PLUGIN: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"hello"'*)
+      printf '%s\n' '{"type":"hello","protocolVersion":2,"name":"hello-world","capabilities":{"tools":true,"listModels":true},"defaultModel":"hello-world/tiny"}'
+      ;;
+    *'"listModels"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"type":"models","id":%s,"models":[{"id":"hello-world/tiny"}]}\n' "$id"
+      ;;
+    *'"chat"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      if printf '%s' "$line" | grep -q 'run it'; then
+        printf '{"type":"chunk","requestId":%s,"payload":{"kind":"thinking","text":"let me check"}}\n' "$id"
+        printf '{"type":"chunk","requestId":%s,"payload":{"kind":"toolCallStart","index":0,"id":"call_1","name":"bash"}}\n' "$id"
+        printf '{"type":"chunk","requestId":%s,"payload":{"kind":"toolCallArgs","index":0,"argsChunk":"{\\"command\\":\\"echo 42\\"}"}}\n' "$id"
+        printf '{"type":"done","requestId":%s,"finishReason":"toolCalls"}\n' "$id"
+      else
+        printf '{"type":"chunk","requestId":%s,"payload":{"kind":"text","text":"The tool ran."}}\n' "$id"
+        printf '{"type":"done","requestId":%s,"finishReason":"stop","usage":{"promptTokens":4,"completionTokens":2}}\n' "$id"
+      fi
+      ;;
+  esac
+done
+"#;
+
+/// A plugin that streams half a round (thinking + text) and then fails
+/// with a request-scoped non-retryable error: the partial round must be
+/// flushed to the session file (M14).
+const HALF_STREAM_PLUGIN: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"hello"'*)
+      printf '%s\n' '{"type":"hello","protocolVersion":2,"name":"hello-world","capabilities":{"tools":false,"listModels":false},"defaultModel":"hello-world/tiny"}'
+      ;;
+    *'"chat"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"type":"chunk","requestId":%s,"payload":{"kind":"thinking","text":"let me thi"}}\n' "$id"
+      printf '{"type":"chunk","requestId":%s,"payload":{"kind":"text","text":"The an"}}\n' "$id"
+      printf '{"type":"error","requestId":%s,"code":"backend","message":"timed out reading response","retryable":false}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// A fresh scratch directory containing an executable plugin script, so
+/// tests are independent of each other's files.
+fn plugin_dir(plugin: &str, script: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "clanky-pipe-sessions-{}-{}-{}",
+        plugin,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!("clanky-provider-{plugin}"));
+    std::fs::write(&file, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+/// One print-mode run in `dir` with the given extra argv.
+fn run_clanky(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_clanky"))
+        .args(args)
+        .current_dir(dir)
+        .env("PATH", path_with(dir))
+        .env("CLANKY_PLUGIN_DEBUG", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run clanky")
+}
+
+/// The one session file under `dir/.clanky/sessions` (there must be
+/// exactly one), read into memory.
+fn single_session(dir: &Path) -> (PathBuf, String) {
+    let sessions = dir.join(".clanky/sessions");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&sessions)
+        .unwrap_or_else(|_| panic!("session dir must exist at {}", sessions.display()))
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "exactly one session file");
+    let path = entries.remove(0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    (path, text)
+}
+
+/// The session file's records (header excluded), parsed as raw JSON.
+fn session_records(dir: &Path) -> Vec<serde_json::Value> {
+    let (_, text) = single_session(dir);
+    text.lines()
+        .skip(1)
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The `type` tags of a session file's records, in order.
+fn record_types(dir: &Path) -> Vec<String> {
+    session_records(dir)
+        .iter()
+        .map(|record| record["type"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A one-line session (user prompt + fixed answer) written by hand, for
+/// `--resume NAME` to continue.
+fn write_session(dir: &Path, name: &str) {
+    let sessions = dir.join(".clanky/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let line = concat!(
+        r#"{"type":"header","version":1,"created":0,"provider":"hello-world","model":"hello-world/tiny"}"#,
+        "\n",
+        r#"{"type":"user","text":"run it"}"#,
+        "\n",
+        r#"{"type":"assistant","text":"It said: echoed.","calls":[]}"#,
+        "\n"
+    );
+    let line = line.replace("\\n", "\n");
+    std::fs::write(sessions.join(format!("{name}.jsonl")), line).unwrap();
+}
+
+/// Run the recorded conversation against `TOOL_PLUGIN`'s plugin and
+/// return the model-side messages of the first chat request (the one
+/// whose turn consumed a resumed session's history).
+fn first_request_messages(dir: &Path, args: &[&str]) -> serde_json::Value {
+    let output = run_clanky(dir, args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The plugin dumps each chat request's messages as a JSON line; the
+    // plugin itself only prints it on stderr in debug mode.
+    let dump = stderr
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .unwrap_or_else(|| panic!("no request dump on stderr: {stderr}"));
+    serde_json::from_str(dump).expect("request dump is valid JSON")
+}
+
+#[test]
+fn print_mode_records_the_same_records_a_tui_run_would() {
+    // The tool-call transcript (thinking, call, result, final answer,
+    // usage): every record type the recorder maps from a turn.
+    let dir = plugin_dir("hello-world", TOOL_PLUGIN);
+    let output = run_clanky(&dir, &["--provider", "hello-world", "-p", "run it"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "clanky failed: {:?}\nstderr: {stderr}",
+        output.status
+    );
+    let records = session_records(&dir);
+    let types: Vec<&str> = records
+        .iter()
+        .map(|r| r["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "user",
+            "thinking",
+            "assistant",
+            "toolResult",
+            "assistant",
+            "usage"
+        ],
+        "the tool-loop transcript is recorded completely: {records:?}"
+    );
+    assert_eq!(records[0]["text"], "run it");
+    assert_eq!(records[1]["text"], "let me check");
+    assert_eq!(
+        records[2]["calls"][0]["name"], "bash",
+        "the round's tool call is recorded: {records:?}"
+    );
+    assert_eq!(records[3]["output"], "42");
+    assert_eq!(records[4]["text"], "The tool ran.");
+    assert_eq!(records[5]["promptTokens"], 4);
+    assert_eq!(records[5]["completionTokens"], 2);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_mid_stream_error_flushes_the_partial_round() {
+    // The provider dies mid-round after streaming thinking and text: the
+    // turn fails but nothing the user saw may be lost from the file —
+    // the same consolidated partial flush the TUI writes, before the
+    // error record.
+    let dir = plugin_dir("hello-world", HALF_STREAM_PLUGIN);
+    let output = run_clanky(&dir, &["--provider", "hello-world", "-p", "go"]);
+    assert!(
+        !output.status.success(),
+        "the provider error must surface as a failure: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("timed out reading response"),
+        "the provider's error message reaches the user: {stderr}"
+    );
+
+    let records = session_records(&dir);
+    let types: Vec<&str> = records
+        .iter()
+        .map(|r| r["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        ["user", "thinking", "assistant", "error"],
+        "partial round flushed, then the error record: {records:?}"
+    );
+    assert_eq!(records[1]["text"], "let me thi");
+    assert_eq!(records[2]["text"], "The an");
+    assert_eq!(records[2]["calls"], serde_json::json!([]));
+    let error = records[3]["message"].as_str().unwrap();
+    assert!(
+        error.contains("timed out reading response"),
+        "the error record carries the failure: {error}"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn no_session_leaves_no_file_in_either_mode() {
+    // Print mode.
+    let dir = plugin_dir("hello-world", PLUGIN);
+    let output = run_clanky(
+        &dir,
+        &["--provider", "hello-world", "-p", "--no-session", "hi"],
+    );
+    assert!(output.status.success(), "pipe run failed");
+    assert!(
+        !dir.join(".clanky/sessions").exists(),
+        "--no-session must not create the sessions directory"
+    );
+    std::fs::remove_dir_all(dir).ok();
+
+    // TUI mode: no session file may appear either. The TUI cannot run
+    // without a terminal, so the file-creation logic is what is exercised
+    // here through the same setting path main uses for both front ends.
+    let dir = plugin_dir("hello-world", PLUGIN);
+    let output = run_clanky(&dir, &["--provider", "hello-world", "--no-session", "hi"]);
+    assert!(
+        output.status.success(),
+        "clanky failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dir.join(".clanky/sessions").exists(),
+        "--no-session must not create the sessions directory"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn resume_in_pipe_mode_continues_a_session_and_appends() {
+    let dir = plugin_dir("hello-world", TOOL_PLUGIN);
+    write_session(&dir, "saved");
+
+    // Continue it: the note goes to stderr, the answer to stdout, and
+    // the records append to the same file.
+    let output = run_clanky(
+        &dir,
+        &[
+            "--provider",
+            "hello-world",
+            "-p",
+            "--resume",
+            "saved",
+            "and again",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "clanky failed: {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status
+    );
+    assert_eq!(
+        stdout.trim(),
+        "The tool ran.",
+        "stdout stays a clean stream of the answer: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("resuming `saved`") && stderr.contains("2 records"),
+        "stderr notes what is being continued: {stderr}"
+    );
+
+    // The resumed file holds the old records plus this turn's.
+    let records = session_records(&dir);
+    let texts: Vec<&str> = records
+        .iter()
+        .filter(|r| r["type"] == "user")
+        .filter_map(|r| r["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["run it", "and again"], "appended: {records:?}");
+    assert!(
+        records.iter().any(|r| r["text"] == "The tool ran."),
+        "the new turn's answer is in the same file: {records:?}"
+    );
+
+    // The header was not rewritten (no duplicate): exactly one header line.
+    let (_, text) = single_session(&dir);
+    assert_eq!(
+        text.matches(r#""type":"header""#).count(),
+        1,
+        "reopen appends, it does not re-head: {text}"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn resume_in_pipe_mode_sends_the_full_prior_context() {
+    // The plugin dumps each chat request's messages, so the wire itself
+    // can be checked: a resumed turn must carry the prior conversation.
+    let dir = plugin_dir("hello-world", TOOL_PLUGIN);
+    write_session(&dir, "saved");
+    let output = run_clanky(
+        &dir,
+        &[
+            "--provider",
+            "hello-world",
+            "-p",
+            "--resume",
+            "saved",
+            "and again",
+        ],
+    );
+    assert!(output.status.success());
+    // TOOL_PLUGIN answers the second-style prompt ("and again") with the
+    // final-round branch, so the first request's messages are the
+    // resumed context; the dump records the request's messages array.
+    let dump = {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        stderr
+            .lines()
+            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .expect("the plugin dumped the chat request")
+    };
+    let messages = dump["messages"].as_array().expect("messages array");
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        ["system", "user", "assistant", "user"],
+        "system context fresh, records' history, then the new prompt: {messages:?}"
+    );
+    assert_eq!(messages[1]["content"], "run it");
+    assert_eq!(messages[2]["content"], "It said: echoed.");
+    assert_eq!(messages[3]["content"], "and again");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn resume_with_a_missing_session_fails_the_same_way_in_both_modes() {
+    let dir = plugin_dir("hello-world", PLUGIN);
+    for extra in [&[][..], &["-p"][..]] {
+        let output = run_clanky(
+            &dir,
+            &["--provider", "hello-world", "--resume", "nosuch"]
+                .iter()
+                .chain(extra.iter())
+                .map(|s| *s)
+                .chain(["hi"])
+                .collect::<Vec<_>>(),
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no session named `nosuch` in .clanky/sessions"),
+            "one shared message expected; stderr: {stderr}"
+        );
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

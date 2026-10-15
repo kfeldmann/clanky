@@ -22,6 +22,7 @@ use clanky_protocol::{
 use serde_json::{Value, json};
 
 /// One scripted provider response.
+#[derive(Clone)]
 struct ScriptedTurn {
     chunks: Vec<ChunkPayload>,
     finish_reason: FinishReason,
@@ -419,4 +420,153 @@ fn sampling_and_thinking_are_plumbed_through_every_round() {
         assert_eq!(request["sampling"]["temperature"].as_f64(), Some(0.7));
         assert_eq!(request["thinking"]["budgetTokens"], 2048);
     }
+}
+
+/// A `-p` run and a TUI run over the same transcript must leave the same
+/// session records (M14): print mode feeds its turn events through the same
+/// shared recorder the TUI uses, records the prompt the same way, and closes
+/// the turn with the same `record_done`. This drives both front ends'
+/// recording wirings over one event stream (the tool-loop transcript, so
+/// thinking, tool calls, results, and usage all occur) and pins the joint
+/// records as a golden: any change to either front end's wiring or to the
+/// recorder's event mapping that makes one diverge from the other fails
+/// here. `created` is stamped at write time in production, so the records
+/// (not the header) are what the golden pins.
+///
+/// Regenerate with: `CLANKY_UPDATE_GOLDEN=1 cargo test --test golden`
+#[test]
+fn pipe_and_tui_session_records_match_golden() {
+    use clanky::recorder::{self, Recorder};
+    use clanky::session::Record;
+
+    let script = vec![
+        // Round 1: streamed thinking, then a tool call.
+        ScriptedTurn {
+            chunks: [
+                vec![ChunkPayload::Thinking {
+                    text: "Running the tool.".into(),
+                }],
+                vec![ChunkPayload::Text {
+                    text: "Let me use the tool.".into(),
+                }],
+                tool_call_chunks("call_1", "fake", r#"{"input": "hello"}"#),
+            ]
+            .concat(),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                prompt_tokens: Some(12),
+                completion_tokens: Some(9),
+                cached_tokens: None,
+            }),
+        },
+        // Round 2: the final answer.
+        text_turn("The tool said: fake ran with input=hello"),
+    ];
+
+    // Print mode's recording wiring (main::run_pipe): a fresh recorder,
+    // the user prompt recorded before the turn, every turn event through
+    // `record_turn_event`, then `record_done` for the terminal state.
+    let pipe_dir = temp_session_dir("pipe");
+    let mut pipe_recorder =
+        Recorder::with_dir(pipe_dir.clone(), "session", "deepinfra", Some("mock/model"));
+    pipe_recorder.record(
+        &mut NoSink,
+        Record::User {
+            text: "use the tool on hello".into(),
+        },
+    );
+    let (provider, _requests) = ScriptedProvider::new(script.clone());
+    let mut pipe_messages = vec![ChatMessage::user("use the tool on hello")];
+    let pipe_output = run_turn(
+        Box::new(provider),
+        &fake_tools(),
+        &mut pipe_messages,
+        &config(),
+        &mut |event| {
+            recorder::record_turn_event(&mut pipe_recorder, &mut NoSink, &event);
+        },
+    )
+    .unwrap();
+    pipe_recorder.record_done(&mut NoSink, &Ok(pipe_output.clone()));
+
+    // The TUI's recording wiring (event_loop): the same recorder type fed
+    // the same sequence — prompt record, per-event records, `record_done`.
+    let tui_dir = temp_session_dir("tui");
+    let mut tui_recorder =
+        Recorder::with_dir(tui_dir.clone(), "session", "deepinfra", Some("mock/model"));
+    tui_recorder.record(
+        &mut NoSink,
+        Record::User {
+            text: "use the tool on hello".into(),
+        },
+    );
+    let (provider, _requests) = ScriptedProvider::new(script);
+    let mut tui_messages = vec![ChatMessage::user("use the tool on hello")];
+    let tui_output = run_turn(
+        Box::new(provider),
+        &fake_tools(),
+        &mut tui_messages,
+        &config(),
+        &mut |event| {
+            recorder::record_turn_event(&mut tui_recorder, &mut NoSink, &event);
+        },
+    )
+    .unwrap();
+    tui_recorder.record_done(&mut NoSink, &Ok(tui_output));
+
+    // Both files hold the same records.
+    let pipe_records = written_records(&mut pipe_recorder);
+    let tui_records = written_records(&mut tui_recorder);
+    assert_eq!(pipe_records, tui_records, "front ends must agree");
+
+    let transcript = json!({
+        "records": pipe_records,
+        "output": {
+            "text": pipe_output.text,
+            "finishReason": pipe_output.finish_reason,
+            "usage": pipe_output.usage,
+        },
+    });
+    compare_or_update("session-records", &transcript);
+    std::fs::remove_dir_all(pipe_dir).ok();
+    std::fs::remove_dir_all(tui_dir).ok();
+}
+
+/// The records the recorder has on disk so far (its session file exists
+/// after the first record).
+fn written_records(recorder: &mut clanky::recorder::Recorder) -> Vec<Value> {
+    let file = recorder
+        .open_file()
+        .expect("recording recorder opened a session file")
+        .to_path_buf();
+    let data = clanky::session::load(&file).unwrap();
+    // The header carries the provider/model, like the TUI's files.
+    assert_eq!(data.header.provider.as_deref(), Some("deepinfra"));
+    assert_eq!(data.header.model.as_deref(), Some("mock/model"));
+    data.records
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap())
+        .collect()
+}
+
+/// Recorder sink for tests that expect no session-write failures.
+struct NoSink;
+impl clanky::recorder::ErrorSink for NoSink {
+    fn report(&mut self, message: String) {
+        panic!("unexpected session failure: {message}");
+    }
+}
+
+fn temp_session_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "clanky-golden-session-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
