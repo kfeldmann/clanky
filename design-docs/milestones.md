@@ -593,6 +593,24 @@ As built notes:
   is gone. The TUI's `load_session` took the path/name instead of a
   `SessionInfo` (that type stays for the `/resume` picker).
 
+## ☐ M15 — TUI markdown tables: box borders, fitted widths, wrapped cells
+The M3 table renderer draws tables as plain `|`-and-`-` markdown source rows
+at natural width, so the generic word-wrapper reflows them afterwards — in a
+narrow terminal a wide table becomes an unreadable tangle of border fragments
+interleaved with cell content. Rework `render_table` to draw real tables:
+box-drawing borders (`┌─┬┐`/`│`/`├─┼┤`/`└─┴┘`), column widths fitted to the
+viewport (per-column word floors, proportional slack distribution when the
+natural table overflows), and cells word-wrapped to their column. Inter-row
+rules are always drawn (no opt-in). The width-fitting core is lifted nearly
+verbatim from the author's other ratatui program
+(`ptm-project-todo-manager`, MIT); the seam change is that
+`markdown::render` gains a `width` parameter and emits tables already
+fitted and wrapped, so the later generic `wrap()` pass stays a no-op on
+table rows (the invariant the scroll math rides on). Plan, copied-vs-adapted
+breakdown, and test plan: `tui-table-rendering-plan.md`.
+- Done when: a wide table renders as a bordered box that fits the
+  transcript width, with words intact inside their cells.
+
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming
    granularity, cancellation semantics, how `list-models` interacts with
