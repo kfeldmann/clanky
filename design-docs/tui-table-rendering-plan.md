@@ -1,6 +1,6 @@
 # Plan — TUI markdown tables: box borders, fitted widths, wrapped cells
 
-> **Status: planned.** Nothing implemented yet; this is the working plan.
+> **Status: implemented (M15).** See the M15 as-built notes in `milestones.md`.
 > Source: `ptm-project-todo-manager` `src/ui/markdown.rs`
 > (https://github.com/kfeldmann/ptm-project-todo-manager/blob/main/src/ui/markdown.rs),
 > the author's other ratatui program, now MIT-licensed (same license as

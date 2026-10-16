@@ -593,7 +593,7 @@ As built notes:
   is gone. The TUI's `load_session` took the path/name instead of a
   `SessionInfo` (that type stays for the `/resume` picker).
 
-## ☐ M15 — TUI markdown tables: box borders, fitted widths, wrapped cells
+## ☑ M15 — TUI markdown tables: box borders, fitted widths, wrapped cells
 The M3 table renderer draws tables as plain `|`-and-`-` markdown source rows
 at natural width, so the generic word-wrapper reflows them afterwards — in a
 narrow terminal a wide table becomes an unreadable tangle of border fragments
@@ -610,6 +610,45 @@ table rows (the invariant the scroll math rides on). Plan, copied-vs-adapted
 breakdown, and test plan: `tui-table-rendering-plan.md`.
 - Done when: a wide table renders as a bordered box that fits the
   transcript width, with words intact inside their cells.
+
+
+As built notes:
+- `render_table` is a near-verbatim lift of ptm-project-todo-manager's
+  column-sizing core (word floors, natural pass, proportional slack
+  distribution / proportional floor-scaling on overflow), with the indent
+  term dropped. Cells are Clanky's styled spans: rendering, wrapping
+  (`wrap_chars`), alignment padding, and style plumbing all stay on the
+  existing machinery — no port of ptm's `word_wrap_cell`, and one wrapping
+  code path for the module.
+- ptm's opt-in inter-row separator feature (repeated delimiter row +
+  lighter body-separator style) is not ported; Clanky draws `├─┼┤` after
+  every row except the last, in the border color. A rule lands after the
+  *logical* row: a row whose cells wrap to several physical lines gets
+  exactly one rule after its last line.
+- ptm's one-span-per-cell emit (`" {cell} "` as one string) became
+  explicit pad/content spans so per-char styles survive: a bold or
+  code-styled cell never repaints the column padding around it, and a
+  cell split across physical rows keeps its style on every line.
+- Degenerate widths behave per plan: when even 1-char columns can't fit
+  (`avail` clamped to `col_count`), the box still renders at w=1 and the
+  generic `wrap()` splits the over-long rows; `print_line` truncates.
+  The table tests pin both the degradation path and the no-panic
+  invariant; nothing in the code special-cases it beyond the clamp.
+- `markdown::render(text, base, width)` gained the width parameter; the
+  two `app.rs` call sites (`Entry::Assistant`, `Entry::Thinking`) pass
+  their `entry_lines` width. Tables therefore come out of `render`
+  already fitted and wrapped (every row ≤ width), and the generic
+  `wrap()` pass after is a no-op on them — pinned by
+  `assistant_table_fits_width_without_rewrapping` in `app.rs` (each box
+  row starts with a border char and fits, so no re-split happened).
+- Streaming/resize behave as planned: a table appears as plain text
+  until the delimiter row arrives, then re-draws as a growing box each
+  frame; a committed table keeps its fit-time width after a resize
+  (scrollback is never rewritten).
+- README "Rendering notes" gained a bullet on the box borders, fitting,
+  and wrapped cells; the plan doc `tui-table-rendering-plan.md` is left
+  as the record of the port. Golden fixtures contain no tables; the
+  golden suite passes unchanged.
 
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming

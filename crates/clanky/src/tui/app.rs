@@ -878,7 +878,7 @@ impl App {
             Entry::Assistant(text) => {
                 let trimmed = text.trim_end_matches(['\n', '\r']);
                 lines.extend(markdown::wrap(
-                    &markdown::render(trimmed, Style::new()),
+                    &markdown::render(trimmed, Style::new(), width),
                     width,
                 ));
                 lines.push(Line::default());
@@ -887,7 +887,7 @@ impl App {
                 let base = Style::new()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC);
-                lines.extend(markdown::wrap(&markdown::render(text, base), width));
+                lines.extend(markdown::wrap(&markdown::render(text, base, width), width));
                 lines.push(Line::default());
             }
             // A collapsed thinking block: one placeholder line, so the
@@ -1639,6 +1639,41 @@ mod tests {
             other => panic!("expected a tool call entry, got {other:?}"),
         };
         assert!(full.contains(&long));
+    }
+
+    #[test]
+    fn assistant_table_fits_width_without_rewrapping() {
+        use unicode_width::UnicodeWidthStr as _;
+        let mut app = App::new();
+        app.entries.push(Entry::Assistant(
+            "| aaa | bbb | ccc |\n| -- | -- | -- |\n| longwordhere | x | y |".into(),
+        ));
+        let lines = app.entry_lines(0, 40);
+        // Every table row keeps the full box borders: the later generic
+        // `wrap()` must not re-split any row the table renderer emitted
+        // (it would break the box into border fragments).
+        let table_rows: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|l| {
+                let t: String = l.spans.iter().map(|s| s.content.to_string()).collect();
+                t.contains('┌') || t.contains('└') || t.contains('│') || t.contains('├')
+            })
+            .collect();
+        assert_eq!(table_rows.len(), 5, "a bordered box: {lines:?}");
+        for line in &table_rows {
+            let t: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+            let w: usize = t.width();
+            assert!(w <= 40, "row of width {w}: {t:?}");
+            // A border fragment from re-wrapping would start mid-box.
+            assert!(
+                t.starts_with('┌')
+                    || t.starts_with('└')
+                    || t.starts_with('│')
+                    || t.starts_with('├'),
+                "row starts with a border char: {t:?}"
+            );
+        }
+        assert_eq!(lines.last().unwrap().spans.len(), 0, "trailing separator");
     }
 
     #[test]

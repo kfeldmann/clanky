@@ -361,6 +361,14 @@ post-quit history all work. Two details of that model are visible:
   follow-up behaviors differ across terminals (and GNU `screen` defers
   displaying a character written there until the screen scrolls), so the
   renderer reserves it and the last column stays blank.
+- Markdown tables render as boxes with box-drawing borders
+  (`┌─┬┐`/`│`/`├─┼┤`/`└┴┘`) instead of plain pipe rows, with inter-row rules
+  always drawn. Column widths are fitted to the transcript width (each
+  column keeps at least its longest word; extra space is distributed
+  proportionally), and cells word-wrap inside their column, so a wide
+  table in a narrow terminal stays readable instead of tangling with
+  the generic word-wrapper. A table is fitted to the width when it is
+  printed; resizing does not rewrite scrollback.
 - Resizing, returning from `$EDITOR`, and clearing redraw the bottom
   region in place; nothing is pushed into scrollback by a redraw.
 - Multi-line input (paste, `$EDITOR`) renders as one row per line,
