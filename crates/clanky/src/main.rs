@@ -333,6 +333,9 @@ impl PrintSink {
         let ws = &delta[trimmed.len()..];
         if !self.pending_ws.is_empty() && !trimmed.is_empty() {
             write!(w, "{}", self.pending_ws).ok();
+            // The held whitespace has now been emitted; drop it so it is
+            // not re-emitted before every later delta.
+            self.pending_ws.clear();
         }
         if !trimmed.is_empty() {
             write!(w, "{trimmed}").ok();
@@ -453,6 +456,32 @@ mod tests {
             ],
         );
         assert_eq!(out, "a\nb\n\n");
+    }
+
+    #[test]
+    fn held_whitespace_is_not_re_emitted_before_every_later_delta() {
+        // Regression: reasoning models often stream paragraph breaks at
+        // delta granularity — a chunk ends in `\n\n` and the next chunk
+        // carries the following words. The held whitespace must come out
+        // once, not be re-emitted before every later delta.
+        let (out, _) = run_events(
+            false,
+            &[
+                TurnEvent::Text {
+                    delta: "para one\n\n".into(),
+                },
+                TurnEvent::Text {
+                    delta: "more".into(),
+                },
+                TurnEvent::Text {
+                    delta: " words".into(),
+                },
+                TurnEvent::Text {
+                    delta: " here".into(),
+                },
+            ],
+        );
+        assert_eq!(out, "para one\n\nmore words here\n\n");
     }
 
     #[test]
