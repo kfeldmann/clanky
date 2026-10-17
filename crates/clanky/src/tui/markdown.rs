@@ -352,11 +352,14 @@ fn render_table(
 
     // Render cells first (styles), then measure. A missing cell is empty,
     // so short rows still line up with the delimiter's column count.
-    let render_row = |cells: &[&str]| -> Vec<Vec<(char, Style)>> {
+    // Header cells render with a bold base so their text (and any inline
+    // styling inside it) is bold; body cells use the plain base. The
+    // padding spans below use `cell_s` for the same reason.
+    let render_row = |cells: &[&str], style: Style| -> Vec<Vec<(char, Style)>> {
         (0..col_count)
             .map(|c| {
                 let raw = cells.get(c).map(|s| unescape_pipes(s)).unwrap_or_default();
-                inline(&raw, base)
+                inline(&raw, style)
                     .into_iter()
                     .flat_map(|span| {
                         span.content
@@ -368,8 +371,10 @@ fn render_table(
             })
             .collect()
     };
-    let header_cells = render_row(header);
-    let body_cells: Vec<Vec<Vec<(char, Style)>>> = body.iter().map(|r| render_row(r)).collect();
+    let header_style = base.add_modifier(Modifier::BOLD);
+    let header_cells = render_row(header, header_style);
+    let body_cells: Vec<Vec<Vec<(char, Style)>>> =
+        body.iter().map(|r| render_row(r, base)).collect();
     let all_rows: Vec<&Vec<Vec<(char, Style)>>> = std::iter::once(&header_cells)
         .chain(body_cells.iter())
         .collect();
@@ -989,6 +994,32 @@ mod tests {
         assert!(bolds[3], "first body line bold: {bolds:?}");
         assert!(bolds[4], "second body line bold: {bolds:?}");
         assert!(!bolds[0] && !bolds[2], "borders stay dim: {bolds:?}");
+    }
+
+    #[test]
+    fn table_header_text_is_bold() {
+        let md = "| a | b |\n| -- | -- |\n| x | y |";
+        let lines = render(md, Style::new(), 40);
+        let texts: Vec<String> = lines.iter().map(|l| span_text(&l.spans)).collect();
+        // Row 1 is the header; its text spans carry bold, its padding and
+        // the borders do not.
+        let header_bolds: Vec<bool> = lines[1]
+            .spans
+            .iter()
+            .map(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .collect();
+        assert!(
+            header_bolds.iter().any(|&b| b) && !header_bolds.iter().all(|&b| b),
+            "header text bold, padding not: {header_bolds:?}"
+        );
+        assert_eq!(texts[1], "│ a │ b │");
+        // Body rows stay unbold, including their padding.
+        assert!(
+            !lines[3]
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
     }
 
     #[test]
