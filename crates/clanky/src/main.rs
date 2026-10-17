@@ -263,6 +263,11 @@ impl PrintSink {
                 // The thinking text ends when the answer text (or the
                 // next event) starts; close that block first.
                 self.close_text(out);
+                if !self.in_thinking {
+                    // Every thinking block opens with the prefix, so the
+                    // stderr stream visibly marks where thinking starts.
+                    write!(err, "> ").ok();
+                }
                 self.in_thinking = true;
                 self.hold_ws(err, delta);
             }
@@ -285,7 +290,7 @@ impl PrintSink {
                 }
                 writeln!(
                     err,
-                    "  ↻ {message} — retrying in {:.1}s ({attempt}/{max_retries})",
+                    "INFO: ↻ {message} — retrying in {:.1}s ({attempt}/{max_retries})",
                     delay.as_secs_f64()
                 )
                 .ok();
@@ -300,7 +305,7 @@ impl PrintSink {
                     return;
                 }
                 let preview = tools::truncate_call_arguments(&arguments, tools::CALL_PREVIEW_CHARS);
-                writeln!(err, "● {name} {preview}").ok();
+                writeln!(err, "INFO: ● {name} {preview}").ok();
                 writeln!(err).ok();
             }
             TurnEvent::ToolResult { name, output } => {
@@ -313,7 +318,7 @@ impl PrintSink {
                 // output character, newlines kept (never collapsed into
                 // a symbol), preview capped at a few lines.
                 let preview = tools::preview_result(&output, tools::RESULT_PREVIEW_LINES);
-                let marker = "  └─ ";
+                let marker = "INFO:   └─ ";
                 let mut lines = preview.lines();
                 let head = lines.next().unwrap_or("");
                 let indent = " ".repeat(marker.chars().count() + name.chars().count() + 2);
@@ -410,7 +415,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(err, "hmm\n\n");
+        assert_eq!(err, "> hmm\n\n");
     }
 
     #[test]
@@ -425,7 +430,7 @@ mod tests {
                 TurnEvent::Text { delta: "x".into() },
             ],
         );
-        assert_eq!(err, "a\nb\n\n");
+        assert_eq!(err, "> a\nb\n\n");
     }
 
     #[test]
@@ -508,7 +513,7 @@ mod tests {
             ],
         );
         assert_eq!(out, "let me check\n\ndone\n\n");
-        assert_eq!(err, "● bash {}\n\n  └─ bash: ok\n\n");
+        assert_eq!(err, "INFO: ● bash {}\n\nINFO:   └─ bash: ok\n\n");
     }
 
     #[test]
@@ -531,7 +536,7 @@ mod tests {
             ],
         );
         assert_eq!(out, "first\n\nsecond\n\n");
-        assert_eq!(err, "hmm\n\n");
+        assert_eq!(err, "> hmm\n\n");
     }
 
     #[test]
@@ -558,7 +563,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
         );
-        assert_eq!(err, "● bash {}\n\n");
+        assert_eq!(err, "INFO: ● bash {}\n\n");
     }
 
     #[test]
@@ -570,7 +575,7 @@ mod tests {
                 output: "aaa\nbbb".into(),
             }],
         );
-        assert_eq!(err, "  └─ bash: aaa\n           bbb\n\n");
+        assert_eq!(err, "INFO:   └─ bash: aaa\n                 bbb\n\n");
     }
 
     #[test]

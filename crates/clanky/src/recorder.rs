@@ -345,7 +345,7 @@ pub struct StderrErrors;
 
 impl ErrorSink for StderrErrors {
     fn report(&mut self, message: String) {
-        eprintln!("{message}");
+        eprintln!("ERROR: {message}");
     }
 }
 
