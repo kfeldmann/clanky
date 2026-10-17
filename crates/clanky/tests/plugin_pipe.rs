@@ -386,7 +386,8 @@ fn print_mode_records_the_same_records_a_tui_run_would() {
             "assistant",
             "toolResult",
             "assistant",
-            "usage"
+            "usage",
+            "stopReason"
         ],
         "the tool-loop transcript is recorded completely: {records:?}"
     );
@@ -400,6 +401,10 @@ fn print_mode_records_the_same_records_a_tui_run_would() {
     assert_eq!(records[4]["text"], "The tool ran.");
     assert_eq!(records[5]["promptTokens"], 4);
     assert_eq!(records[5]["completionTokens"], 2);
+    assert_eq!(
+        records[6]["reason"], "stop",
+        "the turn's stop reason is the last record: {records:?}"
+    );
     std::fs::remove_dir_all(dir).ok();
 }
 
@@ -430,7 +435,8 @@ fn a_mid_stream_error_flushes_the_partial_round() {
     assert_eq!(
         types,
         ["user", "thinking", "assistant", "error"],
-        "partial round flushed, then the error record: {records:?}"
+        "partial round flushed, then the error record (no stopReason — \
+the turn never reached its terminal `done`): {records:?}"
     );
     assert_eq!(records[1]["text"], "let me thi");
     assert_eq!(records[2]["text"], "The an");

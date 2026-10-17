@@ -49,6 +49,10 @@
       "completionTokens": 3,
       "promptTokens": 7,
       "type": "usage"
+    },
+    {
+      "reason": "stop",
+      "type": "stopReason"
     }
   ]
 }

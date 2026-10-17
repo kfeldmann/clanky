@@ -154,6 +154,7 @@ impl Recorder {
                     created: 0,
                     provider: Some("mock".into()),
                     model: Some("mock/model".into()),
+                    stop_reason: None,
                 },
             ),
         }
@@ -199,6 +200,52 @@ impl Recorder {
             self.writer.append(&session::usage_record(usage)).unwrap();
         }
     }
+}
+
+/// A completed turn leaves the `stopReason` record (then stamps the
+/// header); an interrupted turn leaves an `error` record instead. This is
+/// the M14 acceptance shape: drive the real loop, record the way the
+/// front ends do.
+#[test]
+fn completed_turn_records_its_stop_reason() {
+    let dir = temp_dir("stop-reason");
+    let path = dir.join("session.jsonl");
+    let mut recorder = Recorder::new(path.clone());
+    let tools: clanky::tools::ToolSet = vec![Box::new(EchoTool)];
+    let mut messages = vec![ChatMessage::user("run it")];
+    recorder
+        .writer
+        .append(&Record::User {
+            text: "run it".into(),
+        })
+        .unwrap();
+    let output = run_turn(
+        Box::new(ScriptedProvider {
+            requests: std::rc::Rc::new(RefCell::new(Vec::new())),
+            script: RefCell::new(VecDeque::from(vec![text_round("done.")])),
+        }),
+        &tools,
+        &mut messages,
+        &config(),
+        &mut |event| recorder.on_turn_event(&event),
+    )
+    .unwrap();
+    // The terminal record: the recorder writes usage (already emitted as
+    // events) plus the turn's stop reason.
+    recorder
+        .writer
+        .append(&session::stop_reason_record(output.finish_reason))
+        .unwrap();
+    drop(recorder);
+    let data = session::load(&path).unwrap();
+    assert_eq!(
+        data.records.last(),
+        Some(&Record::StopReason {
+            reason: "stop".into()
+        }),
+        "the turn's stop reason is the last record"
+    );
+    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -371,6 +418,7 @@ fn markdown_export_covers_the_session_and_honors_its_flags() {
             created: 1_700_000_000_000,
             provider: Some("deepinfra".into()),
             model: Some("mock/model".into()),
+            stop_reason: None,
         },
     );
     for record in &records {

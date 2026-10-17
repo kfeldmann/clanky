@@ -97,8 +97,6 @@ decisions made during implementation. Check them before redesigning something.
   binary; `./run` executes it (requires `DEEPINFRA_TOKEN` or
   `LITELLM_API_KEY`).
 
-**Warning:** Today we're working from an NFS volume, so a full release build takes over 35 minutes! You may want to target your tests and builds to only the component you're changing.
-
 ## Environment variables
 
 - DeepInfra: `DEEPINFRA_API_KEY` (fallback `DEEPINFRA_TOKEN`), optional

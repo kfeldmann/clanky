@@ -141,6 +141,7 @@ impl Recorder {
             created: session::now_millis(),
             provider: Some(self.provider.clone()),
             model: self.model.clone(),
+            stop_reason: None,
         }
     }
 
@@ -215,6 +216,7 @@ impl Recorder {
                     created: 0, // stamped when the file is created
                     provider: Some(self.provider.clone()),
                     model: self.model.clone(),
+                    stop_reason: None,
                 },
             ));
         }
@@ -262,20 +264,28 @@ impl Recorder {
 
     /// Record the turn's terminal state: anything the last round streamed
     /// without completing is consolidated and written first (content,
-    /// then the error), as on screen.
+    /// then the error), as on screen. A turn that reached its terminal
+    /// `done` also appends a `stopReason` record; a turn that failed gets
+    /// an `error` record instead — the terminal record says which way the
+    /// turn ended.
     pub fn record_done(
         &mut self,
         errors: &mut dyn ErrorSink,
         result: &Result<crate::turn::TurnOutput>,
     ) {
         self.flush_partial(errors);
-        if let Err(err) = result {
-            self.record(
-                errors,
-                session::Record::Error {
-                    message: err.to_string(),
-                },
-            );
+        match result {
+            Ok(output) => {
+                self.record(errors, session::stop_reason_record(output.finish_reason));
+            }
+            Err(err) => {
+                self.record(
+                    errors,
+                    session::Record::Error {
+                        message: err.to_string(),
+                    },
+                );
+            }
         }
     }
 }

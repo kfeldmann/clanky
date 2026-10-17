@@ -557,6 +557,10 @@ impl App {
                         completion_tokens.unwrap_or(0),
                     );
                 }
+                // Metadata, not conversation content: usage is applied
+                // round-by-round through [`TurnEvent::Usage`], and the
+                // stop reason has no transcript entry of its own.
+                Record::StopReason { .. } => {}
             }
         }
         crate::session::history_from_records(records)

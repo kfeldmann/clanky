@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,6 +57,12 @@ pub struct Header {
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The last turn's stop reason (why it ended), stamped when the turn
+    /// completes and rewritten by the next one. Absent in files that never
+    /// finished a turn (created but left idle, or a turn interrupted before
+    /// the terminal `done`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stop_reason: Option<String>,
 }
 
 /// One conversation event. Serialized with a `"type"` tag (camelCase
@@ -93,6 +99,13 @@ pub enum Record {
     },
     /// A turn or write error, kept so the transcript survives resume.
     Error { message: String },
+    /// Why a turn ended (`FinishReason`, protocol §8), appended when the
+    /// turn's terminal `done` arrives — the last record of a completed
+    /// turn, after its content, tool results, and usage. A turn cut short
+    /// by an error writes an `error` record instead. A field with no
+    /// session meaning (for example `toolCalls`, the tool loop's
+    /// keep-going signal) is still recorded as the backend reported it.
+    StopReason { reason: String },
 }
 
 /// One parsed session file.
@@ -145,15 +158,32 @@ impl SessionWriter {
     }
 
     /// A writer that continues an existing session file (no new header).
+    /// The file's own header line is read so a later
+    /// [`SessionWriter::set_stop_reason`] rewrites it with what is already
+    /// there plus the new reason; if the file cannot be read it may have
+    /// vanished, so the plain fresh-header defaults stand and the next
+    /// file creation stamps them.
     pub fn reopen(path: PathBuf) -> Self {
-        Self {
-            path,
-            header: Header {
+        let header = std::fs::read(&path)
+            .ok()
+            .and_then(|all| all.split(|&b| b == b'\n').next().map(|line| line.to_vec()))
+            .filter(|line| !line.is_empty())
+            .and_then(|line| serde_json::from_slice::<Value>(&line).ok())
+            .filter(|value| value.get("type").and_then(Value::as_str) == Some("header"))
+            .and_then(|value| serde_json::from_value::<Header>(value).ok())
+            .unwrap_or(Header {
                 version: FORMAT_VERSION,
                 created: 0,
                 provider: None,
                 model: None,
-            },
+                // No readable header to carry the field; the defaults
+                // above only matter if the file vanished and a fresh one
+                // is created, which has no last turn yet.
+                stop_reason: None,
+            });
+        Self {
+            path,
+            header,
             mode: Mode::Reopen,
             file: None,
         }
@@ -161,6 +191,62 @@ impl SessionWriter {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Stamp the file header's `stopReason` with the just-finished turn's
+    /// stop reason. If the file has not been created yet there is nothing
+    /// to stamp (a session with no records has no last turn); the pending
+    /// value is kept anyway, so the field lands on the header when the
+    /// first record creates the file.
+    pub fn set_stop_reason(&mut self, reason: clanky_protocol::FinishReason) {
+        self.header.stop_reason = Some(reason.as_str().to_string());
+        // The file may not be open yet (the writer lazily creates it on
+        // the first record); there is then no header line to rewrite, and
+        // the in-memory header above is what the first file creation
+        // stamps.
+        if self.file.is_none() {
+            if self.mode == Mode::Reopen && self.path.exists() {
+                match OpenOptions::new().read(true).write(true).open(&self.path) {
+                    Ok(file) => self.file = Some(file),
+                    Err(_) => return, // unreadable file: nothing to stamp
+                }
+            } else {
+                return;
+            }
+        }
+        let file = self.file.as_mut().expect("file opened above");
+        // Read the rest of the file, truncate after line 1, and write the
+        // updated header followed by what was there. The header line is
+        // rebuilt from the in-memory `header` — for `Mode::Reopen`,
+        // `reopen` seeded it from the file's own header line.
+        file.seek(std::io::SeekFrom::Start(0)).ok();
+        let mut rest = Vec::new();
+        let header_end = match file.read_to_end(&mut rest) {
+            Ok(_) => rest
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|nl| nl + 1)
+                .unwrap_or(0),
+            Err(_) => return,
+        };
+        let rest = rest.split_off(header_end);
+        if file
+            .set_len(0)
+            .and_then(|_| file.seek(std::io::SeekFrom::Start(0)))
+            .is_err()
+        {
+            return;
+        }
+        let mut value = serde_json::to_value(&self.header).expect("header serializes");
+        value["type"] = "header".into();
+        let header_line = serde_json::to_string(&value).expect("header is valid JSON") + "\n";
+        // Best effort: a failed rewrite leaves the header un-stamped; the
+        // next turn's stamp or the next append (a plain record) still
+        // writes whatever is writable.
+        let _ = file
+            .write_all(header_line.as_bytes())
+            .and_then(|_| file.write_all(&rest))
+            .and_then(|_| file.flush());
     }
 
     /// Append one record (the header first, on file creation) and flush,
@@ -404,7 +490,9 @@ pub fn load(path: &Path) -> Result<SessionData> {
         let kind = value.get("type").and_then(Value::as_str);
         if !matches!(
             kind,
-            Some("user" | "thinking" | "assistant" | "toolResult" | "usage" | "error")
+            Some(
+                "user" | "thinking" | "assistant" | "toolResult" | "usage" | "error" | "stopReason",
+            )
         ) {
             continue; // unknown record type: skip (forward compatibility)
         }
@@ -450,7 +538,10 @@ pub fn history_from_records(records: &[Record]) -> Vec<ChatMessage> {
     for record in records {
         match record {
             Record::User { text } => messages.push(ChatMessage::user(text)),
-            Record::Thinking { .. } | Record::Usage { .. } | Record::Error { .. } => {}
+            Record::Thinking { .. }
+            | Record::Usage { .. }
+            | Record::Error { .. }
+            | Record::StopReason { .. } => {}
             Record::Assistant { text, calls } => {
                 for call in calls {
                     awaiting.push_back(call.id.clone());
@@ -483,9 +574,19 @@ pub fn usage_record(usage: Usage) -> Record {
     }
 }
 
+/// Convenience: a turn's stop reason as a record (`reason` is
+/// `FinishReason::as_str`). Called with the turn's terminal `done`, once
+/// per completed turn.
+pub fn stop_reason_record(reason: clanky_protocol::FinishReason) -> Record {
+    Record::StopReason {
+        reason: reason.as_str().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clanky_protocol::FinishReason;
     use serde_json::json;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -532,6 +633,7 @@ mod tests {
                 created: 1_700_000_000_000,
                 provider: Some("deepinfra".into()),
                 model: Some("test/model".into()),
+                stop_reason: None,
             },
         );
         for record in records {
@@ -563,9 +665,80 @@ mod tests {
                 created: 0,
                 provider: None,
                 model: None,
+                stop_reason: None,
             },
         );
         assert!(!path.exists(), "no file before the first record");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn stop_reason_stamps_the_header_and_roundtrips() {
+        let dir = temp_dir("stop-reason");
+        let path = write_session(&dir, "reasoned", &sample_records());
+        let mut writer = SessionWriter::reopen(path.clone());
+        writer.set_stop_reason(FinishReason::Length);
+        writer
+            .append(&Record::User {
+                text: "next turn".into(),
+            })
+            .unwrap();
+        let data = load(&path).unwrap();
+        assert_eq!(data.header.stop_reason.as_deref(), Some("length"));
+        assert_eq!(
+            data.records.last(),
+            Some(&Record::User {
+                text: "next turn".into()
+            })
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn stop_reason_is_rewritten_by_the_next_turn() {
+        let dir = temp_dir("stop-reason-rewrite");
+        let path = write_session(&dir, "twice", &sample_records());
+        let mut writer = SessionWriter::reopen(path.clone());
+        writer.set_stop_reason(FinishReason::Stop);
+        writer.set_stop_reason(FinishReason::ToolCalls);
+        let data = load(&path).unwrap();
+        assert_eq!(
+            data.header.stop_reason.as_deref(),
+            Some("toolCalls"),
+            "the last turn's reason wins"
+        );
+        assert_eq!(
+            data.records,
+            sample_records(),
+            "stamping rewrites line 1 only"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unknown_stop_reason_record_types_are_skipped_forward_compat() {
+        // An older reader (before `stopReason` existed) skips the record;
+        // this reader loads it. Also pin that a stopReason record with a
+        // payload loads as `Record::StopReason`.
+        let dir = temp_dir("stop-reason-record");
+        let path = dir.join("record.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"header","version":1,"created":1}"#,
+                "\n",
+                r#"{"type":"stopReason","reason":"toolCalls"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let data = load(&path).unwrap();
+        assert_eq!(
+            data.records,
+            vec![Record::StopReason {
+                reason: "toolCalls".into()
+            }]
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

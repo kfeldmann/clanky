@@ -2227,6 +2227,7 @@ mod tests {
                 created: 1_700_000_000_000,
                 provider: Some("deepinfra".into()),
                 model: Some("mock/model".into()),
+                stop_reason: None,
             },
         );
         for record in [
@@ -2496,6 +2497,29 @@ mod tests {
                     message: "provider error: backend: timed out reading response".into()
                 },
             ]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_completed_turn_appends_the_stop_reason_record() {
+        // The terminal `done` of a successful turn becomes a `stopReason`
+        // record — the turn's last record, after usage.
+        let (mut state, dir) = recording_state("stop-reason");
+        state.record_done(
+            &mut NoErrors,
+            &Ok(TurnOutput {
+                text: "done".into(),
+                finish_reason: clanky_protocol::FinishReason::Stop,
+                usage: None,
+            }),
+        );
+        let data = session::load(&dir.join("session.jsonl")).unwrap();
+        assert_eq!(
+            data.records,
+            vec![session::Record::StopReason {
+                reason: "stop".into()
+            }]
         );
         std::fs::remove_dir_all(dir).ok();
     }

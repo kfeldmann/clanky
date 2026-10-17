@@ -80,6 +80,7 @@ pub fn render(
     out.push('\n');
 
     let mut saw_usage = false;
+    let mut saw_stop_reason: Option<String> = None;
     let mut wrote_anything = false;
     for record in records {
         match record {
@@ -133,6 +134,11 @@ pub fn render(
                 // Usage is summarized once, after the transcript.
                 saw_usage = true;
             }
+            Record::StopReason { reason } => {
+                // The last turn's stop reason is metadata, like usage:
+                // one footer line, not a transcript entry.
+                saw_stop_reason = Some(reason.clone());
+            }
         }
     }
 
@@ -143,6 +149,11 @@ pub fn render(
         out.push_str(&format!(
             "\n---\n\n_{}_\n",
             describe_usage(total_usage(records))
+        ));
+    }
+    if let Some(reason) = saw_stop_reason {
+        out.push_str(&format!(
+            "\n---\n\n_Last turn ended with stop reason `{reason}`._\n"
         ));
     }
     out
@@ -232,6 +243,7 @@ mod tests {
             created: 1_700_000_000_000,
             provider: Some("deepinfra".into()),
             model: Some("mock/model".into()),
+            stop_reason: None,
         }
     }
 

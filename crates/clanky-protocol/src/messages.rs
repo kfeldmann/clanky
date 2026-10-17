@@ -303,6 +303,20 @@ pub enum FinishReason {
     ContentFilter,
 }
 
+impl FinishReason {
+    /// The wire/file spelling of this reason (protocol §8). Also what a
+    /// session file's `stopReason` record and header field carry.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::ToolCalls => "toolCalls",
+            Self::Length => "length",
+            Self::Cancelled => "cancelled",
+            Self::ContentFilter => "contentFilter",
+        }
+    }
+}
+
 /// Error codes from the provider (spec §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
