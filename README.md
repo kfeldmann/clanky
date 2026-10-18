@@ -57,6 +57,7 @@ All fields are optional; unknown keys are rejected with a parse error.
 | `max_retries` | integer       | Retries for a retryable provider error (`0` = never retry; default `5`) |
 | `prompt`   | string           | Prompt text (mainly useful on the CLI, not in a file) |
 | `session`  | boolean          | `false` disables session recording in every mode (default: on) |
+| `project`  | string           | Label shown at the left of the TUI input prompt (TUI only) |
 
 Example:
 
@@ -371,6 +372,11 @@ post-quit history all work. Two details of that model are visible:
   printed; resizing does not rewrite scrollback.
 - Resizing, returning from `$EDITOR`, and clearing redraw the bottom
   region in place; nothing is pushed into scrollback by a redraw.
+- A `project` label (the `project` setting) prints at the left of the
+  input prompt: `project = "clanky"` renders the label before the
+  prompt symbol (idle: `clanky` + two spaces + symbol; streaming: the
+  dot is lit between them); unset, the prompt is unchanged.
+  Display-only (print mode ignores it).
 - Multi-line input (paste, `$EDITOR`) renders as one row per line,
   indented under the prompt symbol, so every line starts at the same
   column; each row scrolls horizontally to keep the caret visible, and

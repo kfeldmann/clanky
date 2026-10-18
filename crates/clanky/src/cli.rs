@@ -89,6 +89,7 @@ impl Cli {
             max_retries: self.max_retries,
             prompt,
             session: self.no_session.then_some(false),
+            project: None,
         }
     }
 }

@@ -121,6 +121,9 @@ pub struct Launch {
     /// `/resume` report that sessions are off, and the status line shows
     /// `(no session)`.
     pub recording: bool,
+    /// Project label printed at the left of the input prompt
+    /// (`project` setting; `None` = no label).
+    pub project: Option<String>,
 }
 
 impl Launch {
@@ -144,6 +147,7 @@ impl Launch {
                 .map(str::to_string),
             resume: None,
             recording: settings.record_sessions(),
+            project: settings.project.clone(),
         }
     }
 }
@@ -678,7 +682,7 @@ fn load_session(
 
 fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Result<()> {
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
-    let mut app = app::App::new();
+    let mut app = app::App::new(launch.project.clone());
     // Fresh session: seed the system context so the first turn sends it
     // (resumed sessions rebuild it inside `load_session`).
     app.history = crate::context::system_messages();
@@ -1650,7 +1654,7 @@ mod tests {
     fn ctrl_u_clears_from_cursor_to_start() {
         let mut cfg = launch();
         let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
         app.input = "hello".into();
@@ -1669,7 +1673,7 @@ mod tests {
     fn ctrl_t_toggles_thinking_display() {
         let mut cfg = launch();
         let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
 
@@ -1686,7 +1690,7 @@ mod tests {
 
     #[test]
     fn toggling_mid_stream_collapses_and_resumes() {
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         app.on_turn_event(TurnEvent::Thinking {
             delta: "one ".into(),
         });
@@ -1875,7 +1879,7 @@ mod tests {
         }];
         let mut launch = launch();
         launch.model = Some("mock/model".into());
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
 
         // Nothing billed and nothing estimated: no cost, no pricing-less
         // zero either.
@@ -2022,7 +2026,7 @@ mod tests {
     #[test]
     fn sampling_edits_apply_and_merge() {
         let mut cfg = launch();
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
 
         apply_sampling(&mut cfg, &SamplingEdit::Show, &mut app);
         assert!(cfg.sampling.is_none());
@@ -2081,7 +2085,7 @@ mod tests {
     fn thinking_commands_set_and_clear() {
         let mut cfg = launch();
         let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
 
@@ -2130,7 +2134,7 @@ mod tests {
     fn model_and_provider_commands_reconfigure_the_launch() {
         let mut cfg = launch();
         let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
 
@@ -2161,7 +2165,7 @@ mod tests {
     fn template_commands_fill_the_input_line() {
         let mut cfg = launch();
         let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
         let template = Template {
@@ -2252,7 +2256,7 @@ mod tests {
     #[test]
     fn md_export_writes_the_default_selection() {
         let (state, dir) = session_with_file("default");
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let source = ExportSource::snapshot(&state, &app, ExportOptions::default()).unwrap();
         let target = dir.join("out/session.md");
         apply_export(&mut app, target.to_str().unwrap(), &source);
@@ -2269,7 +2273,7 @@ mod tests {
     #[test]
     fn md_export_all_includes_thinking() {
         let (state, dir) = session_with_file("all");
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let source = ExportSource::snapshot(&state, &app, ExportOptions::ALL).unwrap();
         let target = dir.join("all.md");
         apply_export(&mut app, target.to_str().unwrap(), &source);
@@ -2283,7 +2287,7 @@ mod tests {
     fn md_export_without_a_session_writes_an_empty_document() {
         let mut state = SessionState::new("deepinfra", None);
         *(state.dir_mut()) = std::env::temp_dir();
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let source = ExportSource::snapshot(&state, &app, ExportOptions::default()).unwrap();
         let target =
             std::env::temp_dir().join(format!("clanky-md-empty-{}.md", std::process::id()));
@@ -2296,7 +2300,7 @@ mod tests {
     #[test]
     fn md_export_reports_write_failures() {
         let (state, dir) = session_with_file("unwritable");
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let source = ExportSource::snapshot(&state, &app, ExportOptions::default()).unwrap();
         // A directory cannot be written as a file.
         apply_export(&mut app, dir.to_str().unwrap(), &source);
@@ -2308,7 +2312,7 @@ mod tests {
     fn md_command_without_a_filename_opens_the_modal() {
         let mut cfg = launch();
         let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
 
@@ -2351,7 +2355,7 @@ mod tests {
 
     #[test]
     fn system_command_pushes_labelled_parts() {
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let parts = vec![
             ("~/.clanky/SYSTEM.md".to_string(), "be terse".to_string()),
             ("AGENTS.md".to_string(), "be helpful".to_string()),
@@ -2371,7 +2375,7 @@ mod tests {
 
     #[test]
     fn system_command_without_context_pushes_a_note() {
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         push_system_report(&mut app, &[]);
         assert_eq!(app.entries.len(), 1);
         assert!(matches!(app.entries[0], app::Entry::Info(_)));
@@ -2576,7 +2580,7 @@ mod tests {
     fn name_and_resume_report_politely_when_recording_is_off() {
         let mut cfg = launch();
         let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref()).recording(false);
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
 
@@ -2642,7 +2646,7 @@ mod tests {
         // ever held: `/md` must export what the screen showed.
         let cfg = launch();
         let state = SessionState::new(&cfg.provider, cfg.model.as_deref()).recording(false);
-        let mut app = app::App::new();
+        let mut app = app::App::new(None);
         app.push_user("count files");
         app.on_turn_event(TurnEvent::ToolCall {
             name: "bash".into(),

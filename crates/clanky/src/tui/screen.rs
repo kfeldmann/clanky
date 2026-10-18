@@ -707,41 +707,66 @@ struct InputRows {
     caret: Option<(usize, u16)>,
 }
 
-/// The prompt prefix is always three columns: a streaming dot ("●" while
-/// a turn runs, a blank otherwise) plus "❯ ". The fixed width keeps the
-/// caret column steady whether or not the dot is lit. Continuation rows
-/// are indented to the same width.
+/// The prompt prefix is always at least three columns: a streaming dot
+/// ("●" while a turn runs, a blank otherwise) plus "❯ ", optionally
+/// preceded by the project label (`project` setting, e.g. `clanky  ❯ `).
+/// The fixed width keeps the caret column steady whether or not the dot
+/// is lit. Continuation rows are indented to the same width.
 const PROMPT_WIDTH: usize = 3;
+
+/// Spans printed at the left of the input prompt: the project label
+/// (`project` setting) followed by the prompt block itself. The first
+/// span's width is the total prefix width the continuation rows and the
+/// caret column must match; `None` is the bare three-column prompt.
+fn prompt_prefix(app: &App) -> Vec<Span<'static>> {
+    let prompt_style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let dot = if app.busy {
+        Span::styled("●".to_string(), prompt_style)
+    } else {
+        Span::raw(" ".to_string())
+    };
+    let mut spans = Vec::new();
+    if let Some(project) = app.project.as_deref() {
+        spans.push(Span::styled(
+            project.to_string(),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" ".to_string()));
+    }
+    spans.push(dot);
+    spans.push(Span::styled(INPUT_PROMPT.to_string(), prompt_style));
+    spans
+}
+
+/// Display width of the prompt prefix: the project label plus a space
+/// when set, then the fixed dot + prompt symbol.
+fn prompt_prefix_width(app: &App) -> usize {
+    PROMPT_WIDTH + app.project.as_deref().map(|p| p.width() + 1).unwrap_or(0)
+}
 
 /// `budget` caps how many rows the input region may occupy. When the
 /// input has more lines than fit, the rows around the caret are kept
 /// (the caret must stay on screen); the hidden ones just don't render —
 /// the buffer itself is unaffected.
 fn input_rows(app: &App, width: u16, budget: usize) -> InputRows {
-    let view_width = (width as usize).saturating_sub(PROMPT_WIDTH);
+    let prefix_width = prompt_prefix_width(app);
+    let view_width = (width as usize).saturating_sub(prefix_width);
     if view_width == 0 {
         return InputRows {
             lines: Vec::new(),
             caret: None,
         };
     }
-    let prompt_style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
-    let dot = if app.busy {
-        Span::styled("●", prompt_style)
-    } else {
-        Span::raw(" ".to_string())
-    };
+    let prefix = prompt_prefix(app);
     if app.input.is_empty() && !app.busy {
+        let mut lines = prefix.clone();
+        lines.push(Span::styled(
+            "type a message…".to_string(),
+            Style::new().fg(Color::DarkGray),
+        ));
         return InputRows {
-            lines: vec![Line::from(vec![
-                dot,
-                Span::styled(INPUT_PROMPT.to_string(), prompt_style),
-                Span::styled(
-                    "type a message…".to_string(),
-                    Style::new().fg(Color::DarkGray),
-                ),
-            ])],
-            caret: Some((0, PROMPT_WIDTH as u16)),
+            lines: vec![Line::from(lines)],
+            caret: Some((0, prefix_width as u16)),
         };
     }
 
@@ -783,7 +808,7 @@ fn input_rows(app: &App, width: u16, budget: usize) -> InputRows {
         caret_byte = rows[caret_row].len();
     }
 
-    let indent = " ".repeat(PROMPT_WIDTH);
+    let indent = " ".repeat(prefix_width);
     let mut lines = Vec::new();
     let mut caret = None;
     for (r, row) in rows.iter().enumerate() {
@@ -795,14 +820,13 @@ fn input_rows(app: &App, width: u16, budget: usize) -> InputRows {
         let (window, caret_col) = input_window(row, cursor_here, view_width);
         let mut spans = Vec::with_capacity(3);
         if r == 0 {
-            spans.push(dot.clone());
-            spans.push(Span::styled(INPUT_PROMPT.to_string(), prompt_style));
+            spans.extend(prefix.clone());
         } else {
             spans.push(Span::raw(indent.clone()));
         }
         spans.extend(window);
         if r == caret_row {
-            caret = Some((r, (PROMPT_WIDTH + caret_col) as u16));
+            caret = Some((r, (prefix_width + caret_col) as u16));
         }
         lines.push(Line::from(spans));
     }
@@ -1259,7 +1283,7 @@ mod tests {
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut app = App::new();
+        let mut app = App::new(None);
         let mut s = screen(Buf::default(), width, height);
         let mut st = status();
         st.model = Some("zai-org/GLM-5.3-Flash");
@@ -1326,7 +1350,7 @@ mod tests {
     #[test]
     fn committed_rows_are_printed_once() {
         let buf = Buf::default();
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.push_user("hello");
         let mut s = screen(buf, 60, 10);
         s.render(&mut app, &status(), None, None, None).unwrap();
@@ -1340,7 +1364,7 @@ mod tests {
     #[test]
     fn streaming_tail_is_rewritten_and_then_committed() {
         let buf = Buf::default();
-        let mut app = App::new();
+        let mut app = App::new(None);
         let mut s = screen(buf, 60, 10);
         app.on_turn_event(TurnEvent::Text {
             delta: "alpha".into(),
@@ -1374,7 +1398,7 @@ mod tests {
     #[test]
     fn a_long_streaming_entry_commits_its_oldest_rows() {
         let buf = Buf::default();
-        let mut app = App::new();
+        let mut app = App::new(None);
         let mut s = screen(buf, 60, 5); // keep = 5 - 2 - 1 = 2 tail rows
         for n in 1..=6 {
             app.on_turn_event(TurnEvent::Text {
@@ -1400,7 +1424,7 @@ mod tests {
     /// caret column (→ drift right) without clearing row remainders.
     #[test]
     fn redraw_keeps_the_tail_in_place() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         let mut s = Screen::new(Buf::default(), 80, 8);
         s.render(&mut app, &status(), None, None, None).unwrap(); // placeholder
         app.input = "Say hello".into();
@@ -1442,7 +1466,7 @@ mod tests {
     /// printing past it, so nothing ever scrolls.
     #[test]
     fn editor_roundtrip_does_not_scroll_the_status_line() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.push_user("hello");
         let mut s = Screen::new(Buf::default(), 80, 8);
         s.render(&mut app, &status(), None, None, None).unwrap();
@@ -1477,7 +1501,7 @@ mod tests {
     /// ending on the bottom row, and further renders rewrite it in place.
     #[test]
     fn resize_re_anchors_and_then_rewrites_in_place() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.push_user("hello");
         let mut s = Screen::new(Buf::default(), 80, 8);
         s.render(&mut app, &status(), None, None, None).unwrap();
@@ -1510,7 +1534,7 @@ mod tests {
     /// column short; the status line pads up to (but not including) it.
     #[test]
     fn rows_never_paint_the_last_column() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.busy = true; // full-width status right edge
         let mut s = Screen::new(Buf::default(), 40, 8);
         s.render(&mut app, &status(), None, None, None).unwrap();
@@ -1535,7 +1559,7 @@ mod tests {
     /// CUP, and its block ends on the bottom row without scrolling.
     #[test]
     fn growing_transcript_never_pushes_the_tail_into_scrollback() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         let mut s = screen(Buf::default(), 40, 6);
         // One screenful of scrolling history: many finalized entries,
         // each rendered right after the previous (steady-state path).
@@ -1570,7 +1594,7 @@ mod tests {
     /// do not fit scroll once (transcript), never the tail repeatedly.
     #[test]
     fn resize_with_a_tall_streaming_entry_does_not_scroll_the_tail() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.busy = true;
         let mut s = screen(Buf::default(), 20, 6);
         for n in 1..=8 {
@@ -1604,7 +1628,7 @@ mod tests {
     /// pushed into scrollback.
     #[test]
     fn tail_growth_scrolls_once_per_commit_not_per_redraw() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.busy = true;
         let mut s = screen(Buf::default(), 20, 6);
         for n in 1..=16 {
@@ -1632,7 +1656,7 @@ mod tests {
     /// below the end of the previous one (a staircase).
     #[test]
     fn multi_line_tool_output_prints_at_the_left_edge() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::ToolCall {
             name: "bash".into(),
             arguments: "{}".into(),
@@ -1709,7 +1733,7 @@ mod tests {
 
     #[test]
     fn status_line_pads_and_shows_state() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.busy = true;
         app.last_usage = Some(clanky_protocol::Usage {
             prompt_tokens: Some(120),
@@ -1734,7 +1758,7 @@ mod tests {
 
     #[test]
     fn status_line_decontents_gracefully_as_the_terminal_narrows() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.last_usage = Some(clanky_protocol::Usage {
             prompt_tokens: Some(2500),
             completion_tokens: Some(500),
@@ -1822,7 +1846,7 @@ mod tests {
 
     #[test]
     fn hidden_thinking_renders_as_a_placeholder_line() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.toggle_thinking_display(); // off
         app.on_turn_event(TurnEvent::Thinking {
             delta: "secret reasoning".into(),
@@ -1844,7 +1868,7 @@ mod tests {
 
     #[test]
     fn status_line_shows_thinking_and_cost() {
-        let app = App::new();
+        let app = App::new(None);
         let status = Status {
             provider: "deepinfra",
             model: Some("mock/model"),
@@ -1866,7 +1890,7 @@ mod tests {
 
     #[test]
     fn estimates_count_into_the_display_while_nothing_is_billed() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::Thinking {
             delta: "x".repeat(96),
         });
@@ -1889,7 +1913,7 @@ mod tests {
 
     #[test]
     fn usage_shows_context_percent_when_the_window_is_known() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::Usage {
             usage: clanky_protocol::Usage {
                 prompt_tokens: Some(17255),
@@ -1933,7 +1957,7 @@ mod tests {
 
     #[test]
     fn input_rows_show_placeholder_and_window_long_input() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         let input = input_rows(&app, 40, 24);
         assert_eq!(input.lines.len(), 1);
         let text = input_text(&input.lines[0]);
@@ -1967,7 +1991,7 @@ mod tests {
     /// under the prompt symbol so every line starts at the same column.
     #[test]
     fn multi_line_input_starts_each_row_at_the_prompt_column() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.input = "line one\nline two\nline three".into();
         app.cursor = app.input.len();
         let mut s = Screen::new(Buf::default(), 40, 8);
@@ -1991,11 +2015,72 @@ mod tests {
         // block ends.)
     }
 
+    /// The `project` setting is printed at the left of the input prompt:
+    /// the label, then the unchanged dot + prompt symbol, then the text.
+    #[test]
+    fn project_label_sits_at_the_left_of_the_input_prompt() {
+        let mut app = App::new(Some("clanky".into()));
+        app.input = "hi".into();
+        app.cursor = 2;
+        let input = input_rows(&app, 40, 24);
+        assert_eq!(input.lines.len(), 1);
+        let text = input_text(&input.lines[0]);
+        assert!(text.contains("clanky  ❯ hi"), "{text}");
+        // The caret column follows the wider prefix.
+        assert_eq!(
+            input.caret,
+            Some((0, (PROMPT_WIDTH + "clanky".len() + 1 + 2) as u16))
+        );
+    }
+
+    /// With a project label, the streaming dot still sits between the
+    /// label and the prompt symbol, and continuation rows indent past
+    /// the whole prefix.
+    #[test]
+    fn project_label_keeps_the_dot_and_alignment() {
+        let mut app = App::new(Some("proj".into()));
+        app.busy = true;
+        let input = input_rows(&app, 40, 24);
+        let text = input_text(&input.lines[0]);
+        assert!(text.contains("proj ●❯"), "{text}");
+
+        // Multi-line: every continuation row starts after the full
+        // prefix ("proj " + dot + prompt symbol = 8 columns).
+        app.busy = false;
+        app.input = "one\ntwo".into();
+        app.cursor = app.input.len();
+        let mut s = Screen::new(Buf::default(), 40, 8);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        let rows = s.take_out().emulated_screen(40, 8);
+        for needle in ["one", "two"] {
+            let row = &rows[input_text_row(&rows, needle)];
+            assert_eq!(
+                row.find(needle).map(|i| row[..i].chars().count()),
+                Some(8),
+                "{needle} starts at column 8: {row}"
+            );
+        }
+    }
+
+    /// No `project` setting: the input prompt is exactly as before
+    /// (three-column prefix, no label).
+    #[test]
+    fn no_project_label_leaves_the_prompt_unchanged() {
+        let mut app = App::new(None);
+        app.input = "hi".into();
+        app.cursor = 2;
+        let input = input_rows(&app, 40, 24);
+        let text = input_text(&input.lines[0]);
+        assert!(text.contains("❯ hi"), "{text}");
+        assert!(!text.contains("clanky"), "{text}");
+        assert_eq!(input.caret, Some((0, (PROMPT_WIDTH + 2) as u16)));
+    }
+
     /// A trailing newline yields an empty final input row, and the caret
     /// (at the end of the buffer) sits on it.
     #[test]
     fn trailing_newline_gives_the_caret_an_empty_row() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.input = "hello\n".into();
         app.cursor = app.input.len();
         let mut s = Screen::new(Buf::default(), 40, 8);
@@ -2026,7 +2111,7 @@ mod tests {
     /// cursor — the renderer emits CUU (move up) past the later rows.
     #[test]
     fn caret_moves_to_the_row_with_the_cursor() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.input = "aaaa\nbbbb\ncccc".into();
         app.cursor = 5; // start of "bbbb" (after the first newline)
         let mut s = Screen::new(Buf::default(), 40, 10);
@@ -2046,7 +2131,7 @@ mod tests {
     /// caret are kept so the caret stays on screen.
     #[test]
     fn input_rows_trim_to_the_budget_around_the_caret() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.input = (0..20)
             .map(|i| format!("row-{i}"))
             .collect::<Vec<_>>()
@@ -2069,7 +2154,7 @@ mod tests {
     /// The prompt width constant must match the actual prompt pieces.
     #[test]
     fn prompt_width_matches_the_rendered_prompt() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.input = "x".into();
         app.cursor = 1;
         let input = input_rows(&app, 40, 24);
@@ -2160,7 +2245,7 @@ mod tests {
 
     #[test]
     fn an_open_modal_owns_the_caret() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.input = "typing".into();
         app.cursor = 6;
         let modal = Modal::new("export markdown", "file name", "a.md");
@@ -2179,7 +2264,7 @@ mod tests {
 
     #[test]
     fn completion_box_lists_candidates() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.completion = Some(CompletionState::new(
             String::new(),
             String::new(),
@@ -2231,7 +2316,7 @@ mod tests {
     /// rows pushed out of place.
     #[test]
     fn thinking_tabs_expand_to_stable_rows() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::Thinking {
             delta: "code:\n\tfoo();\n\t\tbar(); done".into(),
         });
@@ -2253,7 +2338,7 @@ mod tests {
     /// status line on screen and none in scrollback.
     #[test]
     fn streaming_thinking_overflow_keeps_one_status_line() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.busy = true;
         let mut s = screen(Buf::default(), 40, 10);
         s.render(&mut app, &status(), None, None, None).unwrap();

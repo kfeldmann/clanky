@@ -373,7 +373,7 @@ fn tool_preview_rendering_matches_golden() {
     )
     .unwrap();
 
-    let mut app = clanky::tui::App::new();
+    let mut app = clanky::tui::App::new(None);
     app.push_user("long input");
     for event in events.borrow().iter() {
         app.on_turn_event(event.clone());

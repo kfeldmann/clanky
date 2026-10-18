@@ -219,16 +219,21 @@ pub struct App {
     /// while it was off stay collapsed as [`Entry::Thinking`] placeholders.
     show_thinking: bool,
     open: Option<OpenKind>,
+    /// Project label shown at the left of the input prompt (`project`
+    /// setting; `None` = no label). Display-only.
+    pub project: Option<String>,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl App {
-    pub fn new() -> Self {
+    /// `project` is the label rendered at the left of the input prompt
+    /// (the `project` setting); `None` renders the prompt unchanged.
+    pub fn new(project: Option<String>) -> Self {
         Self {
             entries: Vec::new(),
             input: String::new(),
@@ -250,6 +255,7 @@ impl App {
             estimate_prompt: 0,
             estimate_completion_chars: 0,
             estimate_completion: 0,
+            project,
         }
     }
 
@@ -1072,7 +1078,7 @@ mod tests {
 
     #[test]
     fn text_deltas_form_one_assistant_entry() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::Text { delta: "he".into() });
         app.on_turn_event(TurnEvent::Text {
             delta: "llo".into(),
@@ -1085,7 +1091,7 @@ mod tests {
     /// never stack with the separator into 2-3 blank rows.
     #[test]
     fn each_entry_ends_with_one_blank_line() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.push_user("hi");
         app.on_turn_event(TurnEvent::Text {
             delta: "answer\n\n\n".into(),
@@ -1129,7 +1135,7 @@ mod tests {
 
     #[test]
     fn thinking_then_text_split_entries() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::Thinking {
             delta: "hmm".into(),
         });
@@ -1140,7 +1146,7 @@ mod tests {
         );
 
         // With the display off, the same stream collapses to placeholders.
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.toggle_thinking_display();
         app.on_turn_event(TurnEvent::Thinking {
             delta: "hmm".into(),
@@ -1162,7 +1168,7 @@ mod tests {
         //   ● bash {...}
         //   └─ bash: ...
         //   Thinking...
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.toggle_thinking_display();
         app.on_turn_event(TurnEvent::Thinking {
             delta: "reason 1".into(),
@@ -1200,7 +1206,7 @@ mod tests {
     fn tool_call_closes_the_streaming_entry() {
         // Text after a tool call must open a new assistant entry so it
         // renders *below* the tool activity, not above it.
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::Text {
             delta: "checking".into(),
         });
@@ -1235,7 +1241,7 @@ mod tests {
     #[test]
     fn retry_notice_closes_the_block_and_is_informational() {
         use std::time::Duration;
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::Text {
             delta: "par".into(),
         });
@@ -1260,7 +1266,7 @@ mod tests {
 
     #[test]
     fn billed_usage_accumulates_per_round_and_done_surfaces_errors() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.busy = true;
         let round1 = Usage {
             prompt_tokens: Some(10),
@@ -1304,7 +1310,7 @@ mod tests {
 
     #[test]
     fn cached_tokens_track_the_cache_served_prompt_portion() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         // 1000 prompt tokens, 800 from cache, 50 completion.
         app.on_turn_event(TurnEvent::Usage {
             usage: Usage {
@@ -1337,7 +1343,7 @@ mod tests {
 
     #[test]
     fn estimates_streamed_text_and_resets_on_usage() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         assert_eq!(app.estimated_tokens(), (0, 0));
 
         // 40 chars at a 32-char step and 3 chars/token: 32/3 -> 10.
@@ -1376,7 +1382,7 @@ mod tests {
 
     #[test]
     fn user_prompt_and_tool_results_estimate_into_the_prompt_pool() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         // 96 chars -> 3 steps * 32 chars / 3 = 32.
         app.push_user(&"x".repeat(96));
         assert_eq!(app.estimated_tokens(), (32, 0));
@@ -1402,7 +1408,7 @@ mod tests {
 
     #[test]
     fn estimate_clears_when_a_turn_ends_without_usage() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.busy = true;
         app.on_turn_event(TurnEvent::Thinking {
             delta: "x".repeat(96),
@@ -1418,7 +1424,7 @@ mod tests {
 
     #[test]
     fn failed_tool_results_render_in_red() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::ToolCall {
             name: "bash".into(),
             arguments: r#"{"command":"false"}"#.into(),
@@ -1465,7 +1471,7 @@ mod tests {
     /// wrapped row, aligned under the first output character.
     #[test]
     fn tool_result_output_lines_start_at_the_left_edge() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "one\ntwo\nthree".into(),
@@ -1493,7 +1499,7 @@ mod tests {
 
     #[test]
     fn input_editing_inserts_and_removes_chars() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         for c in "ab".chars() {
             app.insert_char(c);
         }
@@ -1529,7 +1535,7 @@ mod tests {
 
     #[test]
     fn multibyte_chars_edit_correctly() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         for c in "é中".chars() {
             app.insert_char(c);
         }
@@ -1546,7 +1552,7 @@ mod tests {
 
     #[test]
     fn take_input_clears_and_requires_text() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         assert_eq!(app.take_input(), None);
         app.input = "  hi  ".into();
         app.cursor = 6;
@@ -1569,7 +1575,7 @@ mod tests {
 
     #[test]
     fn transcript_renders_markdown_and_wraps() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.push_user("hello");
         app.on_turn_event(TurnEvent::Text {
             delta: "a **bold** reply".into(),
@@ -1585,7 +1591,7 @@ mod tests {
 
     #[test]
     fn tool_calls_render_with_marker_and_preview() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::ToolCall {
             name: "bash".into(),
             arguments: json!({"command": "ls"}).to_string(),
@@ -1610,7 +1616,7 @@ mod tests {
     #[test]
     fn long_tool_call_arguments_are_cut_for_display_only() {
         let long = "z".repeat(2_000);
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.on_turn_event(TurnEvent::ToolCall {
             name: "bash".into(),
             arguments: json!({"command": long, "timeout_seconds": 90}).to_string(),
@@ -1648,7 +1654,7 @@ mod tests {
     #[test]
     fn assistant_table_fits_width_without_rewrapping() {
         use unicode_width::UnicodeWidthStr as _;
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.entries.push(Entry::Assistant(
             "| aaa | bbb | ccc |\n| -- | -- | -- |\n| longwordhere | x | y |".into(),
         ));
@@ -1682,7 +1688,7 @@ mod tests {
 
     #[test]
     fn clear_empties_the_transcript_and_print_bookkeeping() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.push_user("hi");
         app.set_printed(0, 3);
         app.printed_entries = 1;
@@ -1694,7 +1700,7 @@ mod tests {
 
     #[test]
     fn sealed_boundary_tracks_the_streaming_entry() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         assert_eq!(app.sealed_boundary(), 0, "empty transcript is all sealed");
 
         app.push_user("hi");
@@ -1746,7 +1752,7 @@ mod tests {
                 completion_tokens: Some(2),
             },
         ];
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.push_user("old");
         let history = app.restore(&records);
         assert_eq!(
@@ -1778,7 +1784,7 @@ mod tests {
 
     #[test]
     fn user_error_info_rows_carry_block_bg() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.push_user("hello");
         app.entries.push(Entry::Error("boom".into()));
         app.entries.push(Entry::Info("renamed".into()));
@@ -1822,7 +1828,7 @@ mod tests {
 
     #[test]
     fn user_bg_survives_wrapping() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         // One long source line: wraps into several rows at width 10.
         app.push_user("aaa bbb ccc ddd eee");
         let lines = app.entry_lines(0, 10);
@@ -1848,7 +1854,7 @@ mod tests {
 
     #[test]
     fn internal_blank_rows_are_filled_so_the_block_is_seamless() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.push_user("para one\n\npara two");
         let lines = app.entry_lines(0, 40);
         // Rows: "❯ para one" + pad, a full-width filled paragraph break,
@@ -1871,7 +1877,7 @@ mod tests {
 
     #[test]
     fn info_entries_render_dimmed() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.entries.push(Entry::Info("renamed".into()));
         let lines = app.transcript_lines(40);
         assert!(lines.iter().any(|l| {
@@ -1885,7 +1891,7 @@ mod tests {
 
     #[test]
     fn completion_cycles_through_candidates() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.completion = Some(CompletionState::new(
             "cat ".into(),
             String::new(),
@@ -1906,7 +1912,7 @@ mod tests {
 
     #[test]
     fn completion_cycle_keeps_prefix_and_suffix() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.completion = Some(CompletionState::new(
             "read ".into(),
             " now".into(),
@@ -1921,7 +1927,7 @@ mod tests {
 
     #[test]
     fn take_input_clears_completion_state() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.completion = Some(CompletionState::new(
             String::new(),
             String::new(),
@@ -1935,7 +1941,7 @@ mod tests {
 
     #[test]
     fn submitted_prompts_are_recallable_with_up_down() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.input = "first".into();
         app.cursor = 5;
         app.take_input();
@@ -1967,7 +1973,7 @@ mod tests {
 
     #[test]
     fn history_up_with_no_history_is_a_no_op() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.input = "hi".into();
         app.history_up();
         assert_eq!(app.input, "hi");
@@ -1985,7 +1991,7 @@ mod tests {
             },
             Record::User { text: "two".into() },
         ];
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.restore(&records);
         app.history_up();
         assert_eq!(app.input, "two");
@@ -1995,7 +2001,7 @@ mod tests {
 
     #[test]
     fn system_parts_render_with_label_and_content() {
-        let mut app = App::new();
+        let mut app = App::new(None);
         app.entries.push(Entry::Info("2 part(s)".into()));
         app.entries.push(Entry::SystemPart {
             content: "# Context — skill review\n\nCheck the diffs.".into(),

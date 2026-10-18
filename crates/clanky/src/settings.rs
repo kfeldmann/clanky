@@ -49,6 +49,10 @@ pub struct Settings {
     /// `--no-session` flag) turns recording off in both front ends;
     /// unset means recorded.
     pub session: Option<bool>,
+    /// Project label shown at the left of the TUI input prompt (e.g.
+    /// `project = "clanky"` renders `clanky  ❯ `). Display-only: the
+    /// print front end ignores it.
+    pub project: Option<String>,
 }
 
 impl Settings {
@@ -124,6 +128,9 @@ impl Settings {
         if over.session.is_some() {
             self.session = over.session;
         }
+        if over.project.is_some() {
+            self.project = over.project;
+        }
     }
 
     /// Whether conversations are recorded into session files. Sessions
@@ -184,6 +191,33 @@ mod tests {
 
         std::fs::remove_file(user).unwrap();
         std::fs::remove_file(project).unwrap();
+    }
+
+    #[test]
+    fn project_field_parses_and_overlays_per_layer() {
+        let tmp = std::env::temp_dir().join("clanky-test-project-field");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let user = write_temp_settings(
+            &tmp.join("clanky-test-project-user"),
+            "project = \"user-proj\"\n",
+        );
+        let project = write_temp_settings(
+            &tmp.join("clanky-test-project-project"),
+            "project = \"project-proj\"\n",
+        );
+        let merged = Settings::load_from_paths(&[user.clone(), project.clone()]).unwrap();
+        assert_eq!(merged.project.as_deref(), Some("project-proj"));
+
+        // A layer that does not set it keeps the lower layer's value.
+        let merged = Settings::load_from_paths(&[
+            user,
+            PathBuf::from("/nonexistent-clanky-project/settings.toml"),
+        ])
+        .unwrap();
+        assert_eq!(merged.project.as_deref(), Some("user-proj"));
+
+        std::fs::remove_file(project).unwrap();
+        assert_eq!(Settings::default().project, None, "unset means no label");
     }
 
     #[test]
