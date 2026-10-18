@@ -40,7 +40,7 @@
 
 use std::io::{self, Write};
 
-use ratatui::crossterm::cursor::{MoveTo, MoveToColumn, MoveUp};
+use ratatui::crossterm::cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{Clear, ClearType};
 use std::borrow::Cow;
@@ -82,6 +82,11 @@ pub struct Screen<W: Write> {
     /// Rows printed by the last render that the next render rewrites
     /// (streaming tail + popup + status + input).
     tail_height: usize,
+    /// Rows between the cursor and the bottom edge when the last render
+    /// finished: usually 0 (steady-state redraws end on the bottom row),
+    /// but a caret parked on an upper input row leaves it positive — the
+    /// next redraw must start from the cursor's *actual* position.
+    cursor_top: usize,
 }
 
 impl<W: Write> Screen<W> {
@@ -92,6 +97,7 @@ impl<W: Write> Screen<W> {
             width,
             height,
             tail_height: 0,
+            cursor_top: 0,
         }
     }
 
@@ -107,6 +113,7 @@ impl<W: Write> Screen<W> {
         self.width = width;
         self.height = height;
         self.tail_height = 0;
+        self.cursor_top = 0;
         let sealed = app.sealed_boundary();
         if sealed < app.entries.len() {
             app.set_printed(sealed, 0);
@@ -118,6 +125,7 @@ impl<W: Write> Screen<W> {
     pub fn clear_screen(&mut self) {
         let _ = execute!(self.out, Clear(ClearType::All), MoveTo(0, 0));
         self.tail_height = 0;
+        self.cursor_top = 0;
     }
 
     /// Finish: a fresh line below the transcript so the shell prompt does
@@ -232,12 +240,33 @@ impl<W: Write> Screen<W> {
                 .min(self.height as usize - 1);
             execute!(self.out, MoveTo(0, top as u16))?;
             execute!(self.out, Clear(ClearType::FromCursorDown))?;
+            self.cursor_top = 0;
         } else {
-            execute!(
-                self.out,
-                MoveUp(self.tail_height as u16 - 1),
-                MoveToColumn(0)
-            )?;
+            // The previous frame parked the caret on an input row — any
+            // row of the tail, not the bottom edge — so reach the new
+            // block's top row (`new_rows - 1` above the bottom) from
+            // where the cursor actually is. The block spans COMMIT rows
+            // above the tail too: anchoring only `tail.len()` above the
+            // bottom made the commit rows paint onto the old tail's
+            // rows while the new tail printed past the bottom edge —
+            // scrolling once per committed row and repositioning every
+            // frame, so older transcript text appeared nailed above a
+            // scrolling "viewport" instead of flowing into history.
+            // With the commit-aware move the block ends on the bottom
+            // edge again: rows pushed off the top scroll exactly once
+            // (per committed row) and the tail keeps its rows. A fixed
+            // `MoveUp(tail_height - 1)` is also wrong when the block is
+            // taller than the screen (a tall streaming entry after a
+            // resize): MoveUp clamps at the screen's top, the redraw
+            // prints past the bottom and scrolls. The delta is signed:
+            // a shrinking tail can leave the cursor above the new top.
+            let delta = new_rows as isize - 1 - self.cursor_top as isize;
+            if delta > 0 {
+                execute!(self.out, MoveUp(delta as u16))?;
+            } else if delta < 0 {
+                execute!(self.out, MoveDown((-delta) as u16))?;
+            }
+            execute!(self.out, MoveToColumn(0))?;
         }
         let mut first = true;
         for line in commit.iter().chain(tail.iter()) {
@@ -256,19 +285,31 @@ impl<W: Write> Screen<W> {
             execute!(self.out, Clear(ClearType::FromCursorDown))?;
         }
         self.tail_height = tail.len();
+        // The draw rewrites `tail.len()` rows from the tail's top; ended
+        // on the bottom edge (no caret repark yet).
+        self.cursor_top = 0;
         if let Some((row, col)) = footer.caret {
-            // The caret lives inside the tail (an input row); moving up
-            // from the tail's bottom row reaches it without absolute
-            // addressing (a live anchor cannot use CUP — see above). The
-            // caret's row is footer-relative, so the streaming entry's
-            // rows above the footer are skipped: parking above them put
-            // the cursor too high while thinking streamed, and the next
-            // redraw started early, leaving stale tail copies below.
-            let from_bottom = tail.len().saturating_sub(entry_tail_rows + 1 + row);
+            // Park the caret on its own row (the next redraw reads
+            // `cursor_top` instead of assuming the bottom edge). Moving
+            // up from the tail's bottom row reaches it without absolute
+            // addressing (a live anchor cannot use CUP — see above).
+            // `footer.caret`'s row is already an index into the tail's
+            // lines (the input region appends its `input_start`), so the
+            // caret sits `tail.len() - 1 - wanted` rows above the tail's
+            // bottom row — on the bottom row itself when it is the last
+            // line. (An earlier `+ 1` double-counted the entry-tail
+            // skip: the caret parked one row low — for the common single
+            // input row, below the bottom edge — so the next redraw
+            // measured the previous frame's cursor one row off, redrew
+            // one row high, and corrected on the row after: the input
+            // line visibly jumped up and back on every keystroke.)
+            let wanted = entry_tail_rows + row;
+            let from_bottom = (tail.len() - 1).saturating_sub(wanted);
             if from_bottom > 0 {
                 execute!(self.out, MoveUp(from_bottom as u16))?;
             }
             execute!(self.out, MoveToColumn(col))?;
+            self.cursor_top = from_bottom;
         }
         self.out.flush()
     }
@@ -1085,6 +1126,85 @@ mod tests {
     use super::*;
     use crate::turn::{TurnEvent, TurnOutput};
 
+    /// A committed user prompt (rendered once, sealed) is followed by a
+    /// thinking block streaming in row by row: each redraw rewrites the
+    /// tail in place — one status row, one input row, no duplicates, no
+    /// drift — while the committed rows join the transcript irreversibly.
+    /// Regression (commit-aware live anchor): the redraw used to move up
+    /// `tail.len() - 1` rows but then also print `commit.len()` rows
+    /// from there, so commit rows painted over the stable tail's rows
+    /// while tail rows printed past the bottom edge — scrolling the
+    /// screen once per committed row and repositioning every frame:
+    /// older messages appeared nailed above a "viewport" of streaming
+    /// text instead of the stream flowing into history.
+    #[test]
+    fn thinking_stream_commit_rewrites_the_tail_in_place() {
+        let mut app = App::new(None);
+        let mut s = screen(Buf::default(), 60, 15);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        s.take_out();
+        app.push_user("first question");
+        app.busy = true;
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        // The very next render has nothing new: the tail stays put.
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        s.take_out();
+
+        for n in 1..=6 {
+            app.on_turn_event(TurnEvent::Thinking {
+                delta: format!("think line {n}\n"),
+            });
+            s.render(&mut app, &status(), None, None, None).unwrap();
+        }
+        let rows = s.take_out().emulated_screen(60, 15);
+        // All six streamed lines on screen, each once.
+        for n in 1..=6 {
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r.contains(&format!("think line {n}")))
+                    .count(),
+                1,
+                "think line {n} duplicated or missing: {rows:?}"
+            );
+        }
+        // Exactly one status line and one input line, below the stream.
+        assert_eq!(rows.iter().filter(|r| r.contains("deepinfra ·")).count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.contains("●❯")).count(), 1);
+        // The committed prompt scrolled off the top: the streamed rows
+        // plus their separators exceed the screen and the transcript
+        // (never the tail) flows into history. Nothing was duplicated.
+        assert!(!rows.iter().any(|r| r.contains("first question")));
+        // Long enough that the streamed tail commits its oldest rows:
+        // those commit rows join history and must not reorder or
+        // duplicate what is already there.
+        for n in 7..=12 {
+            app.on_turn_event(TurnEvent::Thinking {
+                delta: format!("think line {n}\n"),
+            });
+            s.render(&mut app, &status(), None, None, None).unwrap();
+        }
+        let rows = s.take_out().emulated_screen(60, 15);
+        assert_eq!(rows.iter().filter(|r| r.contains("deepinfra ·")).count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.contains("●❯")).count(), 1);
+        // Rows are consecutive in SortedRows: each visible streaming row
+        // appears exactly once. The oldest lines scroll off the top as
+        // they commit, still exactly once each.
+        for n in 2..=12 {
+            let shown = rows
+                .iter()
+                .filter(|r| r.contains(&format!("think line {n}")))
+                .count();
+            assert!(shown <= 1, "think line {n} duplicated: {rows:?}");
+        }
+        // The top visible row is not a tail row (status or input).
+        if let Some(top) = rows.iter().find(|r| !r.trim().is_empty()) {
+            assert!(
+                !top.contains("deepinfra ·") && !top.contains("●❯"),
+                "a tail row is the top of the screen: {top:?}"
+            );
+        }
+    }
+
     /// A writer that records the plain text rows printed by a screen,
     /// keeping escape sequences out of the assertions.
     #[derive(Default)]
@@ -1524,6 +1644,76 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("❯ hello")),
             "the committed prompt stays put: {rows:?}"
+        );
+    }
+
+    /// Typing one character at a time: every redraw rewrites the input
+    /// row in place. Regression (caret flicker): the redraw used to mis-
+    /// position when the caret's parked row fed back into the next
+    /// frame's move, so each keystroke redrew the tail a row high and
+    /// then corrected it — the input (and everything above) visibly
+    /// jumped once per keystroke.
+    #[test]
+    fn typing_rewrites_the_input_row_in_place_every_keystroke() {
+        let mut app = App::new(None);
+        app.push_user("earlier message");
+        let mut s = screen(Buf::default(), 80, 10);
+        let mut stream = Buf::default();
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        stream.0.extend(s.take_out().0);
+        // Accumulate every frame into one stream and replay it in a real
+        // (bottom-anchored) emulator: per-frame fresh replays are only
+        // valid when a frame ends on the bottom row, which a parked
+        // caret breaks.
+        for text in [
+            Some(""),
+            Some("S"),
+            Some("Sa"),
+            Some("Say"),
+            Some("Say "),
+            Some("Say h"),
+            Some("Say he"),
+            Some("Say hel"),
+        ] {
+            if let Some(text) = text {
+                app.input = text.into();
+                app.cursor = text.len();
+            }
+            s.render(&mut app, &status(), None, None, None).unwrap();
+            let frame = s.take_out();
+            let rows = frame.emulated_screen(80, 10);
+            stream.0.extend(frame.0);
+            if let Some(text) = text {
+                if text.is_empty() {
+                    continue;
+                }
+                let status = rows.iter().filter(|r| r.contains("deepinfra ·")).count();
+                let input = rows.iter().filter(|r| r.contains(text)).count();
+                assert_eq!(status, 1, "({text}) status duplicated/lost: {rows:?}");
+                assert_eq!(input, 1, "({text}) input row duplicated/lost: {rows:?}");
+            }
+        }
+        let rows = stream.emulated_screen(80, 10);
+        // Over the whole typing session the transcript above the tail
+        // never gains duplicates...
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.contains("❯ earlier message"))
+                .count(),
+            1,
+            "prompt duplicated/lost: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("deepinfra ·")).count(),
+            1,
+            "status duplicated: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.trim_end().ends_with("Say hel"))
+                .count(),
+            1,
+            "final input duplicated: {rows:?}"
         );
     }
 
@@ -1982,6 +2172,42 @@ mod tests {
         let input = input_rows(&app, 40, 24);
         assert_eq!(input.lines.len(), 1);
         assert!(input.caret.map(|(_, c)| c) > Some(0));
+    }
+
+    /// RED: after leaving the second input row (↑) and returning to
+    /// left/right edits on the first row, the tail redraw started below
+    /// the tail's top, leaving stale copies of the rows below — the
+    /// duplicated "second line".
+    #[test]
+    fn leaving_the_last_input_row_then_editing_does_not_duplicate_rows() {
+        let mut app = App::new(None);
+        app.input = "first line\nsecond line".into();
+        app.cursor = app.input.len();
+        let mut s = Screen::new(Buf::default(), 40, 8);
+
+        // Fill the tail, then ↑ onto the first row and edit on it.
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        app.cursor_up();
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        app.cursor_left();
+        app.cursor_right();
+        s.render(&mut app, &status(), None, None, None).unwrap();
+
+        // Replay all three renders on a fresh emulated screen: the last
+        // render must have rewritten the tail in place, not printed a
+        // second copy below it (that stale copy is the duplicated row).
+        let all = s.take_out();
+        let rows = all.emulated_screen(40, 8);
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("second line")).count(),
+            1,
+            "the second input row must appear exactly once: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("first line")).count(),
+            1,
+            "the first input row must appear exactly once: {rows:?}"
+        );
     }
 
     /// Regression (M12 #4): multi-line input (paste, `$EDITOR`) used to

@@ -1,4 +1,6 @@
 [workspace]
+
+
 resolver = "3"
 members = [
     "crates/clanky",
@@ -20,3 +22,5 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+

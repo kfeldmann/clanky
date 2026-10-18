@@ -650,6 +650,52 @@ As built notes:
   as the record of the port. Golden fixtures contain no tables; the
   golden suite passes unchanged.
 
+## ☑ M16 — TUI input: multi-line caret movement, ctrl+a/e/j, paste-safe Enter
+
+The TUI input rendered multi-line text (paste, `$EDITOR`, templates) but the
+caret could not travel between lines: ↑/↓ always recalled history, so editing
+a pasted block row-by-row was impossible, and a pasted newline submitted the
+prompt mid-text (raw Enter became the pasted newline through the terminal's
+input stream). The input is now a real multi-line editor.
+
+Tasks:
+1. [x] `↑`/`↓` move between the physical rows of the buffer, keeping the
+   caret's column (clamped to the row's width). Only from the top row does
+   `↑` recall the previous prompt (draft semantics unchanged), and only
+   from the bottom row does `↓` step forward — on a single-row buffer both
+   behave exactly as before.
+2. [x] ctrl+a / ctrl+e move to the start/end of the current input line.
+   ctrl+e keeps its readline double duty: at the end of the buffer it opens
+   `$EDITOR` (the `ctrl+e` documented since M7), mid-buffer it is
+   line-end-first.
+3. [x] A pasted newline cannot submit: bracketed paste is enabled for the
+   TUI's lifetime (a drop guard re-disables it even when an error unwinds
+   through `run`), and `Event::Paste` inserts its text whole at the caret.
+   Carriage returns are stripped (`\r\n` paste endings; a stray `\r` would
+   only move the cursor invisibly). Only a physically pressed Enter submits.
+4. [x] ctrl+j inserts a newline at the caret.
+5. [x] README keys table and rendering notes updated.
+
+Done when: typing a multi-line buffer with ctrl+j, ↑/↓ walk its rows; `↑` at
+the top still recalls history; pasting a multi-line block inserts it whole
+without submitting.
+
+As built notes:
+- The physical-row model mirrors the renderer's (`screen.rs` `input_rows`):
+  rows are the segments between newlines, a caret sitting on a newline
+  belongs to the end of the row above, and a caret at the buffer's end
+  lands on the (possibly empty) final row. `App::caret_row` counts
+  newlines strictly before the caret, which reproduces both rules.
+- The ↑/↓ dispatch lives in `handle_key` via the `usize` return of
+  `App::cursor_up`/`cursor_down` (rows moved): `0` means the caret cannot
+  move further and the caller may touch the history.
+- Bracketed paste is a crossterm feature of the re-exported
+  `ratatui::crossterm` (no new dependency); the guard also covers the
+  `$EDITOR` suspension, where raw mode is dropped but the paste mode is
+  left on — the guard's drop fires on every exit path through `run`.
+- Paste is inserted with `App::insert_str` (chars, `\r` filtered), not
+  per-key events, so a large paste is one edit and one redraw.
+
 ## Open Questions
 1. ✔ **Provider plugin protocol details:** exact message shapes, streaming
    granularity, cancellation semantics, how `list-models` interacts with

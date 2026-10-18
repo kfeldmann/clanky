@@ -338,8 +338,10 @@ clanky --provider hello-world -p "say hi"
 | Key | Action |
 | --- | --- |
 | `Enter` | submit (queued while a turn is streaming) |
-| `↑`/`↓` | recall previously submitted prompts (the first `↑` saves the current input as a draft; `↓` past the newest entry restores it) |
+| `↑`/`↓` | move within the lines of a multi-line buffer; from the top row `↑` recalls previously submitted prompts (the first `↑` saves the current input as a draft; `↓` past the newest entry restores it) and from the bottom row `↓` steps forward through history |
 | `Tab` | complete the file path at the caret: longest common prefix first, further `Tab` presses cycle candidates |
+| `ctrl+a` / `ctrl+e` | move to the start / end of the current input line (`ctrl+e` at the end of the buffer opens `$EDITOR`) |
+| `ctrl+j` | insert a newline in the input |
 | `ctrl+e` | edit the prompt buffer in `$EDITOR` (the TUI suspends; an emptied buffer clears the input) |
 | `ctrl+u` | clear the input from the cursor to the beginning of the line |
 | `ctrl+c` / `ctrl+d` | quit |
@@ -377,11 +379,13 @@ post-quit history all work. Two details of that model are visible:
   prompt symbol (idle: `clanky` + two spaces + symbol; streaming: the
   dot is lit between them); unset, the prompt is unchanged.
   Display-only (print mode ignores it).
-- Multi-line input (paste, `$EDITOR`) renders as one row per line,
-  indented under the prompt symbol, so every line starts at the same
-  column; each row scrolls horizontally to keep the caret visible, and
-  when the input outgrows the screen the rows around the caret are the
-  ones shown.
+- Multi-line input (`ctrl+j`, paste, `$EDITOR`) renders as one row per
+  line, indented under the prompt symbol, so every line starts at the
+  same column; each row scrolls horizontally to keep the caret visible,
+  and when the input outgrows the screen the rows around the caret are
+  the ones shown. Bracketed paste is on: a paste is inserted whole at
+  the caret (its newlines become input lines) and never submits — only
+  a pressed `Enter` submits.
 - The status line de-contents gracefully as the terminal narrows:
   elements are dropped one at a time — provider, thinking budget,
   model, cost, session name, the word "queued" (leaving just the dot) —

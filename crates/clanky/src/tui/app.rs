@@ -653,6 +653,18 @@ impl App {
         self.cursor += c.len_utf8();
     }
 
+    /// Insert `text` at the caret (a bracketed paste, ctrl+j's newline);
+    /// the caret lands after it. Carriage returns are dropped: terminals
+    /// deliver pastes with `\r\n` line endings (and a stray `\r` would
+    /// only move the cursor invisibly), while `\n` becomes a real input
+    /// line — so a multi-line paste is inserted whole and only a really
+    /// pressed Enter submits.
+    pub fn insert_str(&mut self, text: &str) {
+        let cleaned: String = text.chars().filter(|&c| c != '\r').collect();
+        self.input.insert_str(self.cursor, &cleaned);
+        self.cursor += cleaned.len();
+    }
+
     pub fn backspace(&mut self) {
         if let Some(pos) = self.prev_boundary() {
             self.input.replace_range(pos..self.cursor, "");
@@ -699,6 +711,116 @@ impl App {
 
     pub fn cursor_end(&mut self) {
         self.cursor = self.input.len();
+    }
+
+    // --- multi-line caret movement ------------------------------------------
+
+    /// How many physical rows the input renders as: the segments between
+    /// newlines, plus the empty final row a trailing newline yields
+    /// (the same split the input renderer draws, see `super::screen`).
+    fn line_count(&self) -> usize {
+        self.input.split('\n').count()
+    }
+
+    /// The row (0-based) the caret renders on. A caret sitting on a
+    /// newline belongs to the end of the row above (the newline ends
+    /// that row), so the newlines *strictly before* the caret count.
+    fn caret_row(&self) -> usize {
+        self.input[..self.cursor]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count()
+    }
+
+    /// Byte offset where physical row `row` starts: one past the newline
+    /// ending its predecessor; row 0 starts at 0.
+    fn row_start(&self, row: usize) -> usize {
+        if row == 0 {
+            return 0;
+        }
+        let mut seen = 0;
+        for (i, b) in self.input.bytes().enumerate() {
+            if b == b'\n' {
+                seen += 1;
+                if seen == row {
+                    return i + 1;
+                }
+            }
+        }
+        self.input.len()
+    }
+
+    /// Byte length of physical row `row` (its newline excluded).
+    fn row_len(&self, row: usize) -> usize {
+        let start = self.row_start(row);
+        self.input[start..]
+            .find('\n')
+            .unwrap_or(self.input.len() - start)
+    }
+
+    /// Byte offset where the caret's physical line starts.
+    fn line_start(&self) -> usize {
+        self.input[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    /// Byte offset where the caret's physical line ends (its newline
+    /// excluded; the buffer's end when it is the last line).
+    fn line_end(&self) -> usize {
+        self.input[self.cursor..]
+            .find('\n')
+            .map_or(self.input.len(), |i| self.cursor + i)
+    }
+
+    /// Move the caret onto physical row `row`, keeping its byte offset
+    /// within the row when that row is long enough, else parking at the
+    /// row's end (never inside a multi-byte char).
+    fn move_to_row(&mut self, row: usize) {
+        let start = self.row_start(row);
+        let column = self.cursor - self.line_start();
+        let mut target = start + column.min(self.row_len(row));
+        while target > start && !self.input.is_char_boundary(target) {
+            target -= 1;
+        }
+        self.cursor = target;
+    }
+
+    /// ↑ inside the buffer: onto the row above, keeping the offset within
+    /// the row. Returns the rows moved; `0` = already on the top row (the
+    /// caller then recalls the previous prompt). A single-row buffer is
+    /// always at its top row: plain single-line ↑ behavior.
+    pub fn cursor_up(&mut self) -> usize {
+        let row = self.caret_row();
+        if row == 0 {
+            return 0;
+        }
+        self.move_to_row(row - 1);
+        1
+    }
+
+    /// ↓ inside the buffer: onto the row below. Returns the rows moved;
+    /// `0` = already on the bottom row (the caller then steps forward
+    /// through the prompt history).
+    pub fn cursor_down(&mut self) -> usize {
+        let row = self.caret_row();
+        if row + 1 >= self.line_count() {
+            return 0;
+        }
+        self.move_to_row(row + 1);
+        1
+    }
+
+    /// ctrl+a: to the beginning of the current line.
+    pub fn cursor_line_home(&mut self) {
+        self.cursor = self.line_start();
+    }
+
+    /// ctrl+e: to the end of the current line (before its newline).
+    /// Returns whether the caret was already at the very end of the
+    /// buffer — readline semantics let the caller then open `$EDITOR`.
+    pub fn cursor_line_end(&mut self) -> bool {
+        let at_buffer_end = self.cursor == self.input.len();
+        self.cursor = self.line_end();
+        at_buffer_end
     }
 
     fn prev_boundary(&self) -> Option<usize> {
@@ -1548,6 +1670,90 @@ mod tests {
         assert_eq!(app.input, "");
         app.backspace(); // no-op at start
         assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn up_down_move_within_the_rows_of_the_buffer() {
+        let mut app = App::new(None);
+        app.input = "aaaa\nbbbb\ncccc".into();
+        app.cursor = 5; // start of "bbbb"
+
+        // Up from the middle row keeps the byte offset within the row
+        // (the caret sits at column 0 of "bbbb", so it stays at column 0).
+        assert_eq!(app.cursor_up(), 1);
+        assert_eq!(app.cursor, 0);
+        // Clamped when the row above is shorter.
+        app.input = "a\nlonger row".into();
+        app.cursor = app.input.find("row").unwrap();
+        assert_eq!(app.cursor_up(), 1);
+        assert_eq!(app.cursor, 1, "end of the short row above");
+        // On the top row ↑ reports no movement: the caller recalls.
+        assert_eq!(app.cursor_up(), 0);
+
+        app.cursor = 0;
+        assert_eq!(app.cursor_down(), 1);
+        assert_eq!(app.cursor, 2, "start of the row below");
+        // On the bottom row ↓ reports no movement: the caller walks on.
+        assert_eq!(app.cursor_down(), 0);
+        assert_eq!(app.cursor, 2);
+    }
+
+    #[test]
+    fn caret_row_tracks_newlines_strictly_before_the_caret() {
+        let mut app = App::new(None);
+        // A caret on a newline belongs to the end of the row above.
+        app.input = "one\ntwo".into();
+        app.cursor = 3;
+        assert_eq!(app.cursor_up(), 0);
+        assert_eq!(app.cursor, 3, "row above the newline is the top row");
+        app.cursor_down();
+        assert_eq!(app.cursor, 7, "onto the second row");
+    }
+
+    #[test]
+    fn a_trailing_newline_makes_the_last_row_editable() {
+        let mut app = App::new(None);
+        app.input = "hello\n".into();
+        app.cursor = 6; // end of the buffer, on the empty final row
+        // The renderer maps this caret to (row 1, column 0); ↑ keeps the
+        // column, landing at the start of "hello".
+        assert_eq!(app.cursor_up(), 1);
+        assert_eq!(app.cursor, 0, "column 0 of the row above");
+        app.cursor_down();
+        assert_eq!(app.cursor, 6, "back onto the empty final row");
+        assert_eq!(app.cursor_down(), 0, "bottom row: caller handles ↓");
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_move_within_the_current_line() {
+        let mut app = App::new(None);
+        app.input = "first\nsecond".into();
+        app.cursor = 9; // inside "second"
+        app.cursor_line_home();
+        assert_eq!(app.cursor, 6);
+        app.cursor_line_end();
+        assert_eq!(app.cursor, 12, "before nothing — line end");
+        // On the last row, ctrl+e at the buffer end opens $EDITOR.
+        assert!(app.cursor_line_end());
+        // Mid-buffer, it never reports buffer end.
+        app.cursor = 2;
+        assert!(!app.cursor_line_end());
+        assert_eq!(app.cursor, 5, "before the newline");
+    }
+
+    #[test]
+    fn a_paste_is_inserted_whole_without_carriage_returns() {
+        let mut app = App::new(None);
+        app.input = "keep ".into();
+        app.cursor = 5;
+        app.insert_str("one\r\ntwo\n");
+        assert_eq!(app.input, "keep one\ntwo\n");
+        assert_eq!(app.cursor, app.input.len());
+        // UTF-8 safety: the caret lands on a char boundary of the insert.
+        app.cursor = 0;
+        app.insert_str("é");
+        assert_eq!(app.input, "ékeep one\ntwo\n");
+        assert_eq!(app.cursor, 2);
     }
 
     #[test]

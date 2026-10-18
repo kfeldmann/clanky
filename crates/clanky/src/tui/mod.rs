@@ -34,8 +34,14 @@
 //! common prefix first, further Tabs cycle candidates, shown in a popup
 //! above the input line); ctrl+e opens `$EDITOR` with the prompt buffer —
 //! raw mode is dropped, the editor owns the terminal, and the TUI resumes
-//! with the edited text. `↑`/`↓` recall previously submitted prompts
-//! (the first `↑` saves the current input as a draft).
+//! with the edited text.
+//!
+//! The input is multi-line: `ctrl+j` inserts a newline, a bracketed paste
+//! is inserted whole (only its text, never as a submit), and `↑`/`↓`/ctrl+a/
+//! ctrl+e move within the text being edited — `↑` recalls the previous
+//! prompt only from the top row of a single-row buffer or a multi-line
+//! buffer's first row, and `↓` steps forward through history only from the
+//! bottom row.
 //!
 //! ctrl+t toggles whether streamed thinking is displayed (see
 //! [`app::App::toggle_thinking_display`]). It is display-only — the session
@@ -70,7 +76,10 @@ use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
 use clanky_protocol::{ChatMessage, ModelInfo};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use serde_json::Value;
 
@@ -319,9 +328,25 @@ fn session_cost(catalog: &Catalog, launch: &Launch, app: &App) -> Option<f64> {
     Some(pricing.session_cost(&app.billed_usage, estimated_prompt, estimated_completion))
 }
 
+/// Enables bracketed paste on construction and disables it on drop, so the
+/// terminal keeps no stale paste mode when an error unwinds through `run`
+/// (including past `restore`, whose early `?` returns skip explicit
+/// cleanup).
+struct PasteGuard(std::io::Stdout);
+
+impl Drop for PasteGuard {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::execute!(self.0, DisableBracketedPaste);
+    }
+}
+
 /// Run the interactive session until the user quits.
 pub fn run(mut launch: Launch) -> Result<()> {
     enable_raw_mode()?;
+    // Bracketed paste: pasted text arrives as one `Event::Paste` (never as
+    // key events), so a pasted newline cannot submit.
+    let mut paste = PasteGuard(std::io::stdout());
+    let _ = ratatui::crossterm::execute!(paste.0, EnableBracketedPaste);
     let (width, height) = size()?;
     let mut screen = screen::Screen::new(std::io::stdout(), width, height);
     let result = event_loop(&mut launch, &mut screen);
@@ -844,6 +869,13 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                         }
                         dirty = true;
                     }
+                }
+                // Bracketed paste: pasted text is one event, its
+                // newlines included — insert it whole at the caret, never
+                // as a submit. Only a pressed Enter submits.
+                Event::Paste(text) => {
+                    app.insert_str(&text);
+                    dirty = true;
                 }
                 // The buffer was reflowed; re-anchor the redrawable region.
                 Event::Resize(width, height) => {
@@ -1547,7 +1579,23 @@ fn handle_key(
         (true, KeyCode::Char('d')) if app.input.is_empty() => Action::Quit,
         (true, KeyCode::Char('l')) => Action::Clear,
         (true, KeyCode::Char('t')) => Action::ToggleThinking,
-        (true, KeyCode::Char('e')) => Action::OpenEditor,
+        (true, KeyCode::Char('a')) => {
+            app.cursor_line_home();
+            Action::None
+        }
+        (true, KeyCode::Char('e')) => {
+            // End of the current line when the buffer spans several
+            // lines; on the last row, open `$EDITOR` (readline semantics).
+            if app.cursor_line_end() {
+                Action::OpenEditor
+            } else {
+                Action::None
+            }
+        }
+        (true, KeyCode::Char('j')) => {
+            app.insert_char('\n');
+            Action::None
+        }
         (true, KeyCode::Char('u')) => {
             app.clear_to_start();
             Action::None
@@ -1599,11 +1647,19 @@ fn handle_key(
             Action::None
         }
         (false, KeyCode::Up) => {
-            app.history_up();
+            // On the top row the buffer is done — recall the previous
+            // prompt; inside a multi-line buffer, move within the text.
+            if app.cursor_up() == 0 {
+                app.history_up();
+            }
             Action::None
         }
         (false, KeyCode::Down) => {
-            app.history_down();
+            // On the bottom row, step forward through the history;
+            // inside a multi-line buffer, move within the text.
+            if app.cursor_down() == 0 {
+                app.history_down();
+            }
             Action::None
         }
         (false, KeyCode::Char(c)) => {
@@ -1686,6 +1742,107 @@ mod tests {
         let plain = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
         handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, plain);
         assert_eq!(app.input, "t");
+    }
+
+    #[test]
+    fn up_recalls_history_only_from_the_top_row() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+        app.input = "earlier".into();
+        app.cursor = 7;
+        app.take_input();
+
+        // Single-row buffer: ↑ recalls the previous prompt (top row).
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, up);
+        assert_eq!(app.input, "earlier");
+
+        // Multi-line buffer, caret on the top row: ↑ still recalls.
+        app.history_down(); // back to live
+        app.input = "top\nbottom".into();
+        app.cursor = 0;
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, up);
+        assert_eq!(app.input, "earlier");
+
+        // ... but on a lower row it moves within the text instead.
+        app.history_down();
+        app.input = "top\nbottom".into();
+        app.cursor = 6;
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, up);
+        assert_eq!(app.input, "top\nbottom");
+        assert_eq!(app.cursor, 2, "column 2 of the top row");
+    }
+
+    #[test]
+    fn down_steps_history_only_from_the_bottom_row() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+        app.input = "earlier".into();
+        app.cursor = 7;
+        app.take_input();
+
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        // Recall with ↑ first, then build a multi-line buffer over it.
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, up);
+        assert_eq!(app.input, "earlier");
+        app.input = "row1\nrow2\nrow3".into();
+        app.cursor = app.input.find("row2").unwrap();
+
+        // ↓ on the middle row: within the text, no history step.
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, down);
+        assert_eq!(app.input, "row1\nrow2\nrow3", "unchanged");
+        assert_eq!(
+            app.cursor,
+            app.input.find("row3").unwrap(),
+            "onto the bottom row"
+        );
+
+        // ↓ on the bottom row: a history step (past the newest entry, the
+        // saved draft comes back — here the empty draft).
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, down);
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_a_newline_and_ctrl_a_e_move_within_lines() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+
+        app.input = "one two".into();
+        app.cursor = 3;
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, j);
+        assert_eq!(app.input, "one\n two");
+
+        // ctrl+a / ctrl+e are line-scoped.
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, a);
+        assert_eq!(app.cursor, 4, "start of the second row");
+        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, e);
+        assert_eq!(app.cursor, 8, "end of the second row");
+        // On the last row at the buffer end, ctrl+e opens $EDITOR.
+        assert!(matches!(
+            handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, e),
+            Action::OpenEditor
+        ));
+        // ... mid-buffer it does not.
+        app.cursor = 1;
+        assert!(matches!(
+            handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, e),
+            Action::None
+        ));
+        assert_eq!(app.cursor, 3, "end of the first row");
     }
 
     #[test]
