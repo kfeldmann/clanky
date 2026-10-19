@@ -112,7 +112,7 @@ fn run_pipe(settings: &mut Settings, resume: Option<&str>, quiet: bool) -> Resul
         let path = session::find_by_name(name)?;
         let data = session::load(&path)?;
         messages.extend(session::history_from_records(&data.records));
-        eprintln!("resuming `{name}` ({} records)", data.records.len());
+        eprintln!("INFO: resuming `{name}` ({} records)", data.records.len());
         recorder.reopen(path);
     }
     messages.push(clanky_protocol::ChatMessage::user(&prompt_text));
@@ -234,6 +234,10 @@ struct PrintSink {
     /// block ends here it is dropped so the close can trim cleanly; if
     /// more text arrives, the held whitespace is emitted first.
     pending_ws: String,
+    /// Whether the next thinking character written needs the `> ` quote
+    /// prefix (a paragraph just started: the block opened, or a newline
+    /// was written or is pending in `pending_ws`).
+    need_quote: bool,
 }
 
 impl PrintSink {
@@ -243,6 +247,7 @@ impl PrintSink {
             in_text: false,
             in_thinking: false,
             pending_ws: String::new(),
+            need_quote: false,
         }
     }
 
@@ -254,7 +259,7 @@ impl PrintSink {
                 // it is dropped so the close can trim cleanly. If more
                 // text arrives, the held whitespace is emitted first.
                 self.in_text = true;
-                self.hold_ws(out, delta);
+                self.hold_ws(out, delta, false);
             }
             TurnEvent::Thinking { delta } => {
                 if self.quiet {
@@ -266,10 +271,10 @@ impl PrintSink {
                 if !self.in_thinking {
                     // Every thinking block opens with the prefix, so the
                     // stderr stream visibly marks where thinking starts.
-                    write!(err, "> ").ok();
+                    self.need_quote = true;
                 }
                 self.in_thinking = true;
-                self.hold_ws(err, delta);
+                self.hold_ws(err, delta, true);
             }
             // Round summaries are for the session recorder (M4); pipe
             // mode has already streamed the text deltas.
@@ -305,7 +310,7 @@ impl PrintSink {
                     return;
                 }
                 let preview = tools::truncate_call_arguments(&arguments, tools::CALL_PREVIEW_CHARS);
-                writeln!(err, "INFO: ● {name} {preview}").ok();
+                writeln!(err, "● {name} {preview}").ok();
                 writeln!(err).ok();
             }
             TurnEvent::ToolResult { name, output } => {
@@ -318,7 +323,7 @@ impl PrintSink {
                 // output character, newlines kept (never collapsed into
                 // a symbol), preview capped at a few lines.
                 let preview = tools::preview_result(&output, tools::RESULT_PREVIEW_LINES);
-                let marker = "INFO:   └─ ";
+                let marker = "  └─ ";
                 let mut lines = preview.lines();
                 let head = lines.next().unwrap_or("");
                 let indent = " ".repeat(marker.chars().count() + name.chars().count() + 2);
@@ -332,21 +337,41 @@ impl PrintSink {
     }
 
     /// Stream a delta to `w`, holding trailing whitespace back so an open
-    /// block can close on a clean trim.
-    fn hold_ws<W: Write>(&mut self, w: &mut W, delta: String) {
+    /// block can close on a clean trim. With `quote`, the `> ` prefix is
+    /// written at the start of every paragraph: after the block opens and
+    /// after each newline (including one held in `pending_ws`), before the
+    /// next character that is not itself a newline.
+    fn hold_ws<W: Write>(&mut self, w: &mut W, delta: String, quote: bool) {
         let trimmed = delta.trim_end_matches(char::is_whitespace);
         let ws = &delta[trimmed.len()..];
         if !self.pending_ws.is_empty() && !trimmed.is_empty() {
-            write!(w, "{}", self.pending_ws).ok();
+            self.write_quoted(w, &self.pending_ws.clone(), quote);
             // The held whitespace has now been emitted; drop it so it is
             // not re-emitted before every later delta.
             self.pending_ws.clear();
         }
-        if !trimmed.is_empty() {
-            write!(w, "{trimmed}").ok();
-        }
+        self.write_quoted(w, trimmed, quote);
         self.pending_ws.push_str(ws);
         w.flush().ok();
+    }
+
+    /// Write text, inserting the `> ` quote prefix after each newline
+    /// (and before a leading paragraph character) when `quote` is set.
+    fn write_quoted<W: Write>(&mut self, w: &mut W, text: &str, quote: bool) {
+        if !quote {
+            write!(w, "{text}").ok();
+            return;
+        }
+        for c in text.chars() {
+            if self.need_quote && c != '\n' {
+                write!(w, "> ").ok();
+                self.need_quote = false;
+            }
+            if c == '\n' {
+                self.need_quote = true;
+            }
+            write!(w, "{c}").ok();
+        }
     }
 
     /// Close an open text block: the held-back trailing whitespace is
@@ -419,6 +444,27 @@ mod tests {
     }
 
     #[test]
+    fn thinking_quotes_every_paragraph() {
+        // Each paragraph gets its own `> ` prefix, including paragraphs
+        // whose leading newline arrived in a held-whitespace chunk.
+        let (_, err) = run_events(
+            false,
+            &[
+                TurnEvent::Thinking {
+                    delta: "one\n\n".into(),
+                },
+                TurnEvent::Thinking {
+                    delta: "two\n".into(),
+                },
+                TurnEvent::Thinking {
+                    delta: "three".into(),
+                },
+            ],
+        );
+        assert_eq!(err, "> one\n\n> two\n> three\n\n");
+    }
+
+    #[test]
     fn thinking_held_whitespace_is_emitted_when_more_text_follows() {
         let (_, err) = run_events(
             false,
@@ -430,7 +476,7 @@ mod tests {
                 TurnEvent::Text { delta: "x".into() },
             ],
         );
-        assert_eq!(err, "> a\nb\n\n");
+        assert_eq!(err, "> a\n> b\n\n");
     }
 
     #[test]
@@ -513,7 +559,7 @@ mod tests {
             ],
         );
         assert_eq!(out, "let me check\n\ndone\n\n");
-        assert_eq!(err, "INFO: ● bash {}\n\nINFO:   └─ bash: ok\n\n");
+        assert_eq!(err, "● bash {}\n\n  └─ bash: ok\n\n");
     }
 
     #[test]
@@ -563,7 +609,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
         );
-        assert_eq!(err, "INFO: ● bash {}\n\n");
+        assert_eq!(err, "● bash {}\n\n");
     }
 
     #[test]
@@ -575,7 +621,7 @@ mod tests {
                 output: "aaa\nbbb".into(),
             }],
         );
-        assert_eq!(err, "INFO:   └─ bash: aaa\n                 bbb\n\n");
+        assert_eq!(err, "  └─ bash: aaa\n           bbb\n\n");
     }
 
     #[test]

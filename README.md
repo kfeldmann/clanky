@@ -461,12 +461,11 @@ entries read as units:
   (a tool round starts, or the turn finishes) it is trimmed and closed
   with a blank line. Tool-round texts are each closed this way, so a
   multi-round turn prints one paragraph per round.
-- Thinking blocks print the same way, on stderr, prefixed with `> ` so
-  they read as quoted asides.
-- Tool calls print as `INFO: ● name {arguments…}` (arguments
-  preview-capped).
-- Tool results render like the TUI transcript, without the color: an
-  `INFO: └─ name: …` header, continuation lines aligned under the first
+- Thinking blocks print the same way, on stderr, with each paragraph
+  prefixed with `> ` so they read as quoted asides.
+- Tool calls print as `● name {arguments…}` (arguments preview-capped).
+- Tool results render like the TUI transcript, without the color: a
+  `└─ name: …` header, continuation lines aligned under the first
   output character, newlines kept, and the preview capped at a few lines
   with a `… (+N more lines)` note.
 - Retry notices print as `INFO: ↻ message — retrying in Ns
@@ -488,7 +487,7 @@ subagent jobs stay inspectable afterwards. Pass `--no-session` (or set
 
 `--resume NAME` works in print mode too: the named session is loaded, the
 turn continues it with the full prior conversation as context, and its
-records append to the same file. A one-line note (`resuming …`) goes to
+records append to the same file. A one-line `INFO: resuming …` note goes to
 stderr, keeping stdout a clean stream of the answer. There is no picker in
 a pipe, so print mode requires a NAME (the TUI's bare `--resume` opens the
 picker).
