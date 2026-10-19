@@ -40,7 +40,7 @@
 
 use std::io::{self, Write};
 
-use ratatui::crossterm::cursor::{MoveDown, MoveTo, MoveToColumn, MoveUp};
+use ratatui::crossterm::cursor::{MoveTo, MoveToColumn, MoveUp};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{Clear, ClearType};
 use std::borrow::Cow;
@@ -114,10 +114,20 @@ impl<W: Write> Screen<W> {
         self.height = height;
         self.tail_height = 0;
         self.cursor_top = 0;
-        let sealed = app.sealed_boundary();
-        if sealed < app.entries.len() {
-            app.set_printed(sealed, 0);
+        // The buffer was reflowed and the anchor is lost. Whatever the
+        // streaming entry has printed so far is conserved across the
+        // resync: the next render commits its unprinted portion (just
+        // as sealed entries commit theirs), and the tail reprints only
+        // from there — the transcript still only ever grows downward,
+        // nothing is redrawn onto old rows. Losing this bookkeeping (an
+        // earlier resync reset it) made the redraw stream already-printed
+        // rows again — the transcript then *overwrote* instead of pushing
+        // up after every resize.
+        let printed = app.printed(app.entries.len().saturating_sub(1));
+        if app.sealed_boundary() < app.entries.len() {
+            app.set_printed(app.entries.len() - 1, printed);
         }
+        // The archived session text that was reached by cursor_top rows...
     }
 
     /// Erase the visible screen (Ctrl+L). Scrollback is preserved; the
@@ -222,16 +232,27 @@ impl<W: Write> Screen<W> {
         //   scrolled, which VTE turned into duplicated status lines.
         //   Stale content left in the region by the editor or the reflow
         //   is wiped first.
-        // - Live (steady state): the previous render parked the cursor at
-        //   the input caret, and the tail spans `tail_height` rows ending
-        //   there — so a relative move up reaches its top regardless of
-        //   where the screen has scrolled. Printing rows past the bottom
-        //   (a growing transcript) scrolls the screen, which silently
-        //   invalidates *every* absolute row address, so a live anchor
-        //   must not use CUP: it would redraw into stale rows and push the
-        //   tail into scrollback on every render. The column is reset
-        //   first (MoveUp preserves it, and printing from column > 0
-        //   would shift the tail right).
+        // - Live (steady state): everything above the previous tail is
+        //   transcript — printed once, immutable, kept by the terminal's
+        //   scrollback like a program writing to stdout. The redraw may
+        //   therefore only touch the previous tail's rows plus whatever
+        //   has grown below them. So the redraw reaches the *previous*
+        //   tail's top row from the caret parked there last frame
+        //   (`cursor_top` rows above the tail's bottom), then prints the
+        //   committed rows and the new tail DOWNWARD from there: growth
+        //   extends downward and pushes the status line down, and when
+        //   the block runs past the bottom edge the terminal scrolls
+        //   naturally and history flows into the native scrollback.
+        //   Anything above the previous tail is never touched. (The
+        //   column is reset first: MoveUp/MoveDown preserve it, and
+        //   printing from column > 0 would shift the tail right.)
+        //
+        //   A prior anchoring computed from the *new* block height
+        //   (`new_rows - 1` rows up): when the block had grown that move
+        //   started redraws rows *above* the previous tail, painting the
+        //   streaming text on top of the transcript above the tail —
+        //   text blocks visibly overwrote the prompt, the tool call and
+        //   each other instead of pushing it up.
         let new_rows = commit.len() + tail.len();
         let shrink = new_rows < self.tail_height;
         if self.tail_height == 0 {
@@ -242,30 +263,19 @@ impl<W: Write> Screen<W> {
             execute!(self.out, Clear(ClearType::FromCursorDown))?;
             self.cursor_top = 0;
         } else {
-            // The previous frame parked the caret on an input row — any
-            // row of the tail, not the bottom edge — so reach the new
-            // block's top row (`new_rows - 1` above the bottom) from
-            // where the cursor actually is. The block spans COMMIT rows
-            // above the tail too: anchoring only `tail.len()` above the
-            // bottom made the commit rows paint onto the old tail's
-            // rows while the new tail printed past the bottom edge —
-            // scrolling once per committed row and repositioning every
-            // frame, so older transcript text appeared nailed above a
-            // scrolling "viewport" instead of flowing into history.
-            // With the commit-aware move the block ends on the bottom
-            // edge again: rows pushed off the top scroll exactly once
-            // (per committed row) and the tail keeps its rows. A fixed
-            // `MoveUp(tail_height - 1)` is also wrong when the block is
-            // taller than the screen (a tall streaming entry after a
-            // resize): MoveUp clamps at the screen's top, the redraw
-            // prints past the bottom and scrolls. The delta is signed:
-            // a shrinking tail can leave the cursor above the new top.
-            let delta = new_rows as isize - 1 - self.cursor_top as isize;
-            if delta > 0 {
-                execute!(self.out, MoveUp(delta as u16))?;
-            } else if delta < 0 {
-                execute!(self.out, MoveDown((-delta) as u16))?;
-            }
+            // From the parked caret, the previous tail's top row is
+            // `tail_height - 1 - cursor_top` rows up (the caret may sit
+            // on any row of the input region: `cursor_top` counts how
+            // far above the tail's bottom row it was parked). When the
+            // cursor already sits on the previous tail's top row
+            // (`cursor_top == tail_height - 1`, the steady state after
+            // any single-row-input frame), the redraw would otherwise
+            // *start* there and overwrite it without knowing the tail
+            // has grown: the CUP frees the tail's old rows below the
+            // cursor. CUP is safe here — the redraw never scrolls
+            // upward, only downward as text is printed.
+            let up = (self.tail_height - 1).saturating_sub(self.cursor_top);
+            execute!(self.out, MoveUp(up as u16))?;
             execute!(self.out, MoveToColumn(0))?;
         }
         let mut first = true;
@@ -310,6 +320,35 @@ impl<W: Write> Screen<W> {
             }
             execute!(self.out, MoveToColumn(col))?;
             self.cursor_top = from_bottom;
+        }
+        if std::env::var_os("CLANKY_TRACE").is_some() {
+            let focus = app
+                .entries
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    crate::tui::app::Entry::Thinking(t) => {
+                        Some(format!("think[{}]", t.chars().count()))
+                    }
+                    crate::tui::app::Entry::Assistant(t) => {
+                        Some(format!("text[{}]", t.chars().count()))
+                    }
+                    crate::tui::app::Entry::ToolCall { name, .. } => Some(format!("call[{name}]")),
+                    crate::tui::app::Entry::ToolResult { name, .. } => {
+                        Some(format!("result[{name}]"))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "TRACE commit={} tail={} cursor_top={} sealed={} nentries={} last={focus} printed={:?}",
+                commit.len(),
+                tail.len(),
+                self.cursor_top,
+                sealed,
+                app.entries.len(),
+                app.printed
+            );
         }
         self.out.flush()
     }
@@ -1454,6 +1493,237 @@ mod tests {
             }
             render!(frame);
         }
+    }
+
+    #[test]
+    fn full_turn_stream_replays_cleanly() {
+        let mut app = App::new(None);
+        app.push_user("question");
+        app.busy = true;
+        let mut s = Screen::new(Buf::default(), 80, 24);
+        let mut stream = Buf::default();
+        let frame = |app: &mut App, s: &mut Screen<Buf>, stream: &mut Buf| {
+            s.render(app, &status(), None, None, None).unwrap();
+            let f = s.take_out();
+            stream.0.extend(f.0);
+        };
+        frame(&mut app, &mut s, &mut stream);
+        for n in 1..=8 {
+            app.on_turn_event(TurnEvent::Thinking {
+                delta: format!("think line {n}\n"),
+            });
+            frame(&mut app, &mut s, &mut stream);
+        }
+        app.on_turn_event(TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: "ls".into(),
+        });
+        frame(&mut app, &mut s, &mut stream);
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "file1\nfile2".into(),
+        });
+        frame(&mut app, &mut s, &mut stream);
+        for n in 1..=6 {
+            app.on_turn_event(TurnEvent::Text {
+                delta: format!("answer line {n}\n"),
+            });
+            frame(&mut app, &mut s, &mut stream);
+        }
+        let rows = stream.emulated_screen(80, 24);
+        // The call line and its result line each show `bash` once: the
+        // result no longer overwrites the call (entries push up).
+        for needle in [
+            "think line 1",
+            "think line 8",
+            "● bash",
+            "└─ bash",
+            "ls",
+            "answer line 6",
+            "question",
+        ] {
+            let n_count = rows.iter().filter(|r| r.contains(needle)).count();
+            assert!(n_count <= 1, "{needle} appears {n_count} times: {rows:?}");
+        }
+    }
+
+    /// Regression: a whole round arriving between renders (thinking, text,
+    /// tool call, tool result in one burst) commits everything at once;
+    /// the next visible frame must show all entries, none duplicated and
+    /// none lost. The per-event replay tests never caught this because
+    /// each of their frames rendered between events.
+    #[test]
+    fn whole_round_in_one_burst_commits_exactly_once() {
+        let mut app = App::new(None);
+        app.push_user("question");
+        app.busy = true;
+        let mut s = Screen::new(Buf::default(), 80, 24);
+        let mut stream = Buf::default();
+        let render = |app: &mut App, s: &mut Screen<Buf>, stream: &mut Buf| {
+            s.render(app, &status(), None, None, None).unwrap();
+            stream.0.extend(s.take_out().0);
+        };
+        render(&mut app, &mut s, &mut stream);
+        // The whole first round lands in one drain: thinking, text, tool
+        // call, tool result.
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "Considering the request... thinking line one\n".into(),
+        });
+        app.on_turn_event(TurnEvent::Text {
+            delta: "Let me check that. ".into(),
+        });
+        app.on_turn_event(TurnEvent::ToolCall {
+            name: "bash".into(),
+            arguments: "{\"command\":\"echo hi\"}".into(),
+        });
+        app.on_turn_event(TurnEvent::ToolResult {
+            name: "bash".into(),
+            output: "hi".into(),
+        });
+        app.on_turn_event(TurnEvent::Thinking {
+            delta: "second thought\n".into(),
+        });
+        app.on_turn_event(TurnEvent::Text { delta: "Tool done. Final answer with a fairly long line to force wrapping of the display row.\nSecond paragraph.".into() });
+        render(&mut app, &mut s, &mut stream);
+        let rows = stream.emulated_screen(80, 24);
+        let count = |needle: &str| rows.iter().filter(|r| r.contains(needle)).count();
+        assert_eq!(count("Let me check"), 1, "text lost/dup: {rows:?}");
+        assert_eq!(count("Considering"), 1, "thinking lost/dup: {rows:?}");
+        assert_eq!(count("echo hi"), 1, "tool call lost/dup: {rows:?}");
+        assert_eq!(count("hello-from-bash"), 0, "n/a");
+        assert_eq!(count("Tool done"), 1, "final text lost/dup: {rows:?}");
+        assert_eq!(
+            count("second thought"),
+            1,
+            "second thinking lost/dup: {rows:?}"
+        );
+        // The result no longer overwrites the call: both lines visible.
+        assert_eq!(count("● bash"), 1, "call line lost/dup: {rows:?}");
+        assert_eq!(count("└─ bash"), 1, "result line lost/dup: {rows:?}");
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("deepinfra ·")).count(),
+            1,
+            "status: {rows:?}"
+        );
+    }
+
+    /// Same burst, but rendered per event (one render after each event):
+    /// each entry must appear exactly once when the turn settles.
+    #[test]
+    fn per_event_renders_commit_exactly_once() {
+        let mut app = App::new(None);
+        app.push_user("question");
+        app.busy = true;
+        let mut s = Screen::new(Buf::default(), 80, 24);
+        let mut stream = Buf::default();
+        let render = |app: &mut App, s: &mut Screen<Buf>, stream: &mut Buf| {
+            s.render(app, &status(), None, None, None).unwrap();
+            stream.0.extend(s.take_out().0);
+        };
+        render(&mut app, &mut s, &mut stream);
+        for ev in [
+            TurnEvent::Thinking { delta: "Considering the request... thinking line one\n".into() },
+            TurnEvent::Text { delta: "Let me check that. ".into() },
+            TurnEvent::ToolCall { name: "bash".into(), arguments: "{\"command\":\"echo hi\"}".into() },
+            TurnEvent::ToolResult { name: "bash".into(), output: "hi".into() },
+            TurnEvent::Thinking { delta: "second thought\n".into() },
+            TurnEvent::Text { delta: "Tool done. Final answer with a fairly long line to force wrapping of the display row.\nSecond paragraph.".into() },
+        ] {
+            app.on_turn_event(ev);
+            render(&mut app, &mut s, &mut stream);
+            let (rows, hist) = stream.emulated(80, 24);
+                        println!("=== frame ===");
+            for (i, r) in hist.iter().enumerate() { println!("H{i:02}|{r}|"); }
+            for (i, r) in rows.iter().enumerate() { println!("S{i:02}|{r}|"); }
+        }
+        let rows = stream.emulated_screen(80, 24);
+        let count = |needle: &str| rows.iter().filter(|r| r.contains(needle)).count();
+        assert_eq!(count("Let me check"), 1, "text lost/dup: {rows:?}");
+        assert_eq!(count("Considering"), 1, "thinking lost/dup: {rows:?}");
+        assert_eq!(count("echo hi"), 1, "tool call lost/dup: {rows:?}");
+        assert_eq!(count("● bash"), 1, "call line lost/dup: {rows:?}");
+        assert_eq!(count("└─ bash"), 1, "result line lost/dup: {rows:?}");
+        assert_eq!(count("Tool done"), 1, "final text lost/dup: {rows:?}");
+        assert_eq!(
+            count("second thought"),
+            1,
+            "second thinking lost/dup: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("deepinfra ·")).count(),
+            1,
+            "status: {rows:?}"
+        );
+    }
+
+    /// Nothing that was printed may ever be rewritten: each finalized
+    /// entry (prompt, thinking, call, result, answer) pushes down and
+    /// remains visible above the newer one. Regression for the
+    /// overwrite-instead-of-push-up bug where streaming text painted
+    /// over the prompt and earlier blocks.
+    #[test]
+    fn nothing_is_ever_overwritten() {
+        let mut app = App::new(None);
+        app.push_user("question");
+        app.busy = true;
+        let mut s = Screen::new(Buf::default(), 80, 30);
+        let mut stream = Buf::default();
+        let render = |app: &mut App, s: &mut Screen<Buf>, stream: &mut Buf| {
+            s.render(app, &status(), None, None, None).unwrap();
+            stream.0.extend(s.take_out().0);
+        };
+        render(&mut app, &mut s, &mut stream);
+        for ev in [
+            TurnEvent::Thinking {
+                delta: "reasoning about the task\n".into(),
+            },
+            TurnEvent::Text {
+                delta: "I will now check. ".into(),
+            },
+            TurnEvent::ToolCall {
+                name: "bash".into(),
+                arguments: "\"command\":\"echo threedee\"".into(),
+            },
+            TurnEvent::ToolResult {
+                name: "bash".into(),
+                output: "threedee".into(),
+            },
+            TurnEvent::Text {
+                delta: "All finished with the requested task.".into(),
+            },
+        ] {
+            app.on_turn_event(ev);
+            render(&mut app, &mut s, &mut stream);
+        }
+        let rows = stream.emulated_screen(80, 30);
+        let count = |needle: &str| rows.iter().filter(|r| r.contains(needle)).count();
+        assert_eq!(count("❯ question"), 1, "prompt overwritten: {rows:?}");
+        assert_eq!(
+            count("reasoning about the task"),
+            1,
+            "thinking overwritten: {rows:?}"
+        );
+        assert_eq!(
+            count("I will now check"),
+            1,
+            "assistant text overwritten: {rows:?}"
+        );
+        assert_eq!(count("echo threedee"), 1, "call overwritten: {rows:?}");
+        assert_eq!(
+            count("└─ bash: threedee"),
+            1,
+            "result overwritten: {rows:?}"
+        );
+        assert_eq!(
+            count("All finished with the requested task"),
+            1,
+            "final text: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("deepinfra ·")).count(),
+            1,
+            "status: {rows:?}"
+        );
     }
 
     fn status() -> Status<'static> {
