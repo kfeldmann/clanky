@@ -97,7 +97,7 @@ fn hello_world_plugin_handshakes_and_answers() {
     let mut streamed = String::new();
     let output = run_turn_with(
         &mut client,
-        &tools::default_tools(),
+        &tools::default_tools(None),
         &mut messages,
         &config,
         &mut |event| {

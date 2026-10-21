@@ -91,7 +91,7 @@ use crate::recorder;
 use crate::session::{self, SessionInfo};
 use crate::settings::{SamplingParams, Settings};
 use crate::turn::{TurnConfig, TurnEvent, TurnOutput};
-use commands::{Command, SamplingEdit};
+use commands::{Command, SamplingEdit, TimeoutEdit};
 
 /// Presets offered by the bare `/thinking` picker.
 const THINKING_OPTIONS: &[(&str, &str)] = &[
@@ -133,6 +133,12 @@ pub struct Launch {
     /// Project label printed at the left of the input prompt
     /// (`project` setting; `None` = no label).
     pub project: Option<String>,
+    /// Default tool-call timeout in seconds (`timeout_seconds` setting /
+    /// `--timeout-seconds`; `None` = unbounded). Live-edited by `/timeout`.
+    pub timeout_seconds: Option<u64>,
+    /// Start the session named (`--name`); fed to the recorder as the
+    /// pending name. `None` = the generated default name.
+    pub session_name: Option<String>,
 }
 
 impl Launch {
@@ -157,6 +163,8 @@ impl Launch {
             resume: None,
             recording: settings.record_sessions(),
             project: settings.project.clone(),
+            timeout_seconds: settings.timeout_seconds,
+            session_name: None,
         }
     }
 }
@@ -419,7 +427,7 @@ fn spawn_turn(
                 };
                 crate::turn::run_turn_with(
                     session.client_mut(),
-                    &crate::tools::default_tools(),
+                    &crate::tools::default_tools(launch.timeout_seconds),
                     &mut messages,
                     &config,
                     &mut |event: TurnEvent| {
@@ -514,6 +522,7 @@ const PALETTE_BUILTINS: &[(&str, &str)] = &[
     ("/md ", "export the session as Markdown"),
     ("/name ", "rename the session"),
     ("/resume", "load a saved session"),
+    ("/timeout ", "default tool timeout"),
 ];
 
 /// Status-line text shown in place of the session name while session
@@ -714,6 +723,9 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     let mut state =
         SessionState::new(&launch.provider, launch.model.as_deref()).recording(launch.recording);
     let mut transcript_errors = TranscriptErrors::default();
+    if let Some(name) = launch.session_name.clone() {
+        state = state.with_name(&name, &mut transcript_errors);
+    }
     // Prefetch the provider's model catalog in the background: it prices
     // the session-cost display and makes `/model` instant. The fetch also
     // reports the plugin's advertised default model.
@@ -1295,6 +1307,28 @@ fn handle_command(
         Command::Thinking(None) => Action::OpenPicker(PickerKind::Thinking),
         Command::Sampling(edit) => {
             apply_sampling(launch, &edit, app);
+            Action::None
+        }
+        Command::Timeout(edit) => {
+            match edit {
+                TimeoutEdit::Show => {
+                    let description = launch.timeout_seconds.map_or_else(
+                        || "no tool timeout set (commands run unbounded)".to_string(),
+                        |seconds| format!("tool timeout: {seconds}s"),
+                    );
+                    app.entries.push(app::Entry::Info(description));
+                }
+                TimeoutEdit::Off => {
+                    launch.timeout_seconds = None;
+                    app.entries
+                        .push(app::Entry::Info("tool timeout cleared (unbounded)".into()));
+                }
+                TimeoutEdit::Seconds(seconds) => {
+                    launch.timeout_seconds = Some(seconds);
+                    app.entries
+                        .push(app::Entry::Info(format!("tool timeout set to {seconds}s")));
+                }
+            }
             Action::None
         }
         Command::System => {

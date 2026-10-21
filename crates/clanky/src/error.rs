@@ -124,6 +124,11 @@ pub enum Error {
     )]
     ResumeWithNoSession,
 
+    #[error(
+        "cannot use --name with --resume: the resumed session already has a name (use /name to rename it)"
+    )]
+    NameWithResume,
+
     #[error("$EDITOR is not set; set it to edit the prompt buffer (ctrl+e)")]
     NoEditor,
 

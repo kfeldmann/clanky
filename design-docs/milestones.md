@@ -709,3 +709,209 @@ As built notes:
    Answer: naming convension (refined in M8 planning to PATH-only lookup, no
    sibling scan and no settings entries — see `provider-plugins-plan.md`)
 4. ☐ **MCP scope when it arrives:** tools first; prompts/resources later if wanted.
+
+## ✔ M17 — Config knobs & CLI additions
+Four small, independent additions that all ride the existing settings-precedence
+machinery (user file < project file < CLI) or the `clap` surface. Grouped because
+each alone would be a one-line milestone; they should land **before** M18 so the
+settings dump (M18) covers them from day one.
+
+1. Tool-call timeout, settings + CLI + `/timeout`:
+   - The per-tool default deadline moves from `bash`-specific to generic: the
+     `Tool` layer gets a configurable default timeout applied to any tool call
+     that does not specify `timeout_seconds`. Default remains unset =
+     unbounded (unchanged behavior); unset is invisible to the tool, exactly
+     as today.
+   - The timeout is enforced at the `Tool` layer, and what expiry *means*
+     depends on whether the tool can be cancelled:
+     - **Killable tools** delegate their work to a child process (today only
+       `bash`). Expiry is real cancellation: the child's process group gets
+       TERM/KILL, the call ends because the work ended. This is today's
+       behavior, unchanged.
+     - **In-process tools** (planned `edit`, any future non-spawning built-in)
+       have no child to kill; expiry can only mean abandonment: run the call,
+       on deadline either surface the timeout error and possibly leave the
+       work finishing on a detached strand, or (better) don't enforce at all
+       when the tool can genuinely block on no recoverable path. The
+       distinction is a per-tool property: in-process tools declare whether
+       the default deadline applies to them. `edit`-class tools — plain
+       buffered file IO that finishes in milliseconds or fails — do not; the
+       default deadline is for killable tools plus any future tool where a
+       hang is plausible and abandonment is safe (e.g. a network-fetch tool).
+       Rationale: an abandonment timeout on a non-idempotent in-process tool
+       lies to the model — the tool-timeout error invites a retry while the
+       abandoned work may still complete, so `edit` could double-apply.
+   - `timeout_seconds` setting (`[settings] timeout_seconds`), `--timeout-seconds
+     N` CLI flag, and `/timeout <seconds|off>` slash command (off = clear back to
+     unbounded, i.e. unset — the per-call field still wins over the configured
+     default). Precedence: CLI > project > user, `/timeout` changes the live
+     value.
+   - An expired killable call surfaces as today's tool-timeout error (group
+     TERM/KILL). Tools that opt out of the default deadline are unaffected by
+     it entirely.
+2. `--project` CLI option: overlays the existing `project` display label
+   (same per-field overlay as all settings; label shown at the input prompt and
+   (from M18) in the settings dump).
+3. `--name NAME` CLI option: starts the session named (`default_name()` skipped
+   in both TUI and print mode). Validated by the same `validate_name`; `--name`
+   together with `--resume` is a usage error (one shared message for both modes).
+   `/name` still works mid-session.
+4. `--help` text updated as items land.
+
+Done when: `--timeout-seconds 5 --name fix --project clanky clanky -p …` runs, a
+long command is killed at 5 s (in TUI too, via `/timeout`), precedence CLI >
+project > user verified, `--name` + `--resume` shared error, README updated.
+
+As built notes:
+- The generic deadline lives in `tools::default_tools(timeout_seconds)`: the
+  `Tool` layer builds the set from the merged setting each turn (print mode in
+  `run_pipe`, TUI in `spawn_turn`), so a `/timeout` edit takes effect from the
+  next call without rebuilding anything. Unset goes through as the
+  `UNSET_DEADLINE` sentinel (≈`u64::MAX/2` seconds): the deadline machinery
+  runs unconditionally (a command always spawns in its own process group,
+  never only when a deadline exists), but a deadline past `Instant`'s range
+  never fires, so "unbounded" behaves exactly as before. Per-call `timeout_seconds` wins over the configured default in
+  both directions; a per-call value is still validated the same way (0
+  rejected, non-integer rejected).
+- The M17 design's killable-vs-in-process distinction is not a code path yet:
+  only `bash` exists today and it is killable, so the enforcement is plain
+  TERM/KILL cancellation, unchanged from M2. `edit`-class tools (M19) will
+  opt out by simply never consulting the default deadline (plain buffered IO
+  has no recoverable hang to abandon).
+- `/timeout <seconds|off>` parses `off`/positive-integers/`show` (no arg) and
+  rejects 0 and non-numeric values; the TUI palette gained a `/timeout ` entry.
+  The live edit happens on `Launch.timeout_seconds` — a struct field like its
+  siblings, never written back to a settings file (M18's settings *dump* will
+  still observe `/timeout` changes via records; that work is M18). Note
+  the process-group spawn became unconditional: with the sentinel deadline it
+  changes nothing observable — an unbounded command is never killed and
+  ctrl+c still reaches the child because the terminal keeps delivering to
+  the foreground process group.
+- `--name`: a new `Recorder::with_name(name, errors)` builder sets the pending
+  name before any record (validation errors go through the front end's usual
+  `ErrorSink`), so print mode and TUI share one code path; `--name` +
+  `--resume` resolves to the shared `Error::NameWithResume` in `run` before
+  either front end starts.
+- `--timeout-seconds` is `u64` (clap's own parse error on non-numeric input —
+  exit 2), `--project` maps onto the existing `project` setting's overlay
+  field (`cli.overrides()`), `--name` stays out of `Settings` because it is a
+  session concern, not a setting. The one subtlety with the trailing-var-arg
+  prompt surface: flags must precede the positional PROMPT arguments (a flag
+  after the first free word is swallowed by the prompt) — noted in the CLI
+  test.
+
+## ☐ M18 — Settings observability: startup dump + settings records in the log
+The merged configuration is currently observable only by reading the status line
+(provider · model) and guessing at the rest. Two coupled pieces:
+
+1. **Startup INFO dump** (both TUI and print mode): model, provider, and the
+   merged settings, printed at startup. Print mode writes it to stderr (stdout
+   stays the response/quiet channel). Plain merged values — no per-field
+   source-layer attribution. Unset fields elided.
+2. **A dedicated `Settings` record type** in the session file, carrying model +
+   provider (migrated out of the header) plus the merged settings, written:
+   - at session start (before the first user record), and
+   - in the order the changes happen, whenever settings change mid-session
+     (`/model`, `/thinking`, `/sampling`, `/timeout` — M17 adds the last). The
+     record type is versioned like every record; format-version notes updated.
+   - **On `/resume` (M14 semantics, both modes): the records never *set* values.**
+     The session's settings records are read and folded in order (later
+     records win per field, exactly as they were written) to reconstruct the
+     settings state as of the end of the resumed session; that folded state is
+     compared against the currently active settings and a change record is
+     written for the differences. From the resumed session's perspective the
+     settings therefore appear to have changed mid-session, in order.
+3. Header migration: provider/model move to settings records; loading an
+   old file keeps them working (header still parsed and used if no settings
+   record exists — the existing forward-compatible-skip rule does not apply
+   to the header, which is versioned explicitly). With the never-rewritten
+   fields gone, the header becomes write-once (`version`, `created` only):
+   `Header::stop_reason` and `SessionWriter::set_stop_reason` are removed —
+   dead code, never called outside `session.rs` tests (the per-turn
+   `StopReason` record appended by the recorder carries the data; the
+   `/resume` picker never read the header field). `Mode::Reopen` stops
+   reading the header line back (it existed only to preserve `stop_reason`
+   when rewriting). Old files load fine: its absence in real files is why
+   it was spotted here.
+
+Done when: `clanky -p "hi"` shows the INFO dump on stderr; the session file's
+first record is a settings record with model/provider (header no longer carries
+them, old files still resume); a `/model` change writes a settings record; a
+`/resume` of a session whose settings differed writes a change record.
+
+## ☐ M19 — Edit tool
+A built-in `edit` tool beside `bash` behind the `Tool` trait; unrestricted paths
+(no trust system — bash already writes anywhere; the value of the tool is intent
+and failure messages for the model, not a permission boundary).
+
+1. Schema: `path`, `old_string`, `new_string`, optional `replace_all: bool`.
+   Semantics: literal byte-for-byte match, no patterns/wildcards:
+   - zero matches → error "not found"
+   - multiple matches, no `replace_all` → error naming the match count and
+     asking for more surrounding context (failures are data: fed back so the
+     model can recover)
+   - `replace_all` → every occurrence replaced
+2. No requirement to read-before-edit. We don't have a read tool. We can think
+   about adding such a requirement in the future.
+3. Model result: a short confirmation, not file contents and not a diff —
+   the tool call in context already carries `old_string`/`new_string`:
+   - success: `Replaced N occurrence(s) in <path>` (the count is how the
+     model confirms it did what it intended). No separate line-capped
+     preview; the display preview is simply this result text, capped by the
+     usual `preview_result` like any tool result.
+   - failure: the error message as a normal `ToolResult` (recovery
+     possible), not a turn error. No separate error path: like a non-zero
+     bash exit, failures rise from `is_failed_result`/`ERROR:` prefixing
+     as usual and the TUI renders the result text red; standard result
+     color on success.
+4. Session records unchanged: an Edit is a normal `ToolResult` record.
+5. README tool table updated.
+
+Done when: `clanky -p "change the title in README.md to X"` performs a Read +
+Edit + write cycle and succeeds; a dissertation on uniqueness/non-match read
+back as tool results, golden transcripts updated.
+
+## ☐ M20 — View-image (vision) tool
+A built-in `view-image` tool that puts an image file into the model's context,
+for multimodal models. Scope: **image → model only.** The TUI never displays the
+image (tool-result entry shows size like any result); the model never generates
+images. Cards on the table:
+
+1. **Protocol (the blocker's resolution):** `ChatMessage` gains an optional,
+   additive image list — `Vec<ImagePart> { data_base64, media_type }`, new in a
+   minor protocol version (additive in v2; adapters without the field are no
+   longer needed since all three are ours). Text content stays the primary
+   field; turns continue to send text. A tool result may carry images in
+   addition to its text — the turn loop / adapter layer is responsible for
+   building the backend request shapes:
+   - OpenAI-compatible (DeepInfra, LiteLLM): `image_url` data-URI parts
+     (`data:<media>;base64,<data>`)
+   - Anthropic: `image` source blocks (inside the `tool_result` block, which
+     the Messages API permits, or a follow-up `user` message — decided at
+     implementation)
+   A model that can't accept images 400s; the backend's error is surfaced
+   unchanged (invariant 2) — no local capability whitelist. A future optional
+   `supportsImages` hint (LiteLLM-style) could curate the picker, like
+   `supportsTools` in M10 — not required for this milestone.
+2. Tool: `view-image {"path": …}`, description: "Read an image file from disk
+   and attach it so you can see it." (Name chosen over `read-image`/`vision`:
+   action-shaped verb matching how users phrase the intent — "show me", "take a
+   look", "see this screenshot" — while `view_` avoids the computer-science
+   connotation of "reading a file".) Reads a local file, base64-encodes it,
+   returns a tool result whose text is a size note ("256 kb") and whose images
+   list carries the data. Unknown/undetectable media types resolve from the
+   filename extension (err for unknowns).
+3. **Session records: keep it replayable.** A tool result with images is
+   written in full base64 (a screenshot is ~300–400 KB encoded — large lines in
+   the JSONL, but the whole session file format rests on "replay reconstructs
+   exactly what the model saw"; truncating it violates that with no principled
+   cap). Record schema documents the size expectation. `history_from_records`
+   rebuilds the image parts.
+4. Print mode `-pq`: an image result prints only its size note.
+
+Design notes (wire shapes for all three backends, media-type table, session
+size caveat) go in a short `design-docs/read-image-plan.md`, matching the
+pattern of M10/M11 planning docs.
+Done when: `clanky -p "what's in /work/screenshot.png"` against a vision model
+returns a description; the session replays and the model answers about the
+image again; a text-only model surfaces the backend error unchanged.

@@ -58,6 +58,7 @@ All fields are optional; unknown keys are rejected with a parse error.
 | `prompt`   | string           | Prompt text (mainly useful on the CLI, not in a file) |
 | `session`  | boolean          | `false` disables session recording in every mode (default: on) |
 | `project`  | string           | Label shown at the left of the TUI input prompt (TUI only) |
+| `timeout_seconds` | integer  | Default tool-call timeout in seconds (`bash` calls without their own `timeout_seconds` run unbounded when unset) |
 
 Example:
 
@@ -99,6 +100,15 @@ Notes:
   (TUI) or on stderr (pipe mode). A round that already streamed content is
   never replayed, so a retry cannot duplicate output. Set it on the CLI
   with `--max-retries`.
+- `timeout_seconds` sets the **default tool timeout**, applied to any tool
+  call that does not pass its own `timeout_seconds` (today that is only
+  `bash`). Unset — the default — means unbounded, exactly as before; a
+  per-call `timeout_seconds` on the call always wins over the configured
+  default, in both directions. Set it on the CLI with `--timeout-seconds`,
+  or live in the TUI with `/timeout <seconds|off>` (`off` clears back to
+  unbounded). An expired killable call (e.g. `bash`) is real cancellation:
+  the whole command tree is TERM/KILLed and the model sees the timeout
+  error.
 - Precedence is per field: CLI flag > project file > user file, and a
   scope only overrides fields it actually sets. For `[sampling]` the merge
   is per key: keys set in a higher layer win, and keys set only in a lower
@@ -109,12 +119,16 @@ Notes:
 
 Commands run in the project directory with **no timeout**: they run until
 they finish. If the model wants a deadline it passes `timeout_seconds`
-(any positive number of seconds) on the call — that voluntary timeout is
-honored, and the command's **whole process tree** is killed (TERM, then
-KILL) when it expires, so grandchildren cannot outlive the deadline and
-wedge the call. A command run without `timeout_seconds` shares Clanky's
-process group, so terminal ctrl+c still reaches it. Output sent to the
-model is capped at 20 000 characters (then `… (output truncated)`).
+(any positive number of seconds) on the call — and a configured default
+(`timeout_seconds` setting, `--timeout-seconds`, `/timeout`) applies when
+the call passes none. The per-call value always wins over the configured
+default; without either, a command runs unbounded. Any deadline is
+honored by killing the command's **whole process tree** (TERM, then KILL)
+when it expires, so grandchildren cannot outlive the deadline and wedge
+the call. Without any deadline the group is never killed and the command
+runs until it exits on its own (terminal ctrl+c propagates through
+Clanky's own turn cancellation as before). Output sent to the model is
+capped at 20 000 characters (then `… (output truncated)`).
 
 ### Session precedence note
 
@@ -133,6 +147,11 @@ exports what the screen showed.
 a picker of saved sessions when `NAME` is omitted): the transcript and the
 full conversation history are restored, and the turn's records append to
 the same file.
+
+`--name NAME` starts a session under a fixed name instead of the generated
+timestamped one (same validation as `/name`, in both modes);
+`--name` together with `--resume` is a usage error — the resumed file
+already has its name (`/name` can still rename it mid-session).
 
 Sessions autosave as the conversation happens. When a turn is cut short —
 a provider error mid-stream, or `ctrl+c` quitting while the answer is
@@ -374,7 +393,8 @@ post-quit history all work. Two details of that model are visible:
   printed; resizing does not rewrite scrollback.
 - Resizing, returning from `$EDITOR`, and clearing redraw the bottom
   region in place; nothing is pushed into scrollback by a redraw.
-- A `project` label (the `project` setting) prints at the left of the
+- A `project` label (the `project` setting or `--project`) prints at the
+  left of the
   input prompt: `project = "clanky"` renders the label before the
   prompt symbol (idle: `clanky` + two spaces + symbol; streaming: the
   dot is lit between them); unset, the prompt is unchanged.
@@ -414,6 +434,15 @@ therefore affects text from that point on:
   streaming ends the block there and prints `Thinking...`; turning it on
   resumes printing from that delta — possibly mid-sentence, as a new
   block below what was already printed.
+
+### `/timeout` — the default tool timeout
+
+`/timeout` shows the current default tool timeout (as a transcript info
+line), `/timeout N` sets it to `N` seconds, and `/timeout off` clears it back to unbounded.
+The default applies to any tool call that passes no `timeout_seconds` of
+its own; a per-call value always wins. Same effect as the
+`timeout_seconds` setting or `--timeout-seconds`; the TUI edit changes
+the live session (and is not written back to any settings file).
 
 ### `/md` — export the session as Markdown
 
@@ -490,7 +519,9 @@ turn continues it with the full prior conversation as context, and its
 records append to the same file. A one-line `INFO: resuming …` note goes to
 stderr, keeping stdout a clean stream of the answer. There is no picker in
 a pipe, so print mode requires a NAME (the TUI's bare `--resume` opens the
-picker).
+picker). `--name NAME` names the new session file in print mode too;
+`--name` with `--resume` is rejected in both modes with the same usage
+error.
 
 ## Parallel subagents (`clanky-subagents`)
 

@@ -52,6 +52,22 @@ pub struct Cli {
     #[arg(long)]
     pub max_retries: Option<u32>,
 
+    /// Default tool-call timeout in seconds, applied to any tool call (e.g.
+    /// `bash`) that does not pass its own `timeout_seconds`. Unset means
+    /// unbounded. Overrides settings.
+    #[arg(long, value_name = "SECONDS")]
+    pub timeout_seconds: Option<u64>,
+
+    /// Project label shown at the left of the TUI input prompt (overrides
+    /// the `project` setting; display only — print mode ignores it).
+    #[arg(long)]
+    pub project: Option<String>,
+
+    /// Start the session named NAME (both modes; validated like `/name`).
+    /// Together with --resume this is a usage error.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
     /// Disable session recording in every mode: no session file is
     /// created, `--resume` is rejected, and the TUI's `/name`, `/resume`
     /// and status line reflect that sessions are off.
@@ -89,7 +105,8 @@ impl Cli {
             max_retries: self.max_retries,
             prompt,
             session: self.no_session.then_some(false),
-            project: None,
+            project: self.project.clone(),
+            timeout_seconds: self.timeout_seconds,
         }
     }
 }
@@ -183,6 +200,29 @@ mod tests {
         // Without the flag the field stays unset (recording stays on).
         let over = cli_with(&["-p", "hi"]).overrides();
         assert_eq!(over.session, None);
+    }
+
+    #[test]
+    fn timeout_project_and_name_flags_map_to_settings() {
+        // Flags must come before the trailing prompt arguments.
+        let cli = cli_with(&[
+            "-p",
+            "--timeout-seconds",
+            "5",
+            "--project",
+            "clanky",
+            "--name",
+            "fix",
+            "hi",
+        ]);
+        let over = cli.overrides();
+        assert_eq!(over.timeout_seconds, Some(5));
+        assert_eq!(over.project.as_deref(), Some("clanky"));
+        assert_eq!(cli.name.as_deref(), Some("fix"));
+        // Absent flags stay unset.
+        let over = cli_with(&["-p", "hi"]).overrides();
+        assert_eq!(over.timeout_seconds, None);
+        assert_eq!(over.project, None);
     }
 
     #[test]

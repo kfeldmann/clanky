@@ -53,6 +53,10 @@ pub struct Settings {
     /// `project = "clanky"` renders `clanky  ❯ `). Display-only: the
     /// print front end ignores it.
     pub project: Option<String>,
+    /// Default tool-call timeout in seconds, applied to any tool call that
+    /// does not pass its own `timeout_seconds`. Unset (default) means
+    /// unbounded — unchanged behavior.
+    pub timeout_seconds: Option<u64>,
 }
 
 impl Settings {
@@ -131,6 +135,9 @@ impl Settings {
         if over.project.is_some() {
             self.project = over.project;
         }
+        if over.timeout_seconds.is_some() {
+            self.timeout_seconds = over.timeout_seconds;
+        }
     }
 
     /// Whether conversations are recorded into session files. Sessions
@@ -160,6 +167,14 @@ mod tests {
     }
 
     #[test]
+    fn timeout_seconds_parses_from_toml() {
+        let tmp = std::env::temp_dir();
+        let path = write_temp_settings(&tmp.join("clanky-test-timeout"), "timeout_seconds = 5\n");
+        let settings = Settings::load_file(&path).unwrap().unwrap();
+        assert_eq!(settings.timeout_seconds, Some(5));
+    }
+
+    #[test]
     fn missing_files_yield_defaults() {
         let merged = Settings::load_from_paths(&[
             PathBuf::from("/nonexistent-user/settings.toml"),
@@ -167,6 +182,25 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(merged, Settings::default());
+    }
+
+    #[test]
+    fn timeout_seconds_overlays_per_field() {
+        let base = Settings {
+            timeout_seconds: Some(30),
+            ..Settings::default()
+        };
+        // A setting layer that does not set it keeps the lower value.
+        let mut merged = base.clone();
+        merged.overlay(Settings::default());
+        assert_eq!(merged.timeout_seconds, Some(30));
+        // A higher layer wins.
+        let mut merged = base;
+        merged.overlay(Settings {
+            timeout_seconds: Some(5),
+            ..Settings::default()
+        });
+        assert_eq!(merged.timeout_seconds, Some(5));
     }
 
     #[test]

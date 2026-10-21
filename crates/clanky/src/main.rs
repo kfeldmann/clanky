@@ -54,6 +54,12 @@ fn run(cli: &cli::Cli) -> Result<()> {
         return Err(clanky::error::Error::ResumeWithNoSession);
     }
 
+    // One shared rejection for both front ends: the resumed file already
+    // has its name.
+    if cli.resume.is_some() && cli.name.is_some() {
+        return Err(clanky::error::Error::NameWithResume);
+    }
+
     if cli.print || !tui::available() {
         // No prompt on the command line and no piped stdin: nothing to do
         // in command-line mode, so show usage instead of a cryptic error.
@@ -61,7 +67,12 @@ fn run(cli: &cli::Cli) -> Result<()> {
             eprint!("{}", cli::Cli::command().render_help());
             std::process::exit(2);
         }
-        return run_pipe(&mut settings, cli.resume.as_deref(), cli.quiet);
+        return run_pipe(
+            &mut settings,
+            cli.resume.as_deref(),
+            cli.quiet,
+            cli.name.as_deref(),
+        );
     }
 
     // Interactive mode. A prompt given on the command line starts the
@@ -72,6 +83,7 @@ fn run(cli: &cli::Cli) -> Result<()> {
         .unwrap_or_else(|| provider::DEFAULT_PROVIDER.into());
     let mut launch = tui::Launch::from_settings(&provider_name, &settings);
     launch.resume = cli.resume.clone();
+    launch.session_name = cli.name.clone();
     tui::run(launch)
 }
 
@@ -81,7 +93,12 @@ fn run(cli: &cli::Cli) -> Result<()> {
 /// The turn is recorded into a session file exactly as a TUI run would
 /// (M14): same recorder, same partial flush when the turn is cut short —
 /// by an error or by ctrl+c.
-fn run_pipe(settings: &mut Settings, resume: Option<&str>, quiet: bool) -> Result<()> {
+fn run_pipe(
+    settings: &mut Settings,
+    resume: Option<&str>,
+    quiet: bool,
+    name: Option<&str>,
+) -> Result<()> {
     let prompt_text = clanky::prompt::resolve(settings.prompt.take())?;
     let provider_name = settings
         .provider
@@ -102,6 +119,9 @@ fn run_pipe(settings: &mut Settings, resume: Option<&str>, quiet: bool) -> Resul
         clanky::recorder::Recorder::new(provider_session.name(), config.model.as_deref())
             .recording(settings.record_sessions());
     let mut errors = clanky::recorder::StderrErrors;
+    if let Some(name) = name {
+        recorder = recorder.with_name(name, &mut errors);
+    }
 
     // `--resume NAME`: load the session, rebuild the conversation the next
     // turn continues (system context fresh, records' history appended), and
@@ -173,7 +193,7 @@ fn run_pipe(settings: &mut Settings, resume: Option<&str>, quiet: bool) -> Resul
         let mut err = stderr.lock();
         let result = turn::run_turn_with(
             provider_session.client_mut(),
-            &tools::default_tools(),
+            &tools::default_tools(settings.timeout_seconds),
             &mut messages,
             &config,
             &mut |event: TurnEvent| {

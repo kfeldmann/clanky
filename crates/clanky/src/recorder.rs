@@ -58,6 +58,21 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// Name the session file before anything is recorded (`--name`).
+    /// Consuming-and-returning like the `recording` builder; on an invalid
+    /// name the recorder is dropped (the caller reports the validation
+    /// error and discards the recorder anyway).
+    pub fn with_name(mut self, name: &str, errors: &mut dyn ErrorSink) -> Self {
+        if self.recording {
+            if let Err(err) = session::validate_name(name) {
+                errors.report(err.to_string());
+                return self;
+            }
+            self.pending_name = Some(name.to_string());
+        }
+        self
+    }
+
     /// A recorder for a fresh session (provider and model are stamped
     /// into the file header when the file is created).
     pub fn new(provider: &str, model: Option<&str>) -> Self {

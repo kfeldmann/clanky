@@ -27,7 +27,7 @@
                 "type": "string"
               },
               "timeout_seconds": {
-                "description": "Optional per-call timeout override in seconds (commands run unbounded without it)",
+                "description": "Optional per-call timeout override in seconds (wins over the configured default; without it the configured default applies, unbounded when none is set)",
                 "minimum": 1,
                 "type": "integer"
               }
@@ -85,7 +85,7 @@
                 "type": "string"
               },
               "timeout_seconds": {
-                "description": "Optional per-call timeout override in seconds (commands run unbounded without it)",
+                "description": "Optional per-call timeout override in seconds (wins over the configured default; without it the configured default applies, unbounded when none is set)",
                 "minimum": 1,
                 "type": "integer"
               }

@@ -21,6 +21,8 @@ pub enum Command {
     Thinking(Option<String>),
     /// `/sampling [edits]`.
     Sampling(SamplingEdit),
+    /// `/timeout <seconds|off>`: set or clear the default tool timeout.
+    Timeout(TimeoutEdit),
     /// `/system`: show the assembled system prompt in the transcript.
     System,
     /// `/md [flags] [filename]`: export the session to a Markdown file;
@@ -38,6 +40,17 @@ pub enum Command {
         template: Template,
         extra: Option<String>,
     },
+}
+
+/// A `/timeout` argument shape.
+#[derive(Debug, PartialEq)]
+pub enum TimeoutEdit {
+    /// `/timeout` (no argument): show the current setting.
+    Show,
+    /// `/timeout off`: clear back to unbounded.
+    Off,
+    /// `/timeout N`: set the default tool timeout to N seconds.
+    Seconds(u64),
 }
 
 /// A `/sampling` argument shape.
@@ -75,6 +88,7 @@ pub fn parse_command(
         "provider" => Ok(Command::Provider(optional_arg())),
         "thinking" => Ok(Command::Thinking(optional_arg())),
         "sampling" => parse_sampling(arg).map(Command::Sampling),
+        "timeout" => parse_timeout(arg).map(Command::Timeout),
         "system" => Ok(Command::System),
         "md" => parse_md(arg),
         _ if let Some(template) = templates.iter().find(|t| t.name == word) => {
@@ -88,6 +102,31 @@ pub fn parse_command(
              to .clanky/prompts/"
         )),
     })
+}
+
+/// Parse the `/timeout` argument: nothing (show), `off`, or a positive
+/// number of seconds.
+fn parse_timeout(arg: &str) -> std::result::Result<TimeoutEdit, String> {
+    if arg.is_empty() {
+        return Ok(TimeoutEdit::Show);
+    }
+    if arg == "off" {
+        return Ok(TimeoutEdit::Off);
+    }
+    arg.parse::<u64>().map_or_else(
+        |_| {
+            Err(format!(
+                "invalid timeout `{arg}`: expected seconds, or `off`"
+            ))
+        },
+        |seconds| {
+            if seconds == 0 {
+                Err("timeout must be at least 1 second (use `off` for unbounded)".into())
+            } else {
+                Ok(TimeoutEdit::Seconds(seconds))
+            }
+        },
+    )
 }
 
 /// Parse the `/md` argument: optional `--all`/`--thinking`/`--tools`
@@ -198,6 +237,35 @@ mod tests {
         assert_eq!(
             parse_command("/provider", none),
             Some(Ok(Command::Provider(None)))
+        );
+    }
+
+    #[test]
+    fn timeout_parses_shapes() {
+        let none = &[];
+        assert_eq!(
+            parse_command("/timeout", none),
+            Some(Ok(Command::Timeout(TimeoutEdit::Show)))
+        );
+        assert_eq!(
+            parse_command("/timeout 30", none),
+            Some(Ok(Command::Timeout(TimeoutEdit::Seconds(30))))
+        );
+        assert_eq!(
+            parse_command("/timeout off", none),
+            Some(Ok(Command::Timeout(TimeoutEdit::Off)))
+        );
+        assert_eq!(
+            parse_command("/timeout 0", none),
+            Some(Err(
+                "timeout must be at least 1 second (use `off` for unbounded)".into()
+            ))
+        );
+        assert_eq!(
+            parse_command("/timeout soon", none),
+            Some(Err(
+                "invalid timeout `soon`: expected seconds, or `off`".into()
+            ))
         );
     }
 

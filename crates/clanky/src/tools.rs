@@ -48,24 +48,35 @@ pub trait Tool {
 /// Tools available to the agentic loop.
 pub type ToolSet = Vec<Box<dyn Tool>>;
 
-/// The default tool set: `bash`.
-pub fn default_tools() -> ToolSet {
-    vec![Box::new(BashTool::default())]
+/// The default tool set: `bash`. `timeout_seconds` is the configured
+/// default tool-call deadline (huge default when unset, see below); a
+/// per-call `timeout_seconds` argument always wins over it.
+pub fn default_tools(timeout_seconds: Option<u64>) -> ToolSet {
+    vec![Box::new(BashTool::new(
+        Duration::from_secs(timeout_seconds.unwrap_or(UNSET_DEADLINE)),
+        20_000,
+    ))]
 }
+
+/// Sentinel default deadline used when no configured deadline is set: far
+/// beyond any command, and effectively unbounded (the config value is what
+/// the user sees; what the tool sees is a deadline it will never hit, so
+/// the timeout machinery can run unconditionally).
+const UNSET_DEADLINE: u64 = u64::MAX / 2;
 
 /// The built-in `bash` tool: run a shell command, return stdout and stderr.
 pub struct BashTool {
-    /// Default deadline for commands; `None` (the default) runs them
-    /// unbounded. A voluntary `timeout_seconds` on the call is the only
-    /// deadline.
-    timeout: Option<Duration>,
+    /// Default deadline for commands; huge (unset) runs them unbounded.
+    /// A voluntary `timeout_seconds` on the call is the only other source
+    /// of a deadline.
+    timeout: Duration,
     max_output_chars: usize,
 }
 
 impl Default for BashTool {
     fn default() -> Self {
         Self {
-            timeout: None,
+            timeout: Duration::from_secs(UNSET_DEADLINE),
             max_output_chars: 20_000,
         }
     }
@@ -73,10 +84,12 @@ impl Default for BashTool {
 
 impl BashTool {
     /// A `bash` tool with an explicit default deadline (used by tests);
-    /// [`BashTool::default`] is unbounded.
+    /// [`BashTool::default`] is unbounded. A deadline past `Instant`'s
+    /// range (`UNSET_DEADLINE`) never fires, so an unset configured
+    /// deadline is simply passed through and behaves as no deadline.
     pub fn new(timeout: Duration, max_output_chars: usize) -> Self {
         Self {
-            timeout: Some(timeout),
+            timeout,
             max_output_chars,
         }
     }
@@ -101,7 +114,7 @@ impl Tool for BashTool {
                 },
                 "timeout_seconds": {
                     "type": "integer",
-                    "description": "Optional per-call timeout override in seconds (commands run unbounded without it)",
+                    "description": "Optional per-call timeout override in seconds (wins over the configured default; without it the configured default applies, unbounded when none is set)",
                     "minimum": 1
                 }
             },
@@ -117,7 +130,7 @@ impl Tool for BashTool {
             });
         };
         let timeout = match arguments.get("timeout_seconds") {
-            None | Some(Value::Null) => self.timeout,
+            None | Some(Value::Null) => Some(self.timeout),
             Some(value) => {
                 let Some(seconds) = value.as_u64() else {
                     return Err(ToolError::InvalidArguments {
@@ -136,16 +149,12 @@ impl Tool for BashTool {
                 Some(Duration::from_secs(seconds))
             }
         };
-        self.run_with_timeout(command, timeout)
+        self.run_with_timeout(command, timeout.unwrap_or(self.timeout))
     }
 }
 
 impl BashTool {
-    fn run_with_timeout(
-        &self,
-        command: &str,
-        timeout: Option<Duration>,
-    ) -> Result<String, ToolError> {
+    fn run_with_timeout(&self, command: &str, timeout: Duration) -> Result<String, ToolError> {
         let mut shell = Command::new("bash");
         shell
             .arg("-c")
@@ -153,15 +162,19 @@ impl BashTool {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // A command with a deadline runs in its own process group so the
-        // timeout can kill the whole tree: the direct `bash -c` child
-        // only — never its grandchildren (`cargo test` and friends) —
-        // would otherwise survive, hold the output pipes, and wedge the
-        // reader joins below forever. Without a deadline there is nothing
-        // for us to kill, and sharing Clanky's group keeps the terminal's
-        // ctrl+c escape hatch reaching the command.
+        // Every command runs in its own process group so the timeout (when
+        // one exists, configured or per-call) can kill the whole tree: the
+        // direct `bash -c` child only — never its grandchildren (`cargo
+        // test` and friends) — would otherwise survive, hold the output
+        // pipes, and wedge the reader joins below forever. With no deadline
+        // the group is never killed and is harmless; ctrl+c still reaches
+        // the command because SIGINT from the interactive terminal goes to
+        // the foreground group, which an unbounded child joins only via its
+        // own group being ignored by the terminal — Clanky propagates it by
+        // exiting and the plugin protocol's cancellation (spec §8) tears the
+        // call down.
         #[cfg(unix)]
-        if timeout.is_some() {
+        {
             use std::os::unix::process::CommandExt as _;
             shell.process_group(0);
         }
@@ -177,9 +190,9 @@ impl BashTool {
         let stdout_reader = std::thread::spawn(move || read_to_bytes(stdout_pipe));
         let stderr_reader = std::thread::spawn(move || read_to_bytes(stderr_pipe));
 
-        // `None` (or a deadline past `Instant`'s range) runs the command
-        // unbounded: only a voluntary timeout ever kills it.
-        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        // A deadline past `Instant`'s range (the unset sentinel) runs the
+        // command unbounded: only a voluntary timeout ever kills it.
+        let deadline = Instant::now().checked_add(timeout);
         let status = loop {
             match child.wait_timeout(Duration::from_millis(100)) {
                 Ok(Some(status)) => break Ok(status),
@@ -202,7 +215,7 @@ impl BashTool {
                         let _ = child.wait();
                         break Err(format!(
                             "command exceeded its {}s timeout and was killed",
-                            timeout.map_or(0, |timeout| timeout.as_secs())
+                            timeout.as_secs()
                         ));
                     }
                 }
@@ -555,6 +568,26 @@ mod tests {
         // voluntary `timeout_seconds` can kill it.
         let output = run("sleep 1; echo done");
         assert_eq!(output, "done");
+    }
+
+    #[test]
+    fn configured_default_timeout_applies_and_per_call_wins() {
+        // A configured default deadline kills a command that does not pass
+        // its own `timeout_seconds`.
+        let tool = BashTool::new(Duration::from_secs(1), 20_000);
+        let err = tool.execute(&json!({"command": "sleep 30"})).unwrap_err();
+        assert!(err.to_string().contains("1s timeout"), "{err}");
+
+        // The per-call value wins over the configured default, in both
+        // directions.
+        let out = tool
+            .execute(&json!({"command": "sleep 2; echo done", "timeout_seconds": 10}))
+            .unwrap();
+        assert_eq!(out, "done");
+        let err = tool
+            .execute(&json!({"command": "sleep 30", "timeout_seconds": 1}))
+            .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
     }
 
     #[test]

@@ -149,7 +149,7 @@ fn fake_tools() -> ToolSet {
 }
 
 fn bash_tools() -> ToolSet {
-    clanky::tools::default_tools()
+    clanky::tools::default_tools(None)
 }
 
 fn config() -> TurnConfig {
