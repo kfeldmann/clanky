@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead as _, BufReader, Read as _, Seek as _, Write as _};
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +29,61 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::settings::SessionSettings;
+
+/// The wire shape of a `settings` record: `SessionSettings` with
+/// `#[serde(rename_all = "camelCase")]` field names and unset fields
+/// elided (the `type` tag itself is added by the enum).
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSettingsRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<crate::settings::SamplingParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_rounds: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+}
+
+impl From<&SessionSettings> for SessionSettingsRecord {
+    fn from(s: &SessionSettings) -> Self {
+        Self {
+            provider: s.provider.clone(),
+            model: s.model.clone(),
+            thinking: s.thinking.clone(),
+            sampling: s.sampling.clone(),
+            max_tool_rounds: s.max_tool_rounds,
+            max_retries: s.max_retries,
+            project: s.project.clone(),
+            timeout_seconds: s.timeout_seconds,
+        }
+    }
+}
+
+impl From<&SessionSettingsRecord> for SessionSettings {
+    fn from(r: &SessionSettingsRecord) -> Self {
+        Self {
+            provider: r.provider.clone(),
+            model: r.model.clone(),
+            thinking: r.thinking.clone(),
+            sampling: r.sampling.clone(),
+            max_tool_rounds: r.max_tool_rounds,
+            max_retries: r.max_retries,
+            project: r.project.clone(),
+            timeout_seconds: r.timeout_seconds,
+        }
+    }
+}
 
 /// Current session file format version (§ format header).
 pub const FORMAT_VERSION: u32 = 1;
@@ -46,23 +101,27 @@ pub fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Session file header: the first line of every session file.
+/// Session file header: the first line of every session file. Write-once
+/// since M18: `version` and `created` only — provider/model moved to
+/// `settings` records (and the old header `stopReason` was removed; the
+/// per-turn `stopReason` record carries that data). `provider`/`model`
+/// remain in the struct as parse-only legacy fields so pre-M18 files
+/// still load; they are never written and the loader keeps using them
+/// only when the file has no `settings` record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Header {
     pub version: u32,
     /// Creation time, epoch milliseconds.
     pub created: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy (pre-M18): provider/model lived in the header before
+    /// settings records took over. Parsed, never written; used only
+    /// when a file carries no `settings` record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy: see [`Header::provider`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The last turn's stop reason (why it ended), stamped when the turn
-    /// completes and rewritten by the next one. Absent in files that never
-    /// finished a turn (created but left idle, or a turn interrupted before
-    /// the terminal `done`).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub stop_reason: Option<String>,
 }
 
 /// One conversation event. Serialized with a `"type"` tag (camelCase
@@ -106,6 +165,18 @@ pub enum Record {
     /// session meaning (for example `toolCalls`, the tool loop's
     /// keep-going signal) is still recorded as the backend reported it.
     StopReason { reason: String },
+    /// The effective settings of one session snapshot (M18): provider,
+    /// model, and the merged settings a turn runs with. Written at
+    /// session start (before the first user record) and again, in the
+    /// order the changes happen, whenever settings change mid-session
+    /// (`/model`, `/thinking`, `/sampling`, `/timeout`, `/provider`).
+    /// Each record is a full snapshot, so a session's records folded in
+    /// order (later records win per field) reconstruct the settings
+    /// state as of the end of the session. On `/resume` the folded
+    /// state is *compared* against the active settings — records never
+    /// set values — and one change record is written for the
+    /// differences. Unset fields are elided.
+    Settings { settings: SessionSettingsRecord },
 }
 
 /// One parsed session file.
@@ -157,12 +228,9 @@ impl SessionWriter {
         }
     }
 
-    /// A writer that continues an existing session file (no new header).
-    /// The file's own header line is read so a later
-    /// [`SessionWriter::set_stop_reason`] rewrites it with what is already
-    /// there plus the new reason; if the file cannot be read it may have
-    /// vanished, so the plain fresh-header defaults stand and the next
-    /// file creation stamps them.
+    /// A writer that continues an existing session file (no new header,
+    /// nothing read back: the header is write-once and appending never
+    /// rewrites it).
     pub fn reopen(path: PathBuf) -> Self {
         let header = std::fs::read(&path)
             .ok()
@@ -173,13 +241,11 @@ impl SessionWriter {
             .and_then(|value| serde_json::from_value::<Header>(value).ok())
             .unwrap_or(Header {
                 version: FORMAT_VERSION,
+                // No readable header to stamp `created` from; the fresh
+                // file creation stamps now when it comes to exist.
                 created: 0,
                 provider: None,
                 model: None,
-                // No readable header to carry the field; the defaults
-                // above only matter if the file vanished and a fresh one
-                // is created, which has no last turn yet.
-                stop_reason: None,
             });
         Self {
             path,
@@ -191,62 +257,6 @@ impl SessionWriter {
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Stamp the file header's `stopReason` with the just-finished turn's
-    /// stop reason. If the file has not been created yet there is nothing
-    /// to stamp (a session with no records has no last turn); the pending
-    /// value is kept anyway, so the field lands on the header when the
-    /// first record creates the file.
-    pub fn set_stop_reason(&mut self, reason: clanky_protocol::FinishReason) {
-        self.header.stop_reason = Some(reason.as_str().to_string());
-        // The file may not be open yet (the writer lazily creates it on
-        // the first record); there is then no header line to rewrite, and
-        // the in-memory header above is what the first file creation
-        // stamps.
-        if self.file.is_none() {
-            if self.mode == Mode::Reopen && self.path.exists() {
-                match OpenOptions::new().read(true).write(true).open(&self.path) {
-                    Ok(file) => self.file = Some(file),
-                    Err(_) => return, // unreadable file: nothing to stamp
-                }
-            } else {
-                return;
-            }
-        }
-        let file = self.file.as_mut().expect("file opened above");
-        // Read the rest of the file, truncate after line 1, and write the
-        // updated header followed by what was there. The header line is
-        // rebuilt from the in-memory `header` — for `Mode::Reopen`,
-        // `reopen` seeded it from the file's own header line.
-        file.seek(std::io::SeekFrom::Start(0)).ok();
-        let mut rest = Vec::new();
-        let header_end = match file.read_to_end(&mut rest) {
-            Ok(_) => rest
-                .iter()
-                .position(|&b| b == b'\n')
-                .map(|nl| nl + 1)
-                .unwrap_or(0),
-            Err(_) => return,
-        };
-        let rest = rest.split_off(header_end);
-        if file
-            .set_len(0)
-            .and_then(|_| file.seek(std::io::SeekFrom::Start(0)))
-            .is_err()
-        {
-            return;
-        }
-        let mut value = serde_json::to_value(&self.header).expect("header serializes");
-        value["type"] = "header".into();
-        let header_line = serde_json::to_string(&value).expect("header is valid JSON") + "\n";
-        // Best effort: a failed rewrite leaves the header un-stamped; the
-        // next turn's stamp or the next append (a plain record) still
-        // writes whatever is writable.
-        let _ = file
-            .write_all(header_line.as_bytes())
-            .and_then(|_| file.write_all(&rest))
-            .and_then(|_| file.flush());
     }
 
     /// Append one record (the header first, on file creation) and flush,
@@ -491,7 +501,14 @@ pub fn load(path: &Path) -> Result<SessionData> {
         if !matches!(
             kind,
             Some(
-                "user" | "thinking" | "assistant" | "toolResult" | "usage" | "error" | "stopReason",
+                "user"
+                    | "thinking"
+                    | "assistant"
+                    | "toolResult"
+                    | "usage"
+                    | "error"
+                    | "stopReason"
+                    | "settings",
             )
         ) {
             continue; // unknown record type: skip (forward compatibility)
@@ -528,6 +545,24 @@ fn parse_header(path: &Path, line: &str) -> Result<Header> {
     Ok(header)
 }
 
+/// Fold a session file's settings records in order (M18): later records
+/// win per field, exactly as they were written, so the result is the
+/// settings state as of the end of the session. A file with no settings
+/// record (pre-M18) falls back to the header's legacy provider/model.
+pub fn fold_settings(data: &SessionData) -> SessionSettings {
+    let mut state = SessionSettings {
+        provider: data.header.provider.clone(),
+        model: data.header.model.clone(),
+        ..SessionSettings::default()
+    };
+    for record in &data.records {
+        if let Record::Settings { settings } = record {
+            state.overlay(&SessionSettings::from(settings));
+        }
+    }
+    state
+}
+
 /// Rebuild the full conversation history (system context excluded —
 /// callers re-assemble it) from session records. Tool results are matched
 /// to their calls by order; calls without a result (interrupted turn)
@@ -541,7 +576,8 @@ pub fn history_from_records(records: &[Record]) -> Vec<ChatMessage> {
             Record::Thinking { .. }
             | Record::Usage { .. }
             | Record::Error { .. }
-            | Record::StopReason { .. } => {}
+            | Record::StopReason { .. }
+            | Record::Settings { .. } => {}
             Record::Assistant { text, calls } => {
                 for call in calls {
                     awaiting.push_back(call.id.clone());
@@ -574,6 +610,15 @@ pub fn usage_record(usage: Usage) -> Record {
     }
 }
 
+/// Convenience: one session-settings snapshot as a record (M18). Called
+/// by the recorder when settings are dumped (session start) or change
+/// (slash commands, `/resume` difference).
+pub fn settings_record(settings: &SessionSettings) -> Record {
+    Record::Settings {
+        settings: SessionSettingsRecord::from(settings),
+    }
+}
+
 /// Convenience: a turn's stop reason as a record (`reason` is
 /// `FinishReason::as_str`). Called with the turn's terminal `done`, once
 /// per completed turn.
@@ -586,7 +631,6 @@ pub fn stop_reason_record(reason: clanky_protocol::FinishReason) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clanky_protocol::FinishReason;
     use serde_json::json;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -633,7 +677,6 @@ mod tests {
                 created: 1_700_000_000_000,
                 provider: Some("deepinfra".into()),
                 model: Some("test/model".into()),
-                stop_reason: None,
             },
         );
         for record in records {
@@ -665,53 +708,9 @@ mod tests {
                 created: 0,
                 provider: None,
                 model: None,
-                stop_reason: None,
             },
         );
         assert!(!path.exists(), "no file before the first record");
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn stop_reason_stamps_the_header_and_roundtrips() {
-        let dir = temp_dir("stop-reason");
-        let path = write_session(&dir, "reasoned", &sample_records());
-        let mut writer = SessionWriter::reopen(path.clone());
-        writer.set_stop_reason(FinishReason::Length);
-        writer
-            .append(&Record::User {
-                text: "next turn".into(),
-            })
-            .unwrap();
-        let data = load(&path).unwrap();
-        assert_eq!(data.header.stop_reason.as_deref(), Some("length"));
-        assert_eq!(
-            data.records.last(),
-            Some(&Record::User {
-                text: "next turn".into()
-            })
-        );
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn stop_reason_is_rewritten_by_the_next_turn() {
-        let dir = temp_dir("stop-reason-rewrite");
-        let path = write_session(&dir, "twice", &sample_records());
-        let mut writer = SessionWriter::reopen(path.clone());
-        writer.set_stop_reason(FinishReason::Stop);
-        writer.set_stop_reason(FinishReason::ToolCalls);
-        let data = load(&path).unwrap();
-        assert_eq!(
-            data.header.stop_reason.as_deref(),
-            Some("toolCalls"),
-            "the last turn's reason wins"
-        );
-        assert_eq!(
-            data.records,
-            sample_records(),
-            "stamping rewrites line 1 only"
-        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -844,6 +843,161 @@ mod tests {
             load(&empty).unwrap_err().to_string().contains("empty file"),
             "empty file is an error, not an empty session"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn settings_record_roundtrips_with_unset_fields_elided() {
+        let dir = temp_dir("settings-record");
+        let path = dir.join("settings.jsonl");
+        let settings = SessionSettings {
+            provider: Some("deepinfra".into()),
+            model: Some("m/x".into()),
+            timeout_seconds: Some(5),
+            ..SessionSettings::default()
+        };
+        let mut writer = SessionWriter::new(
+            path.clone(),
+            Header {
+                version: FORMAT_VERSION,
+                created: 1_700_000_000_000,
+                provider: None,
+                model: None,
+            },
+        );
+        writer.append(&settings_record(&settings)).unwrap();
+        drop(writer);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // Unset fields are elided on the wire, camelCase names.
+        assert!(
+            raw.contains(r#""type":"settings""#)
+                && raw.contains(r#""provider":"deepinfra""#)
+                && raw.contains(r#""timeoutSeconds":5"#),
+            "{raw}"
+        );
+        assert!(!raw.contains("thinking"), "unset elided: {raw}");
+        let data = load(&path).unwrap();
+        assert_eq!(data.records, vec![settings_record(&settings)]);
+        // Folding reconstructs the state and nothing is lost.
+        assert_eq!(fold_settings(&data), settings);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn header_is_write_once_and_settings_records_carry_the_metadata() {
+        let dir = temp_dir("write-once");
+        let path = dir.join("m18.jsonl");
+        let mut writer = SessionWriter::new(
+            path.clone(),
+            Header {
+                version: FORMAT_VERSION,
+                created: 1_700_000_000_000,
+                provider: None,
+                model: None,
+            },
+        );
+        for record in &[
+            settings_record(&SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("m/x".into()),
+                ..SessionSettings::default()
+            }),
+            Record::User { text: "hi".into() },
+        ] {
+            writer.append(record).unwrap();
+        }
+        drop(writer);
+        let mut writer = SessionWriter::reopen(path.clone());
+        writer
+            .append(&Record::User {
+                text: "next".into(),
+            })
+            .unwrap();
+        let (_, text) = (path.clone(), std::fs::read_to_string(&path).unwrap());
+        assert_eq!(
+            text.matches(r#""type":"header""#).count(),
+            1,
+            "appending never rewrites the header: {text}"
+        );
+        assert!(
+            !text.contains(r#""stopReason""#),
+            "the header carries no stopReason: {text}"
+        );
+        let data = load(&path).unwrap();
+        assert_eq!(data.header.provider, None);
+        assert_eq!(data.header.model, None);
+        // fold_settings reads the metadata from the records.
+        assert_eq!(fold_settings(&data).provider.as_deref(), Some("deepinfra"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fold_settings_falls_back_to_legacy_header_fields() {
+        // A pre-M18 file: no settings records; the header carries
+        // provider/model.
+        let dir = temp_dir("fold-legacy");
+        let path = dir.join("legacy.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"header","version":1,"created":1,"provider":"deepinfra","model":"old/model"}"#,
+                "\n",
+                r#"{"type":"user","text":"hi"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let data = load(&path).unwrap();
+        let folded = fold_settings(&data);
+        assert_eq!(folded.provider.as_deref(), Some("deepinfra"));
+        assert_eq!(folded.model.as_deref(), Some("old/model"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unknown_settings_record_payloads_do_not_break_loading() {
+        // A malformed `settings` payload is skipped like any other
+        // known-type/bad-payload record.
+        let dir = temp_dir("bad-settings");
+        let path = dir.join("bad.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"header","version":1,"created":1}"#,
+                "\n",
+                r#"{"type":"settings","settings":{"timeoutSeconds":"five"}}"#,
+                "\n",
+                r#"{"type":"user","text":"hi"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let data = load(&path).unwrap();
+        assert_eq!(data.records, vec![Record::User { text: "hi".into() }]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn pre_m18_headers_still_load() {
+        // Before settings records, provider/model lived in the header and
+        // the header carried a stopReason. Old files keep loading; the
+        // loader reads the legacy fields back.
+        let dir = temp_dir("legacy-header");
+        let path = dir.join("old.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"header","version":1,"created":1,"provider":"deepinfra","model":"old/model","stopReason":"stop"}"#,
+                "\n",
+                r#"{"type":"user","text":"hi"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let data = load(&path).unwrap();
+        assert_eq!(data.header.provider.as_deref(), Some("deepinfra"));
+        assert_eq!(data.header.model.as_deref(), Some("old/model"));
+        assert_eq!(data.records.len(), 1);
         std::fs::remove_dir_all(dir).ok();
     }
 

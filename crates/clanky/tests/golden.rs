@@ -467,8 +467,15 @@ fn pipe_and_tui_session_records_match_golden() {
     // the user prompt recorded before the turn, every turn event through
     // `record_turn_event`, then `record_done` for the terminal state.
     let pipe_dir = temp_session_dir("pipe");
-    let mut pipe_recorder =
-        Recorder::with_dir(pipe_dir.clone(), "session", "deepinfra", Some("mock/model"));
+    let mut pipe_recorder = Recorder::with_dir(
+        pipe_dir.clone(),
+        "session",
+        clanky::settings::SessionSettings {
+            provider: Some("deepinfra".into()),
+            model: Some("mock/model".into()),
+            ..Default::default()
+        },
+    );
     pipe_recorder.record(
         &mut NoSink,
         Record::User {
@@ -492,8 +499,15 @@ fn pipe_and_tui_session_records_match_golden() {
     // The TUI's recording wiring (event_loop): the same recorder type fed
     // the same sequence — prompt record, per-event records, `record_done`.
     let tui_dir = temp_session_dir("tui");
-    let mut tui_recorder =
-        Recorder::with_dir(tui_dir.clone(), "session", "deepinfra", Some("mock/model"));
+    let mut tui_recorder = Recorder::with_dir(
+        tui_dir.clone(),
+        "session",
+        clanky::settings::SessionSettings {
+            provider: Some("deepinfra".into()),
+            model: Some("mock/model".into()),
+            ..Default::default()
+        },
+    );
     tui_recorder.record(
         &mut NoSink,
         Record::User {
@@ -540,9 +554,19 @@ fn written_records(recorder: &mut clanky::recorder::Recorder) -> Vec<Value> {
         .expect("recording recorder opened a session file")
         .to_path_buf();
     let data = clanky::session::load(&file).unwrap();
-    // The header carries the provider/model, like the TUI's files.
-    assert_eq!(data.header.provider.as_deref(), Some("deepinfra"));
-    assert_eq!(data.header.model.as_deref(), Some("mock/model"));
+    // The header is write-once now (M18): the provider/model live in the
+    // leading settings record.
+    assert_eq!(data.header.provider.as_deref(), None);
+    assert_eq!(
+        data.records.first(),
+        Some(&clanky::session::Record::Settings {
+            settings: clanky::session::SessionSettingsRecord {
+                provider: Some("deepinfra".into()),
+                model: Some("mock/model".into()),
+                ..Default::default()
+            }
+        })
+    );
     data.records
         .iter()
         .map(|record| serde_json::to_value(record).unwrap())

@@ -10,6 +10,13 @@
   },
   "records": [
     {
+      "settings": {
+        "model": "mock/model",
+        "provider": "deepinfra"
+      },
+      "type": "settings"
+    },
+    {
       "text": "use the tool on hello",
       "type": "user"
     },

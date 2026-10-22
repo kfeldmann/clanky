@@ -148,6 +148,27 @@ a picker of saved sessions when `NAME` is omitted): the transcript and the
 full conversation history are restored, and the turn's records append to
 the same file.
 
+### Settings records
+
+Every session file starts with a `settings` record: provider, model, and
+the merged settings a turn runs with (thinking, `[sampling]`,
+`max_tool_rounds`, `max_retries`, `project`, `timeout_seconds`; unset
+fields are elided). The session header carries only `version` and
+`created` — provider/model moved into the settings records (old session
+files with a provider/model header still resume fine). Whenever settings
+change mid-session — `/model`, `/provider`, `/thinking`, `/sampling`,
+`/timeout`, or a model default adopted from the plugin handshake — one
+settings record is written, in the order the changes happen. Each record
+is a full snapshot of the effective settings, so folding a session's
+records in order (later records win per field, `[sampling]` per key)
+reconstructs the settings state as of the end of that session.
+
+On `--resume` the records never *set* values: the folded state is
+compared against the settings you are resuming with and, when they
+differ, one change record (a snapshot of the new active settings) is
+appended — from the resumed session's perspective the settings changed
+mid-session, in order.
+
 `--name NAME` starts a session under a fixed name instead of the generated
 timestamped one (same validation as `/name`, in both modes);
 `--name` together with `--resume` is a usage error — the resumed file
@@ -371,6 +392,7 @@ clanky --provider hello-world -p "say hi"
 | `/` (empty input) | command palette |
 | `/system` | show the assembled system prompt (context files and skills, as sent to the model) |
 | `/md [flags] [file]` | export the session as a Markdown file (asks for a filename in a modal when none is given) |
+| *(at startup)* | the effective settings are shown once as a transcript note (`settings: …`) — the same merged values `/model` &c. edit and the session file records |
 
 ### Rendering notes
 
@@ -499,6 +521,10 @@ entries read as units:
   with a `… (+N more lines)` note.
 - Retry notices print as `INFO: ↻ message — retrying in Ns
   (attempt/max)`.
+- A startup dump prints as `INFO: settings: …` — provider, model, and
+  the merged settings (unset fields elided) — so a `-p` run's effective
+  configuration is visible in a log with the session file's settings
+  record next to it.
 
 `-q` / `--quiet` (print mode only; rejected in TUI mode) prints just the
 agent's response and errors — no thinking, tool calls, or tool results:

@@ -89,7 +89,7 @@ use crate::prompts::{self, Template};
 use crate::provider::ProviderSession;
 use crate::recorder;
 use crate::session::{self, SessionInfo};
-use crate::settings::{SamplingParams, Settings};
+use crate::settings::{SamplingParams, SessionSettings, Settings};
 use crate::turn::{TurnConfig, TurnEvent, TurnOutput};
 use commands::{Command, SamplingEdit, TimeoutEdit};
 
@@ -139,6 +139,11 @@ pub struct Launch {
     /// Start the session named (`--name`); fed to the recorder as the
     /// pending name. `None` = the generated default name.
     pub session_name: Option<String>,
+    /// The session's effective settings snapshot (M18), the startup dump
+    /// the recorder writes its first settings record from. Live edits
+    /// (`/model` &c.) go to the fields above *and* to this struct, and
+    /// the recorder observes the difference.
+    pub effective: SessionSettings,
 }
 
 impl Launch {
@@ -148,6 +153,11 @@ impl Launch {
     /// per-provider default table.
     pub fn from_settings(provider: &str, settings: &Settings) -> Self {
         Self {
+            effective: {
+                let mut effective = SessionSettings::from(settings);
+                effective.provider = Some(provider.to_string());
+                effective
+            },
             provider: provider.to_string(),
             model: settings.model.clone(),
             sampling: settings.sampling.clone(),
@@ -706,7 +716,17 @@ fn load_session(
     let conversation = app.restore(&data.records);
     app.history = crate::context::system_messages();
     app.history.extend(conversation);
-    state.reopen(path.to_path_buf());
+    // Fold the session's settings records in order (M18) — the state as
+    // of the end of that session — and reopen. The records never set
+    // values here: the recorder appends one change record when the
+    // folded state differs from the active settings (M18's `/resume`
+    // semantics, shared with print mode).
+    let folded = session::fold_settings(&data);
+    state.reopen(
+        path.to_path_buf(),
+        &folded,
+        &mut TranscriptErrors::default(),
+    );
     app.entries.push(app::Entry::Info(format!(
         "resumed `{name}` ({} records)",
         data.records.len()
@@ -720,8 +740,13 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     // Fresh session: seed the system context so the first turn sends it
     // (resumed sessions rebuild it inside `load_session`).
     app.history = crate::context::system_messages();
-    let mut state =
-        SessionState::new(&launch.provider, launch.model.as_deref()).recording(launch.recording);
+    // Startup INFO dump (M18): model, provider, and the merged settings
+    // — as a transcript entry in the TUI (stderr is the terminal here).
+    app.entries.push(app::Entry::Info(format!(
+        "settings: {}",
+        launch.effective.describe()
+    )));
+    let mut state = SessionState::new(launch.effective.clone()).recording(launch.recording);
     let mut transcript_errors = TranscriptErrors::default();
     if let Some(name) = launch.session_name.clone() {
         state = state.with_name(&name, &mut transcript_errors);
@@ -929,6 +954,10 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                         // a provider that is no longer active is ignored.
                         if fetched.provider == launch.provider && launch.model.is_none() {
                             launch.model = fetched.default_model.clone();
+                            // The adopted default is a settings fact too
+                            // (M18): the recorder observes it like any
+                            // other change.
+                            observe_settings(&mut state, launch);
                         }
                         catalog.models = fetched.models;
                         if catalog.for_picker {
@@ -1156,7 +1185,7 @@ fn apply_picker_selection(
         PickerKind::Providers => {
             // Item order matches provider::available().
             if let Some(name) = crate::provider::available().get(index).cloned() {
-                switch_provider(launch, catalog, tx, &name, app);
+                switch_provider(state, launch, catalog, tx, &name, app);
             }
         }
         PickerKind::Thinking => {
@@ -1214,6 +1243,35 @@ fn apply_picker_selection(
     }
 }
 
+/// The session's effective settings derived from the live launch fields:
+/// the fields are authoritative (the turns read them directly); the
+/// snapshot is the recorder's view of the same state, taken at every
+/// change so the two can never drift.
+fn effective_of(launch: &Launch) -> SessionSettings {
+    SessionSettings {
+        provider: Some(launch.provider.clone()),
+        model: launch.model.clone(),
+        thinking: launch.thinking.clone(),
+        sampling: launch.sampling.clone(),
+        max_tool_rounds: launch.max_tool_rounds,
+        max_retries: launch.max_retries,
+        project: launch.project.clone(),
+        timeout_seconds: launch.timeout_seconds,
+    }
+}
+
+/// Observe a settings change in the TUI: the live launch fields have
+/// already been assigned by the caller; snapshot them and record the new
+/// state through the recorder, which writes a settings record once the
+/// session has started (before that, the change is folded into the
+/// startup dump). One helper for every command, so the record trail and
+/// the live fields can never disagree.
+fn observe_settings(state: &mut SessionState, launch: &mut Launch) {
+    let effective = effective_of(launch);
+    launch.effective = effective.clone();
+    state.set_settings(effective, &mut TranscriptErrors::default());
+}
+
 /// Execute a slash command. Commands never produce model turns; they only
 /// reconfigure the session, touch session files, or open pickers.
 fn handle_command(
@@ -1259,6 +1317,7 @@ fn handle_command(
         }
         Command::Model(Some(id)) => {
             launch.model = Some(id.clone());
+            observe_settings(state, launch);
             app.entries
                 .push(app::Entry::Info(format!("model set to `{id}`")));
             Action::None
@@ -1277,7 +1336,7 @@ fn handle_command(
             }
         }
         Command::Provider(Some(name)) => {
-            switch_provider(launch, catalog, tx, &name, app);
+            switch_provider(state, launch, catalog, tx, &name, app);
             Action::None
         }
         Command::Provider(None) => {
@@ -1293,6 +1352,7 @@ fn handle_command(
                     // provider sends its explicit "no reasoning" knob
                     // instead of falling back to the backend default.
                     launch.thinking = Some(raw.clone());
+                    observe_settings(state, launch);
                     let disabled = parsed.budget_tokens == Some(0);
                     app.entries.push(app::Entry::Info(if disabled {
                         "thinking disabled".into()
@@ -1306,7 +1366,7 @@ fn handle_command(
         }
         Command::Thinking(None) => Action::OpenPicker(PickerKind::Thinking),
         Command::Sampling(edit) => {
-            apply_sampling(launch, &edit, app);
+            apply_sampling(state, launch, &edit, app);
             Action::None
         }
         Command::Timeout(edit) => {
@@ -1320,11 +1380,13 @@ fn handle_command(
                 }
                 TimeoutEdit::Off => {
                     launch.timeout_seconds = None;
+                    observe_settings(state, launch);
                     app.entries
                         .push(app::Entry::Info("tool timeout cleared (unbounded)".into()));
                 }
                 TimeoutEdit::Seconds(seconds) => {
                     launch.timeout_seconds = Some(seconds);
+                    observe_settings(state, launch);
                     app.entries
                         .push(app::Entry::Info(format!("tool timeout set to {seconds}s")));
                 }
@@ -1405,8 +1467,12 @@ fn set_provider(launch: &mut Launch, name: &str) -> std::result::Result<(), Stri
 }
 
 /// Apply a provider switch: tear down the old session (the next turn spawns
-/// the new plugin), reset the model, and refresh the catalog.
+/// the new plugin), reset the model, and refresh the catalog. The model is
+/// resolved from the new plugin's handshake at the next turn, so the
+/// effective settings keep the model unset until then (`/model` after the
+/// switch adopts the handshake default and observes it then).
 fn switch_provider(
+    state: &mut SessionState,
     launch: &mut Launch,
     catalog: &mut Catalog,
     tx: &Sender<WorkerEvent>,
@@ -1418,6 +1484,7 @@ fn switch_provider(
             // The model is resolved from the new plugin's handshake on the
             // next turn; refresh the catalog so pricing follows the provider.
             catalog.request(name.to_string(), tx, false);
+            observe_settings(state, launch);
             app.entries
                 .push(app::Entry::Info(format!("provider set to `{name}`")));
         }
@@ -1428,29 +1495,40 @@ fn switch_provider(
 /// Apply a `/sampling` edit to the launch config, reporting as an entry.
 /// Parameters are pass-through: keys and values are not validated here (or
 /// at turn time) — the provider backend validates them at call time.
-fn apply_sampling(launch: &mut Launch, edit: &SamplingEdit, app: &mut app::App) {
+fn apply_sampling(
+    state: &mut SessionState,
+    launch: &mut Launch,
+    edit: &SamplingEdit,
+    app: &mut app::App,
+) {
     match edit {
         SamplingEdit::Show => {
             let description = launch
                 .sampling
                 .as_ref()
-                .map(|p| format!("sampling: {}", describe_sampling(p)))
+                .map(|p| format!("sampling: {}", crate::settings::describe_sampling(p)))
                 .unwrap_or_else(|| "no sampling parameters set".into());
             app.entries.push(app::Entry::Info(description));
         }
         SamplingEdit::Clear => {
             launch.sampling = None;
+            observe_settings(state, launch);
             app.entries
                 .push(app::Entry::Info("sampling parameters cleared".into()));
         }
         SamplingEdit::Set(pairs) => {
-            let current = launch.sampling.get_or_insert_with(SamplingParams::new);
-            for (key, value) in pairs {
-                current.insert(key.clone(), Value::String(value.clone()));
+            {
+                let current = launch.sampling.get_or_insert_with(SamplingParams::new);
+                for (key, value) in pairs {
+                    current.insert(key.clone(), Value::String(value.clone()));
+                }
             }
+            observe_settings(state, launch);
             app.entries.push(app::Entry::Info(format!(
                 "sampling: {}",
-                describe_sampling(current)
+                crate::settings::describe_sampling(
+                    launch.sampling.as_ref().expect("just inserted")
+                )
             )));
         }
         SamplingEdit::Unset(keys) => {
@@ -1459,27 +1537,16 @@ fn apply_sampling(launch: &mut Launch, edit: &SamplingEdit, app: &mut app::App) 
                     current.remove(key.as_str());
                 }
             }
+            observe_settings(state, launch);
             let description = launch
                 .sampling
                 .as_ref()
                 .filter(|p| !p.is_empty())
-                .map(|p| format!("sampling: {}", describe_sampling(p)))
+                .map(|p| format!("sampling: {}", crate::settings::describe_sampling(p)))
                 .unwrap_or_else(|| "no sampling parameters set".into());
             app.entries.push(app::Entry::Info(description));
         }
     }
-}
-
-/// `key=value` pairs joined for display; string values are shown raw.
-fn describe_sampling(params: &SamplingParams) -> String {
-    params
-        .iter()
-        .map(|(key, value)| match value {
-            Value::String(raw) => format!("{key}={raw}"),
-            other => format!("{key}={other}"),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Put a prompt template into the input line (plus any extra text typed
@@ -1743,7 +1810,7 @@ mod tests {
     #[test]
     fn ctrl_u_clears_from_cursor_to_start() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut state = SessionState::new(SessionSettings::default());
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -1762,7 +1829,7 @@ mod tests {
     #[test]
     fn ctrl_t_toggles_thinking_display() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut state = SessionState::new(SessionSettings::default());
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -1781,7 +1848,7 @@ mod tests {
     #[test]
     fn up_recalls_history_only_from_the_top_row() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut state = SessionState::new(SessionSettings::default());
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -1813,7 +1880,7 @@ mod tests {
     #[test]
     fn down_steps_history_only_from_the_bottom_row() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut state = SessionState::new(SessionSettings::default());
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -1847,7 +1914,7 @@ mod tests {
     #[test]
     fn ctrl_j_inserts_a_newline_and_ctrl_a_e_move_within_lines() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut state = SessionState::new(SessionSettings::default());
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2217,13 +2284,15 @@ mod tests {
     #[test]
     fn sampling_edits_apply_and_merge() {
         let mut cfg = launch();
+        let (mut state, dir) = recording_state("sampling");
         let mut app = app::App::new(None);
 
-        apply_sampling(&mut cfg, &SamplingEdit::Show, &mut app);
+        apply_sampling(&mut state, &mut cfg, &SamplingEdit::Show, &mut app);
         assert!(cfg.sampling.is_none());
         assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
 
         apply_sampling(
+            &mut state,
             &mut cfg,
             &SamplingEdit::Set(vec![("temperature".into(), "0.7".into())]),
             &mut app,
@@ -2233,6 +2302,7 @@ mod tests {
             Some(&Value::String("0.7".into()))
         );
         apply_sampling(
+            &mut state,
             &mut cfg,
             &SamplingEdit::Set(vec![("top_p".into(), "0.9".into())]),
             &mut app,
@@ -2242,6 +2312,7 @@ mod tests {
         // No local validation: any key with any value is accepted here —
         // the provider backend validates it at call time.
         apply_sampling(
+            &mut state,
             &mut cfg,
             &SamplingEdit::Set(vec![("reasoning_effort".into(), "high".into())]),
             &mut app,
@@ -2254,6 +2325,7 @@ mod tests {
         );
 
         apply_sampling(
+            &mut state,
             &mut cfg,
             &SamplingEdit::Unset(vec!["temperature".into(), "missing".into()]),
             &mut app,
@@ -2268,14 +2340,15 @@ mod tests {
             Some(&Value::String("0.9".into()))
         );
 
-        apply_sampling(&mut cfg, &SamplingEdit::Clear, &mut app);
+        apply_sampling(&mut state, &mut cfg, &SamplingEdit::Clear, &mut app);
         assert!(cfg.sampling.is_none());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn thinking_commands_set_and_clear() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut state = SessionState::new(SessionSettings::default());
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2324,7 +2397,7 @@ mod tests {
     #[test]
     fn model_and_provider_commands_reconfigure_the_launch() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut state = SessionState::new(SessionSettings::default());
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2355,7 +2428,7 @@ mod tests {
     #[test]
     fn template_commands_fill_the_input_line() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut state = SessionState::new(SessionSettings::default());
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2422,7 +2495,6 @@ mod tests {
                 created: 1_700_000_000_000,
                 provider: Some("deepinfra".into()),
                 model: Some("mock/model".into()),
-                stop_reason: None,
             },
         );
         for record in [
@@ -2439,8 +2511,8 @@ mod tests {
         ] {
             writer.append(&record).unwrap();
         }
-        let mut state = SessionState::with_dir(dir.clone(), "session", "deepinfra", None);
-        state.reopen(path);
+        let mut state = SessionState::with_dir(dir.clone(), "session", SessionSettings::default());
+        state.reopen(path, &SessionSettings::default(), &mut NoErrors);
         (state, dir)
     }
 
@@ -2476,7 +2548,7 @@ mod tests {
 
     #[test]
     fn md_export_without_a_session_writes_an_empty_document() {
-        let mut state = SessionState::new("deepinfra", None);
+        let mut state = SessionState::new(SessionSettings::default());
         *(state.dir_mut()) = std::env::temp_dir();
         let mut app = app::App::new(None);
         let source = ExportSource::snapshot(&state, &app, ExportOptions::default()).unwrap();
@@ -2502,7 +2574,7 @@ mod tests {
     #[test]
     fn md_command_without_a_filename_opens_the_modal() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let mut state = SessionState::new(SessionSettings::default());
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2522,7 +2594,9 @@ mod tests {
             Action::OpenExportModal(source) => {
                 assert_eq!(source.options, ExportOptions::ALL);
                 assert!(source.records.is_empty(), "no session recorded yet");
-                assert_eq!(source.header.provider.as_deref(), Some("deepinfra"));
+                // The header is write-once now (M18): the provider lives
+                // in the settings records.
+                assert_eq!(source.header.provider.as_deref(), None);
             }
             _ => panic!("expected an export modal"),
         }
@@ -2542,6 +2616,82 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
         assert!(std::path::Path::new("out.md").exists(), "file written");
         std::fs::remove_file("out.md").ok();
+    }
+
+    #[test]
+    fn command_edits_write_settings_records() {
+        // A `/model` change before any record: folded into the startup
+        // dump (no file created early, no extra record). After the
+        // session started: one record per change, in change order.
+        let (mut state, dir) = recording_state("commands");
+        let mut cfg = launch();
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::Model(Some("m/picked".into())),
+            &tx,
+        );
+        assert!(
+            state.open_file().is_none(),
+            "a change before the first record must not create the file"
+        );
+
+        // The session starts (the front end records the prompt first).
+        state.record(&mut NoErrors, session::Record::User { text: "hi".into() });
+        let mut data = session::load(&dir.join("session.jsonl")).unwrap();
+        assert_eq!(data.records.len(), 2, "settings dump + user record");
+        assert_eq!(
+            data.records[0],
+            session::settings_record(&SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("m/picked".into()),
+                ..SessionSettings::default()
+            })
+        );
+
+        // A change after start: one record.
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::Timeout(TimeoutEdit::Seconds(5)),
+            &tx,
+        );
+        data = session::load(&dir.join("session.jsonl")).unwrap();
+        assert_eq!(data.records.len(), 3, "one record per change: {data:?}");
+        assert_eq!(
+            data.records[2],
+            session::settings_record(&SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("m/picked".into()),
+                timeout_seconds: Some(5),
+                ..SessionSettings::default()
+            })
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_startup_dump_is_a_transcript_entry() {
+        // The TUI's startup INFO dump is an `Info` entry (stderr is the
+        // terminal here).
+        let cfg = launch();
+        assert!(
+            !cfg.effective.describe().is_empty(),
+            "describe always yields a line"
+        );
+        assert_eq!(
+            SessionSettings::default().describe(),
+            "all defaults",
+            "unset fields are elided"
+        );
     }
 
     #[test]
@@ -2572,6 +2722,11 @@ mod tests {
         assert!(matches!(app.entries[0], app::Entry::Info(_)));
     }
 
+    /// The settings record every recorded session file starts with
+    /// (M18) — an all-defaults snapshot for the test recorders.
+    fn leading_settings_record() -> session::Record {
+        session::settings_record(&SessionSettings::default())
+    }
     /// A `SessionState` that records into its own scratch directory under
     /// a known file name (tests run in parallel, so nothing may be shared).
     fn recording_state(tag: &str) -> (SessionState, PathBuf) {
@@ -2586,7 +2741,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         (
-            SessionState::with_dir(dir.clone(), "session", "deepinfra", None),
+            SessionState::with_dir(dir.clone(), "session", SessionSettings::default()),
             dir,
         )
     }
@@ -2616,6 +2771,7 @@ mod tests {
         assert_eq!(
             data.records,
             vec![
+                leading_settings_record(),
                 session::Record::Thinking {
                     text: "let me think".into()
                 },
@@ -2653,10 +2809,13 @@ mod tests {
         let data = session::load(&dir.join("session.jsonl")).unwrap();
         assert_eq!(
             data.records,
-            vec![session::Record::Assistant {
-                text: "done".into(),
-                calls: vec![]
-            }]
+            vec![
+                leading_settings_record(),
+                session::Record::Assistant {
+                    text: "done".into(),
+                    calls: vec![]
+                },
+            ]
         );
         std::fs::remove_dir_all(dir).ok();
     }
@@ -2684,6 +2843,7 @@ mod tests {
         assert_eq!(
             data.records,
             vec![
+                leading_settings_record(),
                 session::Record::Assistant {
                     text: "partial".into(),
                     calls: vec![]
@@ -2712,9 +2872,12 @@ mod tests {
         let data = session::load(&dir.join("session.jsonl")).unwrap();
         assert_eq!(
             data.records,
-            vec![session::Record::StopReason {
-                reason: "stop".into()
-            }]
+            vec![
+                leading_settings_record(),
+                session::Record::StopReason {
+                    reason: "stop".into()
+                },
+            ]
         );
         std::fs::remove_dir_all(dir).ok();
     }
@@ -2753,6 +2916,7 @@ mod tests {
         assert_eq!(
             data.records,
             vec![
+                leading_settings_record(),
                 session::Record::Assistant {
                     text: "first".into(),
                     calls: vec![]
@@ -2770,7 +2934,7 @@ mod tests {
     #[test]
     fn name_and_resume_report_politely_when_recording_is_off() {
         let mut cfg = launch();
-        let mut state = SessionState::new(&cfg.provider, cfg.model.as_deref()).recording(false);
+        let mut state = SessionState::new(SessionSettings::default()).recording(false);
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
@@ -2816,16 +2980,15 @@ mod tests {
 
     #[test]
     fn status_session_name_shows_no_session_when_recording_is_off() {
-        let cfg = launch();
-        let state = SessionState::new(&cfg.provider, cfg.model.as_deref()).recording(false);
+        let state = SessionState::new(SessionSettings::default()).recording(false);
         assert_eq!(status_session_name(&state).as_deref(), Some("(no session)"));
         // Recording on keeps the existing display: the name once the file
         // exists, nothing before it.
-        let state = SessionState::new(&cfg.provider, cfg.model.as_deref());
+        let state = SessionState::new(SessionSettings::default());
         assert_eq!(status_session_name(&state), None);
         let dir = std::env::temp_dir().join(format!("clanky-status-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut state = SessionState::with_dir(dir.clone(), "named", "deepinfra", None);
+        let mut state = SessionState::with_dir(dir.clone(), "named", SessionSettings::default());
         state.record(&mut NoErrors, session::Record::User { text: "hi".into() });
         assert_eq!(status_session_name(&state).as_deref(), Some("named"));
         std::fs::remove_dir_all(dir).ok();
@@ -2835,8 +2998,7 @@ mod tests {
     fn md_export_without_a_file_uses_screen_records() {
         // With recording off the screen shows a conversation no file
         // ever held: `/md` must export what the screen showed.
-        let cfg = launch();
-        let state = SessionState::new(&cfg.provider, cfg.model.as_deref()).recording(false);
+        let state = SessionState::new(SessionSettings::default()).recording(false);
         let mut app = app::App::new(None);
         app.push_user("count files");
         app.on_turn_event(TurnEvent::ToolCall {

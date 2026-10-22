@@ -154,7 +154,6 @@ impl Recorder {
                     created: 0,
                     provider: Some("mock".into()),
                     model: Some("mock/model".into()),
-                    stop_reason: None,
                 },
             ),
         }
@@ -418,7 +417,6 @@ fn markdown_export_covers_the_session_and_honors_its_flags() {
             created: 1_700_000_000_000,
             provider: Some("deepinfra".into()),
             model: Some("mock/model".into()),
-            stop_reason: None,
         },
     );
     for record in &records {

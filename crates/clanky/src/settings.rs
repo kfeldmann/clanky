@@ -148,6 +148,144 @@ impl Settings {
     }
 }
 
+/// The effective settings of one session (M18): the merged values a
+/// turn runs with — provider, model, and the settings fields that shape
+/// it. Both front ends dump this at startup, and the session file
+/// carries it as a `settings` record at session start and again
+/// whenever settings change mid-session. Unset fields are elided in
+/// the dump and in the records; each record is a full snapshot, so
+/// folding a session's records in order (later records win per field)
+/// reconstructs the settings state as of the end of that session.
+///
+/// Deliberately *not* the `Settings` struct: `prompt` (it becomes a
+/// user record, not a configuration fact) and `session` (a recording
+/// switch, not part of what a turn runs with) are excluded.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SessionSettings {
+    /// Provider name (e.g. `deepinfra`).
+    pub provider: Option<String>,
+    /// Model identifier as known to the provider.
+    pub model: Option<String>,
+    /// Thinking budget in tokens or `off`.
+    pub thinking: Option<String>,
+    /// Sampling parameters (merged per key across layers).
+    pub sampling: Option<SamplingParams>,
+    /// Tool-loop round cap for one turn (`0` = unlimited).
+    pub max_tool_rounds: Option<usize>,
+    /// Retries for a retryable provider error (`0` = never retry).
+    pub max_retries: Option<u32>,
+    /// Project label shown at the left of the TUI input prompt.
+    pub project: Option<String>,
+    /// Default tool-call timeout in seconds (`None` = unbounded).
+    pub timeout_seconds: Option<u64>,
+}
+
+impl SessionSettings {
+    /// Overlay `over` on top of `self`, field by field (used when
+    /// folding a session's settings records in order: later records win
+    /// per field, exactly as they were written). `sampling` merges per
+    /// key, like every settings layering.
+    pub fn overlay(&mut self, over: &Self) {
+        if over.provider.is_some() {
+            self.provider = over.provider.clone();
+        }
+        if over.model.is_some() {
+            self.model = over.model.clone();
+        }
+        if over.thinking.is_some() {
+            self.thinking = over.thinking.clone();
+        }
+        if let Some(over_sampling) = &over.sampling {
+            match &mut self.sampling {
+                Some(base) => base.extend(over_sampling.clone()),
+                None => self.sampling = Some(over_sampling.clone()),
+            }
+        }
+        if over.max_tool_rounds.is_some() {
+            self.max_tool_rounds = over.max_tool_rounds;
+        }
+        if over.max_retries.is_some() {
+            self.max_retries = over.max_retries;
+        }
+        if over.project.is_some() {
+            self.project = over.project.clone();
+        }
+        if over.timeout_seconds.is_some() {
+            self.timeout_seconds = over.timeout_seconds;
+        }
+    }
+
+    /// Whether the two states differ in at least one field. Equivalent
+    /// to `a != b` (`sampling` merge aside); spelled out for intent at
+    /// the recorder's change-detection call site.
+    pub fn differs_from(&self, other: &Self) -> bool {
+        self != other
+    }
+
+    /// One-line human description for the startup dump (M18): provider
+    /// and model, then the merged settings; unset fields elided.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(provider) = &self.provider {
+            parts.push(format!("provider {provider}"));
+        }
+        if let Some(model) = &self.model {
+            parts.push(format!("model {model}"));
+        }
+        if let Some(thinking) = &self.thinking {
+            parts.push(format!("thinking {thinking}"));
+        }
+        if let Some(sampling) = &self.sampling {
+            parts.push(format!("sampling {}", describe_sampling(sampling)));
+        }
+        if let Some(rounds) = self.max_tool_rounds {
+            parts.push(format!("max_tool_rounds {rounds}"));
+        }
+        if let Some(retries) = self.max_retries {
+            parts.push(format!("max_retries {retries}"));
+        }
+        if let Some(project) = &self.project {
+            parts.push(format!("project {project}"));
+        }
+        if let Some(seconds) = self.timeout_seconds {
+            parts.push(format!("timeout {seconds}s"));
+        }
+        if parts.is_empty() {
+            return "all defaults".into();
+        }
+        parts.join(" · ")
+    }
+}
+
+impl From<&Settings> for SessionSettings {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            provider: settings.provider.clone(),
+            model: settings.model.clone(),
+            thinking: settings.thinking.clone(),
+            sampling: settings.sampling.clone(),
+            max_tool_rounds: settings.max_tool_rounds,
+            max_retries: settings.max_retries,
+            project: settings.project.clone(),
+            timeout_seconds: settings.timeout_seconds,
+        }
+    }
+}
+
+/// Sampling parameters as `key=value` pairs for the status messages and
+/// the startup dump. Values are shown as given: strings verbatim, other
+/// JSON values in their JSON form.
+pub fn describe_sampling(params: &SamplingParams) -> String {
+    params
+        .iter()
+        .map(|(key, value)| match value {
+            serde_json::Value::String(raw) => format!("{key}={raw}"),
+            other => format!("{key}={other}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +390,71 @@ mod tests {
 
         std::fs::remove_file(project).unwrap();
         assert_eq!(Settings::default().project, None, "unset means no label");
+    }
+
+    #[test]
+    fn session_settings_exclude_prompt_and_session_switch() {
+        // The session dump is the merged configuration a turn runs with:
+        // `prompt` becomes a user record (not a configuration fact) and
+        // `session` is a recording switch. Neither is part of it.
+        let settings = Settings {
+            provider: Some("deepinfra".into()),
+            prompt: Some("hi".into()),
+            session: Some(false),
+            ..Settings::default()
+        };
+        let effective = SessionSettings::from(&settings);
+        assert_eq!(effective.provider.as_deref(), Some("deepinfra"));
+        assert_eq!(effective.project, None, "unset fields stay unset");
+    }
+
+    #[test]
+    fn session_settings_overlay_folds_later_records() {
+        // Folding is the `/resume` mechanism: later records win per
+        // field, exactly as they were written.
+        let mut state = SessionSettings {
+            provider: Some("deepinfra".into()),
+            model: Some("old/model".into()),
+            sampling: Some(sampling(&[("temperature", "0.7"), ("seed", "42")])),
+            timeout_seconds: Some(30),
+            ..SessionSettings::default()
+        };
+        state.overlay(&SessionSettings {
+            model: Some("new/model".into()),
+            sampling: Some(sampling(&[("top_p", "0.9"), ("seed", "7")])),
+            timeout_seconds: None, // a later unset field keeps the value
+            ..SessionSettings::default()
+        });
+        assert_eq!(state.model.as_deref(), Some("new/model"));
+        assert_eq!(state.timeout_seconds, Some(30), "unset does not clear");
+        let sampling = state.sampling.unwrap();
+        // `sampling` values are strings in these helpers (JSON-decoded
+        // on the wire only), so compare as strings.
+        assert_eq!(sampling["temperature"], serde_json::json!("0.7"));
+        assert_eq!(sampling["top_p"], serde_json::json!("0.9"));
+        assert_eq!(sampling["seed"], serde_json::json!("7"));
+    }
+
+    #[test]
+    fn session_settings_describe_elides_unset_fields() {
+        assert_eq!(SessionSettings::default().describe(), "all defaults");
+        let effective = SessionSettings {
+            provider: Some("deepinfra".into()),
+            model: Some("m/x".into()),
+            sampling: Some(sampling(&[("temperature", "0.7")])),
+            timeout_seconds: Some(5),
+            ..SessionSettings::default()
+        };
+        let described = effective.describe();
+        assert!(described.contains("provider deepinfra"), "{described}");
+        assert!(described.contains("model m/x"), "{described}");
+        assert!(
+            described.contains("sampling temperature=0.7"),
+            "{described}"
+        );
+        assert!(described.contains("timeout 5s"), "{described}");
+        assert!(!described.contains("thinking"), "unset elided: {described}");
+        assert!(!described.contains("project"), "unset elided: {described}");
     }
 
     #[test]

@@ -800,7 +800,7 @@ As built notes:
   after the first free word is swallowed by the prompt) — noted in the CLI
   test.
 
-## ☐ M18 — Settings observability: startup dump + settings records in the log
+## ☑ M18 — Settings observability: startup dump + settings records in the log
 The merged configuration is currently observable only by reading the status line
 (provider · model) and guessing at the rest. Two coupled pieces:
 
@@ -838,6 +838,57 @@ Done when: `clanky -p "hi"` shows the INFO dump on stderr; the session file's
 first record is a settings record with model/provider (header no longer carries
 them, old files still resume); a `/model` change writes a settings record; a
 `/resume` of a session whose settings differed writes a change record.
+As built notes:
+- The session dump type is `settings::SessionSettings` (provider, model,
+  thinking, sampling, max_tool_rounds, max_retries, project,
+  timeout_seconds): every `Settings` field except `prompt` (it becomes a
+  user record, not a configuration fact) and `session` (a recording
+  switch). `describe()` renders one line, unset fields elided
+  (`all defaults` when nothing is set); `describe_sampling` moved from
+  the TUI into `settings.rs`, shared by the dump and the `/sampling`
+  messages.
+- The record wire shape is `session::SessionSettingsRecord`
+  (`camelCase`, unset fields elided) wrapping `SessionSettings`;
+  `session::settings_record(&SessionSettings)` builds it and
+  `session::fold_settings(&SessionData)` folds a file's records in order
+  (later records win per field, `[sampling]` per key), falling back to
+  the legacy header provider/model when the file has no settings record.
+- The recorder owns the state. `Recorder::new(SessionSettings)` replaces
+  the provider/model pair; the dump is written lazily with the *first*
+  `record` call, so the settings record always precedes the first user
+  record without creating the file before the first prompt.
+  `set_settings(settings)` updates the live state and writes a record
+  once the dump is out (pre-start changes fold into it silently â a
+  change before the first prompt never creates the file early). The
+  front ends snapshot the effective settings at every change
+  (`observe_settings` in the TUI derives them from the live `Launch`
+  fields, so record trail and live fields cannot drift; print mode
+  builds one snapshot up front). Covered changes: `/model`,
+  `/provider` (also clears the model until the new handshake resolves
+  it), `/thinking`, `/sampling`, `/timeout`, the TUI's adoption of the
+  plugin's advertised default model when none was set, and `/resume`
+  differences.
+- `/resume`: `recorder::reopen(path, folded, errors)` takes the folded
+  state and appends one change record (a snapshot of the active
+  settings) when it differs from the active settings; equal states write
+  nothing. Resuming counts as session start: later changes write
+  records. The records never set values (M18 semantics kept).
+- Header migration: `Header` is write-once (`version`, `created`);
+  `provider`/`model` remain as parse-only legacy fields (old files load,
+  and `export::effective_settings` uses them only when no settings
+  record exists), `stop_reason` and `SessionWriter::set_stop_reason` are
+  removed, and `Mode::Reopen` no longer reads the header line back.
+- Startup dump: print mode prints `INFO: settings: â¦` to stderr before
+  the resume note; the TUI pushes a `settings: â¦` `Info` entry at
+  startup (stderr is the terminal there). The print-mode snapshot fills
+  the model from the resolved turn config (the plugin handshake's
+  advertised default included), so the dump shows the model a turn will
+  actually use.
+- Test note: `plugin_pipe.rs` pins `HOME` to its scratch dir, so the
+  merged settings a run records are deterministic regardless of the
+  machine's `~/.clanky/settings.toml`; the golden `session-records`
+  fixture gained the leading settings record (regenerated).
+
 
 ## ☐ M19 — Edit tool
 A built-in `edit` tool beside `bash` behind the `Tool` trait; unrestricted paths

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use crate::error::Result;
 use crate::session;
 pub use crate::session::SessionWriter;
+use crate::settings::SessionSettings;
 use crate::turn::TurnEvent;
 
 /// Where write failures go. Errors must never abort the turn: a broken
@@ -46,8 +47,16 @@ struct PartialRound {
 /// the name/resume operations report that sessions are off.
 pub struct Recorder {
     dir: PathBuf,
-    provider: String,
-    model: Option<String>,
+    /// The session's effective settings (M18): the merged values the
+    /// turns run with. Dumped as a `settings` record at session start
+    /// and again whenever a change is observed; the live state is
+    /// updated by the front ends through [`Recorder::set_settings`].
+    settings: SessionSettings,
+    /// Whether the settings record for the current state has been
+    /// written (`false` until the first dump; the file is created
+    /// lazily, so the first user record must be preceded by the dump —
+    /// see [`Recorder::record`]).
+    settings_written: bool,
     /// Whether records are written at all (`--no-session` turns it off).
     recording: bool,
     writer: Option<SessionWriter>,
@@ -73,13 +82,16 @@ impl Recorder {
         self
     }
 
-    /// A recorder for a fresh session (provider and model are stamped
-    /// into the file header when the file is created).
-    pub fn new(provider: &str, model: Option<&str>) -> Self {
+    /// A recorder for a fresh session, starting from the merged
+    /// settings state (M18). The first settings record is written with
+    /// the first user record (both front ends record the prompt before
+    /// the first turn), so the settings record always precedes the
+    /// first user record in the file.
+    pub fn new(settings: SessionSettings) -> Self {
         Self {
             dir: session::sessions_dir(),
-            provider: provider.to_string(),
-            model: model.map(str::to_string),
+            settings,
+            settings_written: false,
             recording: true,
             writer: None,
             pending_name: None,
@@ -107,8 +119,8 @@ impl Recorder {
     /// Record into a specific directory, under a known file name (tests;
     /// production always records into `sessions_dir()` with a generated
     /// name). Returns the file path records are appended to.
-    pub fn with_dir(dir: PathBuf, name: &str, provider: &str, model: Option<&str>) -> Self {
-        let mut state = Self::new(provider, model);
+    pub fn with_dir(dir: PathBuf, name: &str, settings: SessionSettings) -> Self {
+        let mut state = Self::new(settings);
         state.dir = dir;
         state.pending_name = Some(name.to_string());
         state
@@ -149,14 +161,14 @@ impl Recorder {
     }
 
     /// A session header stamped now, for a session with no records yet
-    /// (`/md` on a fresh session exports it).
+    /// (`/md` on a fresh session exports it). Write-once since M18:
+    /// provider/model live in the settings records.
     pub fn fresh_header(&self) -> session::Header {
         session::Header {
             version: session::FORMAT_VERSION,
             created: session::now_millis(),
-            provider: Some(self.provider.clone()),
-            model: self.model.clone(),
-            stop_reason: None,
+            provider: None,
+            model: None,
         }
     }
 
@@ -168,11 +180,45 @@ impl Recorder {
         if !self.recording {
             return;
         }
+        // The first record of the file must be the settings snapshot
+        // (M18: it precedes the first user record). The front ends
+        // record the user prompt before the first turn, so this fires
+        // exactly once, at session start.
+        if !self.settings_written {
+            self.settings_written = true;
+            self.write(session::settings_record(&self.settings), errors);
+        }
+        self.write(record, errors);
+    }
+
+    /// Append one record, reporting write failures through the sink.
+    /// A no-op when recording is off, like [`Recorder::record`].
+    fn write(&mut self, record: session::Record, errors: &mut dyn ErrorSink) {
+        if !self.recording {
+            return;
+        }
         if let Err(err) = self
             .ensure_writer()
             .and_then(|writer| writer.append(&record))
         {
             errors.report(format!("session not saved: {err}"));
+        }
+    }
+
+    /// The current settings state, for a front end's change detection
+    /// (`/model` &c. compare before they assign the new value).
+    /// A settings change happened (`/model`, `/thinking`, `/sampling`,
+    /// `/timeout`, `/provider`, or a model default adopted from the
+    /// plugin handshake): update the live state and, once the session
+    /// has started (the startup dump is out), write a settings record
+    /// for the new state. Before the first record the dump has not been
+    /// written yet, so the change is simply folded into it — a settings
+    /// change before the first prompt never produces a record of its
+    /// own (and never creates the file early).
+    pub fn set_settings(&mut self, settings: SessionSettings, errors: &mut dyn ErrorSink) {
+        self.settings = settings;
+        if self.settings_written {
+            self.write(session::settings_record(&self.settings), errors);
         }
     }
 
@@ -226,12 +272,13 @@ impl Recorder {
                 .unwrap_or_else(session::default_name);
             self.writer = Some(SessionWriter::new(
                 self.dir.join(format!("{name}.jsonl")),
+                // Write-once header (M18): provider/model live in the
+                // settings records now.
                 session::Header {
                     version: session::FORMAT_VERSION,
                     created: 0, // stamped when the file is created
-                    provider: Some(self.provider.clone()),
-                    model: self.model.clone(),
-                    stop_reason: None,
+                    provider: None,
+                    model: None,
                 },
             ));
         }
@@ -266,15 +313,27 @@ impl Recorder {
 
     /// Continue an existing session file: subsequent records append to
     /// `--resume`d sessions (no new header), and the pending `/name` is
-    /// cleared — the file already has its name. A no-op when recording
-    /// is off: the caller rejects resuming into a disabled session, and
-    /// even a stray reopen must not start writing again.
-    pub fn reopen(&mut self, path: PathBuf) {
+    /// cleared — the file already has its name. `folded` is the
+    /// session's own settings records folded in order (M18) — the state
+    /// as of the end of that session. The records never *set* values
+    /// here: when the folded state equals the active settings, nothing
+    /// is written (the file already describes its settings); when it
+    /// differs, one change record — a snapshot of the active settings —
+    /// is appended, so from the resumed session's perspective the
+    /// settings changed mid-session, in order. Either way the resumed
+    /// session counts as started: later settings changes write records.
+    /// A no-op when recording is off: the caller rejects resuming into a
+    /// disabled session, and even a stray reopen must not start writing.
+    pub fn reopen(&mut self, path: PathBuf, folded: &SessionSettings, errors: &mut dyn ErrorSink) {
         if !self.recording {
             return;
         }
         self.writer = Some(SessionWriter::reopen(path));
         self.pending_name = None;
+        self.settings_written = true;
+        if folded.differs_from(&self.settings) {
+            self.write(session::settings_record(&self.settings), errors);
+        }
     }
 
     /// Record the turn's terminal state: anything the last round streamed
@@ -399,7 +458,8 @@ mod tests {
                 .subsec_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let state = Recorder::with_dir(dir.clone(), "session", "deepinfra", None).recording(false);
+        let state =
+            Recorder::with_dir(dir.clone(), "session", SessionSettings::default()).recording(false);
         (state, dir)
     }
 
@@ -427,8 +487,210 @@ mod tests {
             state.set_name(Some("renamed".into())).unwrap_err(),
             Recorder::disabled_message()
         );
-        state.reopen(dir.join("session.jsonl"));
+        let mut errors = PanickySink;
+        state.reopen(
+            dir.join("session.jsonl"),
+            &SessionSettings::default(),
+            &mut errors,
+        );
         assert!(state.open_file().is_none(), "reopen must not start writing");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A fresh recorder with one settings change folded in before the
+    /// first record (the startup-dump path: `set_settings` before the
+    /// first `record` must not create the file early nor write a record).
+    fn pre_start_change(tag: &str) -> (Recorder, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-settings-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = Recorder::with_dir(
+            dir.clone(),
+            "session",
+            SessionSettings {
+                provider: Some("deepinfra".into()),
+                ..SessionSettings::default()
+            },
+        );
+        let mut errors = PanickySink;
+        state.set_settings(
+            SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("m/new".into()),
+                ..SessionSettings::default()
+            },
+            &mut errors,
+        );
+        assert!(
+            state.open_file().is_none(),
+            "a pre-start change must not create the file"
+        );
+        (state, dir)
+    }
+
+    /// The records on disk (settings record included).
+    fn records_on_disk(dir: &Path) -> Vec<session::Record> {
+        session::load(&dir.join("session.jsonl")).unwrap().records
+    }
+
+    #[test]
+    fn the_first_record_is_the_settings_snapshot() {
+        // The dump fires with the first user record, so the file's first
+        // record is the settings record, before the first user record.
+        let (mut state, dir) = pre_start_change("first-record");
+        let mut errors = PanickySink;
+        state.record(&mut errors, session::Record::User { text: "hi".into() });
+        let records = records_on_disk(&dir);
+        assert_eq!(
+            records,
+            vec![
+                session::settings_record(&SessionSettings {
+                    provider: Some("deepinfra".into()),
+                    model: Some("m/new".into()),
+                    ..SessionSettings::default()
+                }),
+                session::Record::User { text: "hi".into() },
+            ]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_change_after_start_writes_a_settings_record() {
+        // `/model` after the session started: the recorder observes the
+        // new state and writes one record for it.
+        let (mut state, dir) = pre_start_change("mid-change");
+        let mut errors = PanickySink;
+        state.record(&mut errors, session::Record::User { text: "hi".into() });
+        state.set_settings(
+            SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("m/other".into()),
+                timeout_seconds: Some(10),
+                ..SessionSettings::default()
+            },
+            &mut errors,
+        );
+        let records = records_on_disk(&dir);
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records[2],
+            session::settings_record(&SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("m/other".into()),
+                timeout_seconds: Some(10),
+                ..SessionSettings::default()
+            })
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn resume_with_equal_settings_writes_no_record_and_unequal_writes_one() {
+        // M18's `/resume` semantics: the session's records folded in
+        // order are compared against the active settings; equal → no
+        // record (the file already describes its settings), different →
+        // one change record, a snapshot of the active settings.
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-resume-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A pre-M18-shaped file: legacy header, no settings records.
+        let path = dir.join("old.jsonl");
+        let mut writer = SessionWriter::new(
+            path.clone(),
+            session::Header {
+                version: session::FORMAT_VERSION,
+                created: 1_700_000_000_000,
+                provider: Some("deepinfra".into()),
+                model: Some("m/old".into()),
+            },
+        );
+        writer
+            .append(&session::Record::User { text: "hi".into() })
+            .unwrap();
+        drop(writer);
+        let data = session::load(&path).unwrap();
+        let folded = session::fold_settings(&data);
+
+        // Active settings equal to the folded state: no record. Each
+        // recorder gets its own copy of the file, so the two appends
+        // never share one (reopen writes to the file it is given).
+        std::fs::copy(&path, dir.join("equal.jsonl")).unwrap();
+        let mut state = Recorder::with_dir(
+            dir.clone(),
+            "equal-unused",
+            SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("m/old".into()),
+                ..SessionSettings::default()
+            },
+        );
+        let mut errors = PanickySink;
+        state.reopen(dir.join("equal.jsonl"), &folded, &mut errors);
+        state.record(
+            &mut errors,
+            session::Record::User {
+                text: "again".into(),
+            },
+        );
+        // Reopen switched the writer to the resumed file.
+        let records = session::load(&path).unwrap().records;
+        assert!(
+            records
+                .iter()
+                .all(|r| !matches!(r, session::Record::Settings { .. })),
+            "equal states write no record: {records:?}"
+        );
+
+        // Active settings differing: one change record (the active
+        // snapshot), before the new user record.
+        std::fs::copy(&path, dir.join("unequal.jsonl")).unwrap();
+        let mut state = Recorder::with_dir(
+            dir.clone(),
+            "unequal-unused",
+            SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("m/new".into()),
+                ..SessionSettings::default()
+            },
+        );
+        state.reopen(dir.join("unequal.jsonl"), &folded, &mut errors);
+        state.record(
+            &mut errors,
+            session::Record::User {
+                text: "again".into(),
+            },
+        );
+        let records = session::load(&dir.join("unequal.jsonl")).unwrap().records;
+        // The file's own records, then the change record, then the new
+        // user record.
+        assert_eq!(
+            records,
+            vec![
+                session::Record::User { text: "hi".into() },
+                session::settings_record(&SessionSettings {
+                    provider: Some("deepinfra".into()),
+                    model: Some("m/new".into()),
+                    ..SessionSettings::default()
+                }),
+                session::Record::User {
+                    text: "again".into()
+                },
+            ]
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

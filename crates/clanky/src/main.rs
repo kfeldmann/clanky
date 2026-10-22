@@ -22,7 +22,7 @@ use clanky::context;
 use clanky::error::Result;
 use clanky::provider;
 use clanky::session;
-use clanky::settings::Settings;
+use clanky::settings::{SessionSettings, Settings};
 use clanky::tools;
 use clanky::tui;
 use clanky::turn::{self, TurnEvent};
@@ -102,7 +102,7 @@ fn run_pipe(
     let prompt_text = clanky::prompt::resolve(settings.prompt.take())?;
     let provider_name = settings
         .provider
-        .take()
+        .clone()
         .unwrap_or_else(|| provider::DEFAULT_PROVIDER.into());
 
     // One long-lived plugin process for the turn (M8). It is shut down when
@@ -111,13 +111,24 @@ fn run_pipe(
     let default_model = provider_session.default_model().map(str::to_string);
     let config = turn::TurnConfig::from_settings(settings, default_model.as_deref());
 
+    // The session's effective settings (M18): the merged values this
+    // turn runs with — the plugin's advertised default fills in for an
+    // unset model, exactly as the turn config does.
+    let effective = SessionSettings {
+        model: config.model.clone(),
+        ..SessionSettings::from(&*settings)
+    };
+    // Startup INFO dump (M18): model, provider, and the merged settings,
+    // on stderr (stdout stays the response/quiet channel). Unset fields
+    // are elided.
+    eprintln!("INFO: settings: {}", effective.describe());
+
     // Same session behavior as the TUI (M14): records by default, the
     // user prompt first, everything the turn produces appended as it
     // happens. `--no-session` (or `session = false`) disables the file:
     // every record call becomes a no-op and nothing is created.
     let mut recorder =
-        clanky::recorder::Recorder::new(provider_session.name(), config.model.as_deref())
-            .recording(settings.record_sessions());
+        clanky::recorder::Recorder::new(effective.clone()).recording(settings.record_sessions());
     let mut errors = clanky::recorder::StderrErrors;
     if let Some(name) = name {
         recorder = recorder.with_name(name, &mut errors);
@@ -133,7 +144,17 @@ fn run_pipe(
         let data = session::load(&path)?;
         messages.extend(session::history_from_records(&data.records));
         eprintln!("INFO: resuming `{name}` ({} records)", data.records.len());
-        recorder.reopen(path);
+        // Fold the session's settings records in order (M18) to
+        // reconstruct the settings state as of the end of that session;
+        // the records never set values here. A state differing from the
+        // active settings writes one change record (the active
+        // snapshot), so from the resumed session's perspective the
+        // settings changed mid-session, in order.
+        let folded = session::fold_settings(&data);
+        if folded.differs_from(&effective) {
+            recorder.set_settings(effective.clone(), &mut errors);
+        }
+        recorder.reopen(path, &folded, &mut errors);
     }
     messages.push(clanky_protocol::ChatMessage::user(&prompt_text));
     recorder.record(

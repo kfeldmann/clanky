@@ -564,9 +564,11 @@ impl App {
                     );
                 }
                 // Metadata, not conversation content: usage is applied
-                // round-by-round through [`TurnEvent::Usage`], and the
-                // stop reason has no transcript entry of its own.
-                Record::StopReason { .. } => {}
+                // round-by-round through [`TurnEvent::Usage`], the stop
+                // reason has no transcript entry of its own, and a
+                // settings snapshot is a settings fact (already visible
+                // in the status line), not a transcript entry.
+                Record::StopReason { .. } | Record::Settings { .. } => {}
             }
         }
         crate::session::history_from_records(records)

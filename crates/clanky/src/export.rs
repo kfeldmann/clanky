@@ -19,6 +19,7 @@
 use clanky_protocol::Usage;
 
 use crate::session::{self, Header, Record};
+use crate::settings::SessionSettings;
 
 /// Which record types an export includes.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -69,10 +70,14 @@ pub fn render(
     let mut meta = |label: &str, value: String| {
         out.push_str(&format!("| {label} | {value} |\n"));
     };
-    if let Some(provider) = &header.provider {
+    // Settings records (M18) are the source of provider/model; a header
+    // field is the pre-M18 legacy location, used only when the file has
+    // no settings record.
+    let effective = effective_settings(header, records);
+    if let Some(provider) = &effective.provider {
         meta("Provider", provider.clone());
     }
-    if let Some(model) = &header.model {
+    if let Some(model) = &effective.model {
         meta("Model", model.clone());
     }
     meta("Created", session::format_datetime(header.created / 1000));
@@ -139,6 +144,12 @@ pub fn render(
                 // one footer line, not a transcript entry.
                 saw_stop_reason = Some(reason.clone());
             }
+            Record::Settings { .. } => {
+                // Settings snapshots are metadata: the effective settings
+                // state at the end of the session is what an export can
+                // honestly state, so only the last record is shown (in
+                // the header table; nothing in the transcript body).
+            }
         }
     }
 
@@ -157,6 +168,22 @@ pub fn render(
         ));
     }
     out
+}
+
+/// The effective settings state of a session file: the last `settings`
+/// record's snapshot. Falls back to the header's legacy provider/model
+/// when the file has no settings record (pre-M18 files).
+pub fn effective_settings(header: &Header, records: &[Record]) -> SessionSettings {
+    for record in records.iter().rev() {
+        if let Record::Settings { settings } = record {
+            return SessionSettings::from(settings);
+        }
+    }
+    SessionSettings {
+        provider: header.provider.clone(),
+        model: header.model.clone(),
+        ..SessionSettings::default()
+    }
 }
 
 /// Total token usage across `records` (prompt and completion summed over
@@ -243,7 +270,6 @@ mod tests {
             created: 1_700_000_000_000,
             provider: Some("deepinfra".into()),
             model: Some("mock/model".into()),
-            stop_reason: None,
         }
     }
 

@@ -99,6 +99,7 @@ fn unknown_provider_lists_discovered_plugins() {
     let output = Command::new(env!("CARGO_BIN_EXE_clanky"))
         .args(["--provider", "nonexistent", "-p", "hi"])
         .current_dir(&dir)
+        .env("HOME", &dir)
         .env("PATH", path_with(&dir))
         .stdin(std::process::Stdio::null())
         .output()
@@ -145,6 +146,7 @@ fn print_mode_records_a_session_by_default() {
     let output = Command::new(env!("CARGO_BIN_EXE_clanky"))
         .args(["--provider", "hello-world", "-p", "say hi"])
         .current_dir(&dir)
+        .env("HOME", &dir)
         .env("PATH", path_with(&dir))
         .stdin(std::process::Stdio::null())
         .output()
@@ -176,6 +178,7 @@ fn resume_with_no_session_is_rejected_with_one_shared_message() {
             .args(extra)
             .args(["--no-session", "hi"])
             .current_dir(&dir)
+            .env("HOME", &dir)
             .env("PATH", path_with(&dir))
             .stdin(std::process::Stdio::null())
             .output()
@@ -276,11 +279,15 @@ fn plugin_dir(plugin: &str, script: &str) -> PathBuf {
     dir
 }
 
-/// One print-mode run in `dir` with the given extra argv.
+/// One print-mode run in `dir` with the given extra argv. `HOME` is
+/// pinned to the scratch dir so the user settings scope is empty and the
+/// merged settings (the leading `settings` record) are deterministic —
+/// no machine's own `~/.clanky/settings.toml` leaks into the assertions.
 fn run_clanky(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_clanky"))
         .args(args)
         .current_dir(dir)
+        .env("HOME", dir)
         .env("PATH", path_with(dir))
         .env("CLANKY_PLUGIN_DEBUG", "1")
         .stdin(std::process::Stdio::null())
@@ -307,6 +314,14 @@ fn session_records(dir: &Path) -> Vec<serde_json::Value> {
     let (_, text) = single_session(dir);
     text.lines()
         .skip(1)
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The one session file's records, header line included as raw JSON.
+fn all_lines(dir: &Path) -> Vec<serde_json::Value> {
+    let (_, text) = single_session(dir);
+    text.lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
 }
@@ -381,6 +396,7 @@ fn print_mode_records_the_same_records_a_tui_run_would() {
     assert_eq!(
         types,
         [
+            "settings",
             "user",
             "thinking",
             "assistant",
@@ -391,18 +407,27 @@ fn print_mode_records_the_same_records_a_tui_run_would() {
         ],
         "the tool-loop transcript is recorded completely: {records:?}"
     );
-    assert_eq!(records[0]["text"], "run it");
-    assert_eq!(records[1]["text"], "let me check");
+    // The settings record leads, and the plugin's advertised default
+    // model fills in for the unset model (the handshake default). The
+    // header is write-once now: it carries no provider/model.
+    let header = &all_lines(&dir)[0];
+    assert_eq!(header["type"], "header");
+    assert_eq!(header["provider"], serde_json::Value::Null);
+    assert_eq!(header["model"], serde_json::Value::Null);
+    assert_eq!(records[0]["settings"]["provider"], "hello-world");
+    assert_eq!(records[0]["settings"]["model"], "hello-world/tiny");
+    assert_eq!(records[1]["text"], "run it");
+    assert_eq!(records[2]["text"], "let me check");
     assert_eq!(
-        records[2]["calls"][0]["name"], "bash",
+        records[3]["calls"][0]["name"], "bash",
         "the round's tool call is recorded: {records:?}"
     );
-    assert_eq!(records[3]["output"], "42");
-    assert_eq!(records[4]["text"], "The tool ran.");
-    assert_eq!(records[5]["promptTokens"], 4);
-    assert_eq!(records[5]["completionTokens"], 2);
+    assert_eq!(records[4]["output"], "42");
+    assert_eq!(records[5]["text"], "The tool ran.");
+    assert_eq!(records[6]["promptTokens"], 4);
+    assert_eq!(records[6]["completionTokens"], 2);
     assert_eq!(
-        records[6]["reason"], "stop",
+        records[7]["reason"], "stop",
         "the turn's stop reason is the last record: {records:?}"
     );
     std::fs::remove_dir_all(dir).ok();
@@ -434,14 +459,14 @@ fn a_mid_stream_error_flushes_the_partial_round() {
         .collect();
     assert_eq!(
         types,
-        ["user", "thinking", "assistant", "error"],
+        ["settings", "user", "thinking", "assistant", "error"],
         "partial round flushed, then the error record (no stopReason — \
 the turn never reached its terminal `done`): {records:?}"
     );
-    assert_eq!(records[1]["text"], "let me thi");
-    assert_eq!(records[2]["text"], "The an");
-    assert_eq!(records[2]["calls"], serde_json::json!([]));
-    let error = records[3]["message"].as_str().unwrap();
+    assert_eq!(records[2]["text"], "let me thi");
+    assert_eq!(records[3]["text"], "The an");
+    assert_eq!(records[3]["calls"], serde_json::json!([]));
+    let error = records[4]["message"].as_str().unwrap();
     assert!(
         error.contains("timed out reading response"),
         "the error record carries the failure: {error}"
