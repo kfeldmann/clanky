@@ -965,7 +965,7 @@ for multimodal models. Scope: **image → model only.** The TUI never displays t
 image (tool-result entry shows size like any result); the model never generates
 images. Cards on the table:
 
-1. **Protocol (the blocker's resolution):** `ChatMessage` gains an optional,
+1. **Protocol:** `ChatMessage` gains an optional,
    additive image list — `Vec<ImagePart> { data_base64, media_type }`, new in a
    minor protocol version (additive in v2; adapters without the field are no
    longer needed since all three are ours). Text content stays the primary
@@ -995,11 +995,11 @@ images. Cards on the table:
    exactly what the model saw"; truncating it violates that with no principled
    cap). Record schema documents the size expectation. `history_from_records`
    rebuilds the image parts.
-4. Print mode `-pq`: an image result prints only its size note.
+4. Print mode `-p`: an image result prints only its size note.
 
 Design notes (wire shapes for all three backends, media-type table, session
 size caveat) go in a short `design-docs/read-image-plan.md`, matching the
 pattern of M10/M11 planning docs.
-Done when: `clanky -p "what's in /work/screenshot.png"` against a vision model
+Done when: `clanky -p "what's in /work/sample.jpg"` against a vision model
 returns a description; the session replays and the model answers about the
 image again; a text-only model surfaces the backend error unchanged.
