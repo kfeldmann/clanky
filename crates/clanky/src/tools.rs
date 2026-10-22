@@ -52,10 +52,13 @@ pub type ToolSet = Vec<Box<dyn Tool>>;
 /// default tool-call deadline (huge default when unset, see below); a
 /// per-call `timeout_seconds` argument always wins over it.
 pub fn default_tools(timeout_seconds: Option<u64>) -> ToolSet {
-    vec![Box::new(BashTool::new(
-        Duration::from_secs(timeout_seconds.unwrap_or(UNSET_DEADLINE)),
-        20_000,
-    ))]
+    vec![
+        Box::new(BashTool::new(
+            Duration::from_secs(timeout_seconds.unwrap_or(UNSET_DEADLINE)),
+            20_000,
+        )),
+        Box::new(EditTool),
+    ]
 }
 
 /// Sentinel default deadline used when no configured deadline is set: far
@@ -269,6 +272,161 @@ impl BashTool {
         }
         truncate_chars(&output, self.max_output_chars)
     }
+}
+
+/// The built-in `edit` tool: replace a literal substring in a file.
+///
+/// The model supplies `path`, `old_string`, `new_string`, and an optional
+/// `replace_all` flag. Matching is byte-for-byte literal — no patterns, no
+/// wildcards — so the text in the tool call is exactly the text in the file.
+///
+/// There is no read-before-edit requirement and no permission boundary: bash
+/// already writes anywhere. The tool's value is intent and failure messages —
+/// the match-count errors below are data the model can recover from, instead
+/// of a silent `sed` that hit the wrong line.
+pub struct EditTool;
+
+impl Default for EditTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl Tool for EditTool {
+    fn name(&self) -> &str {
+        "edit"
+    }
+
+    fn description(&self) -> &str {
+        "Replace a literal substring in a file (byte-for-byte, no patterns). Fails on zero matches; fails on multiple matches unless `replace_all` is set."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file to edit (relative paths resolve against the working directory)"
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "The exact text to replace (must match the file byte-for-byte)"
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "The replacement text"
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace every occurrence instead of failing on multiple matches (default: false)"
+                }
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+
+    fn execute(&self, arguments: &Value) -> Result<String, ToolError> {
+        // Argument extraction: every field the schema requires must be a
+        // string, and each missing/mistyped field gets its own message so
+        // the model can fix just that field.
+        let string_arg = |field: &str| -> Result<&str, ToolError> {
+            arguments.get(field).and_then(Value::as_str).ok_or_else(|| {
+                ToolError::InvalidArguments {
+                    tool: self.name().into(),
+                    message: format!("expected a string field `{field}`"),
+                }
+            })
+        };
+        let path = string_arg("path")?;
+        let old_string = string_arg("old_string")?;
+        let new_string = string_arg("new_string")?;
+        let replace_all = match arguments.get("replace_all") {
+            None | Some(Value::Null) => false,
+            Some(value) => value.as_bool().ok_or_else(|| ToolError::InvalidArguments {
+                tool: self.name().into(),
+                message: "expected a boolean field `replace_all`".into(),
+            })?,
+        };
+        if old_string.is_empty() {
+            return Err(ToolError::InvalidArguments {
+                tool: self.name().into(),
+                message:
+                    "`old_string` must not be empty (an empty match would replace the whole file)"
+                        .into(),
+            });
+        }
+
+        // Read the file as bytes and match on bytes: the needle and
+        // haystack are matched byte-for-byte, and a file with invalid
+        // UTF-8 beside the edited region must not block an edit to valid
+        // text in it.
+        let bytes = std::fs::read(path).map_err(|err| ToolError::Failed {
+            tool: self.name().into(),
+            message: format!("failed to read {path}: {err}"),
+        })?;
+        let count = count_subsequence(&bytes, old_string.as_bytes());
+
+        // Failures are data, not turn errors: each error names exactly what
+        // went wrong so the model can re-read the file and retry.
+        if count == 0 {
+            return Err(ToolError::Failed {
+                tool: self.name().into(),
+                message: format!(
+                    "not found: `old_string` occurs 0 times in {path} (check the exact text, including whitespace)"
+                ),
+            });
+        }
+        if count > 1 && !replace_all {
+            return Err(ToolError::Failed {
+                tool: self.name().into(),
+                message: format!(
+                    "`old_string` occurs {count} times in {path}; provide more surrounding context to make it unique, or pass `replace_all: true`"
+                ),
+            });
+        }
+
+        let (replaced, replacements) =
+            replace_subsequence(&bytes, old_string.as_bytes(), new_string.as_bytes());
+        debug_assert_eq!(
+            replacements, count,
+            "replacement count must match the match count"
+        );
+        std::fs::write(path, &replaced).map_err(|err| ToolError::Failed {
+            tool: self.name().into(),
+            message: format!("failed to write {path}: {err}"),
+        })?;
+
+        // A short confirmation: the count is how the model verifies it did
+        // what it intended. No file contents, no diff — the tool call in
+        // context already carries `old_string`/`new_string`.
+        Ok(format!("Replaced {count} occurrence(s) in {path}"))
+    }
+}
+
+/// Count non-overlapping occurrences of `needle` in `haystack`.
+fn count_subsequence(haystack: &[u8], needle: &[u8]) -> usize {
+    replace_subsequence(haystack, needle, needle).1
+}
+
+/// Replace every occurrence of `needle` with `replacement`, returning the
+/// new bytes and the number of replacements.
+fn replace_subsequence(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut count = 0;
+    let mut index = 0;
+    while index + needle.len() <= haystack.len() {
+        if &haystack[index..index + needle.len()] == needle {
+            out.extend_from_slice(replacement);
+            index += needle.len();
+            count += 1;
+        } else {
+            out.push(haystack[index]);
+            index += 1;
+        }
+    }
+    out.extend_from_slice(&haystack[index..]);
+    (out, count)
 }
 
 /// How long the reader joins may wait past a missed deadline before
@@ -765,5 +923,220 @@ mod tests {
         let cut = truncate_chars("hello world", 5);
         assert!(cut.starts_with("hello"));
         assert!(cut.contains("truncated"));
+    }
+
+    // ---- edit tool ----
+
+    fn edit(arguments: Value) -> Result<String, ToolError> {
+        EditTool.execute(&arguments)
+    }
+
+    /// Write a scratch file and return its (absolute) path.
+    fn scratch(name: &str, contents: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("clanky-edit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.display().to_string()
+    }
+
+    /// Best-effort cleanup of every scratch directory this test binary's
+    /// processes created (the pid suffix differs per test executable run,
+    /// so the glob reaches stale leftovers too).
+    #[test]
+    fn edit_scratch_dirs_are_cleaned_up() {
+        for entry in std::fs::read_dir(std::env::temp_dir()).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("clanky-edit-test-"))
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    fn read(path: &str) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn edit_replaces_a_unique_occurrence() {
+        let path = scratch("unique.txt", "one\ntwo\nthree\n");
+        let result = edit(json!({
+            "path": path,
+            "old_string": "two",
+            "new_string": "TWO"
+        }))
+        .unwrap();
+        assert_eq!(result, format!("Replaced 1 occurrence(s) in {path}"));
+        assert_eq!(read(&path), "one\nTWO\nthree\n");
+    }
+
+    #[test]
+    fn edit_fails_on_zero_matches() {
+        let path = scratch("nomatch.txt", "one\ntwo\n");
+        let err = edit(json!({
+            "path": path,
+            "old_string": "nope",
+            "new_string": "x"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed { message, .. } if message.contains("occurs 0 times"))
+        );
+        assert_eq!(read(&path), "one\ntwo\n");
+    }
+
+    #[test]
+    fn edit_fails_on_multiple_matches_without_replace_all() {
+        let path = scratch("multi.txt", "a b a\n");
+        let err = edit(json!({
+            "path": path,
+            "old_string": "a",
+            "new_string": "x"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed { message, .. } if message.contains("occurs 2 times") && message.contains("surrounding context"))
+        );
+        assert_eq!(read(&path), "a b a\n");
+    }
+
+    #[test]
+    fn edit_replace_all_replaces_every_occurrence() {
+        let path = scratch("all.txt", "a b a\n");
+        let result = edit(json!({
+            "path": path,
+            "old_string": "a",
+            "new_string": "x",
+            "replace_all": true
+        }))
+        .unwrap();
+        assert_eq!(result, format!("Replaced 2 occurrence(s) in {path}"));
+        assert_eq!(read(&path), "x b x\n");
+    }
+
+    #[test]
+    fn edit_matches_are_literal_not_patterns() {
+        // `.` is not a wildcard: `a.c` matches only the literal `a.c`,
+        // never `abc`. One match succeeds and replaces exactly that text.
+        let path = scratch("literal.txt", "a.c abc\n");
+        edit(json!({
+            "path": path,
+            "old_string": "a.c",
+            "new_string": "x"
+        }))
+        .unwrap();
+        assert_eq!(read(&path), "x abc\n");
+
+        // And a regex-only needle that would match `abc` matches nothing.
+        let path = scratch("literal2.txt", "abc\n");
+        let err = edit(json!({
+            "path": path,
+            "old_string": "a.c",
+            "new_string": "x"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed { message, .. } if message.contains("occurs 0 times"))
+        );
+        assert_eq!(read(&path), "abc\n");
+    }
+
+    #[test]
+    fn edit_preserves_invalid_utf8_beside_the_edit() {
+        let dir = std::env::temp_dir().join(format!("clanky-edit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("binary.bin");
+        std::fs::write(&path, b"before \xff after").unwrap();
+        let path = path.display().to_string();
+        edit(json!({
+            "path": path,
+            "old_string": "before",
+            "new_string": "after"
+        }))
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"after \xff after");
+    }
+
+    #[test]
+    fn edit_reports_missing_file() {
+        let dir = std::env::temp_dir().join(format!("clanky-edit-test-{}", std::process::id()));
+        let path = dir.join("does-not-exist.txt");
+        let err = edit(json!({
+            "path": path.display().to_string(),
+            "old_string": "a",
+            "new_string": "b"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed { message, .. } if message.contains("failed to read"))
+        );
+    }
+
+    #[test]
+    fn edit_validates_its_arguments() {
+        let path = scratch("args.txt", "x\n");
+        let err = edit(json!({"path": path, "old_string": "x"})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArguments { message, .. } if message.contains("`new_string`"))
+        );
+        let err = edit(json!({"path": path, "old_string": 5, "new_string": "y"})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArguments { message, .. } if message.contains("`old_string`"))
+        );
+        let err = edit(json!({"old_string": "x", "new_string": "y"})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArguments { message, .. } if message.contains("`path`"))
+        );
+        let err = edit(json!({"path": path, "old_string": "", "new_string": "y"})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArguments { message, .. } if message.contains("`old_string` must not be empty"))
+        );
+        let err = edit(json!({
+            "path": path,
+            "old_string": "x",
+            "new_string": "y",
+            "replace_all": "yes"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArguments { message, .. } if message.contains("`replace_all`"))
+        );
+    }
+
+    #[test]
+    fn edit_counts_multiline_and_adjacent_matches() {
+        // Multi-line needle, matched byte-for-byte including the newline.
+        let path = scratch("multiline.txt", "start\nmiddle\nend\nstart\nmiddle\nend\n");
+        let result = edit(json!({
+            "path": path,
+            "old_string": "start\nmiddle\nend",
+            "new_string": "block"
+        }));
+        // Two identical blocks: fails without `replace_all`.
+        assert!(result.is_err());
+        let result = edit(json!({
+            "path": path,
+            "old_string": "start\nmiddle\nend",
+            "new_string": "block",
+            "replace_all": true
+        }))
+        .unwrap();
+        assert_eq!(result, format!("Replaced 2 occurrence(s) in {path}"));
+        assert_eq!(read(&path), "block\nblock\n");
+
+        // Adjacent occurrences are found: "xx" in "xxxx" is 2 replacements.
+        let path = scratch("adjacent.txt", "xxxx\n");
+        let result = edit(json!({
+            "path": path,
+            "old_string": "xx",
+            "new_string": "y",
+            "replace_all": true
+        }))
+        .unwrap();
+        assert_eq!(result, format!("Replaced 2 occurrence(s) in {path}"));
+        assert_eq!(read(&path), "yy\n");
     }
 }

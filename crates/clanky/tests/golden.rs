@@ -422,6 +422,113 @@ fn sampling_and_thinking_are_plumbed_through_every_round() {
     }
 }
 
+/// The edit tool in the agentic loop (M19): a scripted model edits a real
+/// scratch file through one round, then reads it back and answers. The
+/// golden pins the `edit` tool definition as offered on the wire and the
+/// exact fed-back result text ("Replaced N occurrence(s) in <path>") in
+/// the second round's messages — any change to either breaks the golden.
+///
+/// Regenerate with: `CLANKY_UPDATE_GOLDEN=1 cargo test --test golden`
+#[test]
+fn edit_tool_transcript_matches_golden() {
+    // A deterministic scratch file, like the bash golden's `echo 42`.
+    // The path is relative to the test's working directory (the crate
+    // root) so the golden stays machine-independent; `target/tmp` is
+    // workspace scratch and never committed.
+    let path = "target/tmp/edit-golden/hello.txt".to_string();
+    std::fs::create_dir_all(
+        std::path::Path::new(&path)
+            .parent()
+            .expect("scratch parent"),
+    )
+    .unwrap();
+    std::fs::write(&path, "Hello, world!\n").unwrap();
+    let arguments = json!({
+        "path": path,
+        "old_string": "world",
+        "new_string": "clanky"
+    })
+    .to_string();
+
+    let script = vec![
+        // Round 1: the model edits the file.
+        ScriptedTurn {
+            chunks: tool_call_chunks("call_1", "edit", &arguments),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                prompt_tokens: Some(20),
+                completion_tokens: Some(8),
+                cached_tokens: None,
+            }),
+        },
+        // Round 2: it reads the file back with bash and answers.
+        ScriptedTurn {
+            chunks: [tool_call_chunks(
+                "call_2",
+                "bash",
+                &json!({"command": format!("cat {path}")}).to_string(),
+            )]
+            .concat(),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                prompt_tokens: Some(45),
+                completion_tokens: Some(8),
+                cached_tokens: None,
+            }),
+        },
+        text_turn("The file now says: Hello, clanky!"),
+    ];
+    let (provider, requests) = ScriptedProvider::new(script);
+    let mut messages = vec![ChatMessage::user(
+        "change \"world\" to \"clanky\" in hello.txt",
+    )];
+    let output = run_turn(
+        Box::new(provider),
+        &clanky::tools::default_tools(None),
+        &mut messages,
+        &config(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(output.text, "The file now says: Hello, clanky!");
+
+    // The edit actually happened on disk.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Hello, clanky!\n");
+
+    // The edit tool definition offered on the wire is pinned (name,
+    // description, schema) so a schema change cannot pass unnoticed.
+    let transcript = requests.borrow();
+    let tools = transcript[0].get("tools").unwrap().as_array().unwrap();
+    let edit_tool = tools
+        .iter()
+        .find(|t| t.get("name").and_then(Value::as_str) == Some("edit"))
+        .expect("edit tool offered to the model");
+    let expected_wire = json!({
+        "name": "edit",
+        "description": clanky::tools::EditTool.description().to_string(),
+        "parameters": clanky::tools::EditTool.parameters(),
+    });
+    assert_eq!(*edit_tool, expected_wire);
+
+    // The fed-back tool result must be exactly the confirmation text.
+    let round2 = transcript[1].get("messages").unwrap().as_array().unwrap();
+    let tool_message = round2
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        .expect("edit result message in round 2");
+    assert_eq!(
+        tool_message.get("content").and_then(Value::as_str),
+        Some(format!("Replaced 1 occurrence(s) in {path}").as_str())
+    );
+
+    let transcript = json!({
+        "requests": *transcript,
+        "file": std::fs::read_to_string(&path).unwrap(),
+    });
+    compare_or_update("edit-tool", &transcript);
+    std::fs::remove_file(&path).ok();
+}
+
 /// A `-p` run and a TUI run over the same transcript must leave the same
 /// session records (M14): print mode feeds its turn events through the same
 /// shared recorder the TUI uses, records the prompt the same way, and closes

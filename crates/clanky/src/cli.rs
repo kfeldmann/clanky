@@ -53,8 +53,8 @@ pub struct Cli {
     pub max_retries: Option<u32>,
 
     /// Default tool-call timeout in seconds, applied to any tool call (e.g.
-    /// `bash`) that does not pass its own `timeout_seconds`. Unset means
-    /// unbounded. Overrides settings.
+    /// `bash`; the `edit` tool ignores it) that does not pass its own
+    /// `timeout_seconds`. Unset means unbounded. Overrides settings.
     #[arg(long, value_name = "SECONDS")]
     pub timeout_seconds: Option<u64>,
 

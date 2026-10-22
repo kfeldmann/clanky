@@ -37,6 +37,36 @@
             ],
             "type": "object"
           }
+        },
+        {
+          "description": "Replace a literal substring in a file (byte-for-byte, no patterns). Fails on zero matches; fails on multiple matches unless `replace_all` is set.",
+          "name": "edit",
+          "parameters": {
+            "properties": {
+              "new_string": {
+                "description": "The replacement text",
+                "type": "string"
+              },
+              "old_string": {
+                "description": "The exact text to replace (must match the file byte-for-byte)",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file to edit (relative paths resolve against the working directory)",
+                "type": "string"
+              },
+              "replace_all": {
+                "description": "Replace every occurrence instead of failing on multiple matches (default: false)",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "path",
+              "old_string",
+              "new_string"
+            ],
+            "type": "object"
+          }
         }
       ]
     },
@@ -92,6 +122,36 @@
             },
             "required": [
               "command"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "description": "Replace a literal substring in a file (byte-for-byte, no patterns). Fails on zero matches; fails on multiple matches unless `replace_all` is set.",
+          "name": "edit",
+          "parameters": {
+            "properties": {
+              "new_string": {
+                "description": "The replacement text",
+                "type": "string"
+              },
+              "old_string": {
+                "description": "The exact text to replace (must match the file byte-for-byte)",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file to edit (relative paths resolve against the working directory)",
+                "type": "string"
+              },
+              "replace_all": {
+                "description": "Replace every occurrence instead of failing on multiple matches (default: false)",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "path",
+              "old_string",
+              "new_string"
             ],
             "type": "object"
           }

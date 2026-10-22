@@ -58,7 +58,7 @@ All fields are optional; unknown keys are rejected with a parse error.
 | `prompt`   | string           | Prompt text (mainly useful on the CLI, not in a file) |
 | `session`  | boolean          | `false` disables session recording in every mode (default: on) |
 | `project`  | string           | Label shown at the left of the TUI input prompt (TUI only) |
-| `timeout_seconds` | integer  | Default tool-call timeout in seconds (`bash` calls without their own `timeout_seconds` run unbounded when unset) |
+| `timeout_seconds` | integer  | Default tool-call timeout in seconds (`bash` calls without their own `timeout_seconds` run unbounded when unset; `edit` ignores it) |
 
 Example:
 
@@ -102,13 +102,13 @@ Notes:
   with `--max-retries`.
 - `timeout_seconds` sets the **default tool timeout**, applied to any tool
   call that does not pass its own `timeout_seconds` (today that is only
-  `bash`). Unset — the default — means unbounded, exactly as before; a
-  per-call `timeout_seconds` on the call always wins over the configured
-  default, in both directions. Set it on the CLI with `--timeout-seconds`,
-  or live in the TUI with `/timeout <seconds|off>` (`off` clears back to
-  unbounded). An expired killable call (e.g. `bash`) is real cancellation:
-  the whole command tree is TERM/KILLed and the model sees the timeout
-  error.
+  `bash` — the `edit` tool ignores it; see below). Unset — the default —
+  means unbounded, exactly as before; a per-call `timeout_seconds` on the
+  call always wins over the configured default, in both directions. Set it
+  on the CLI with `--timeout-seconds`, or live in the TUI with
+  `/timeout <seconds|off>` (`off` clears back to unbounded). An expired
+  killable call (e.g. `bash`) is real cancellation: the whole command tree
+  is TERM/KILLed and the model sees the timeout error.
 - Precedence is per field: CLI flag > project file > user file, and a
   scope only overrides fields it actually sets. For `[sampling]` the merge
   is per key: keys set in a higher layer win, and keys set only in a lower
@@ -129,6 +129,28 @@ the call. Without any deadline the group is never killed and the command
 runs until it exits on its own (terminal ctrl+c propagates through
 Clanky's own turn cancellation as before). Output sent to the model is
 capped at 20 000 characters (then `… (output truncated)`).
+
+### The `edit` tool
+
+The `edit` tool replaces a literal substring in a file. The model passes
+`path`, `old_string`, `new_string`, and optionally `replace_all: true`.
+Matching is byte-for-byte literal — no patterns, no wildcards — so the text
+in the tool call is exactly the text in the file (there is no read-before-edit
+requirement; the model reads files through `bash`).
+
+- Zero matches fails with `not found` (naming the file); the model re-reads
+  the file and retries.
+- Multiple matches fail without `replace_all`, naming the match count and
+  asking for more surrounding context — with `replace_all: true` every
+  occurrence is replaced.
+- On success the result is a short confirmation, `Replaced N occurrence(s)
+  in <path>` — no file contents, no diff: the tool call in the conversation
+  already carries both strings.
+
+Failures are data: they are fed back to the model as normal tool results
+(rendered red in the TUI, like a non-zero bash exit) so it can recover, not
+turn errors. There is no permission boundary — `bash` already writes
+anywhere; the tool's value is intent and actionable failure messages.
 
 ### Session precedence note
 
@@ -460,11 +482,12 @@ therefore affects text from that point on:
 ### `/timeout` — the default tool timeout
 
 `/timeout` shows the current default tool timeout (as a transcript info
-line), `/timeout N` sets it to `N` seconds, and `/timeout off` clears it back to unbounded.
-The default applies to any tool call that passes no `timeout_seconds` of
-its own; a per-call value always wins. Same effect as the
-`timeout_seconds` setting or `--timeout-seconds`; the TUI edit changes
-the live session (and is not written back to any settings file).
+line), `/timeout N` sets it to `N` seconds, and `/timeout off` clears it
+back to unbounded. The default applies to any tool call that passes no
+`timeout_seconds` of its own (`bash`; the `edit` tool ignores it); a
+per-call value always wins. Same effect as the `timeout_seconds` setting
+or `--timeout-seconds`; the TUI edit changes the live session (and is not
+written back to any settings file).
 
 ### `/md` — export the session as Markdown
 

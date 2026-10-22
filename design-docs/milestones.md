@@ -777,7 +777,8 @@ As built notes:
   only `bash` exists today and it is killable, so the enforcement is plain
   TERM/KILL cancellation, unchanged from M2. `edit`-class tools (M19) will
   opt out by simply never consulting the default deadline (plain buffered IO
-  has no recoverable hang to abandon).
+  has no recoverable hang to abandon). (M19 did exactly this — see its
+  as-built notes; `edit` never reads a timeout.)
 - `/timeout <seconds|off>` parses `off`/positive-integers/`show` (no arg) and
   rejects 0 and non-numeric values; the TUI palette gained a `/timeout ` entry.
   The live edit happens on `Launch.timeout_seconds` — a struct field like its
@@ -800,7 +801,7 @@ As built notes:
   after the first free word is swallowed by the prompt) — noted in the CLI
   test.
 
-## ☑ M18 — Settings observability: startup dump + settings records in the log
+## ✔ M18 — Settings observability: startup dump + settings records in the log
 The merged configuration is currently observable only by reading the status line
 (provider · model) and guessing at the rest. Two coupled pieces:
 
@@ -890,7 +891,7 @@ As built notes:
   fixture gained the leading settings record (regenerated).
 
 
-## ☐ M19 — Edit tool
+## ✔ M19 — Edit tool
 A built-in `edit` tool beside `bash` behind the `Tool` trait; unrestricted paths
 (no trust system — bash already writes anywhere; the value of the tool is intent
 and failure messages for the model, not a permission boundary).
@@ -921,6 +922,42 @@ and failure messages for the model, not a permission boundary).
 Done when: `clanky -p "change the title in README.md to X"` performs a Read +
 Edit + write cycle and succeeds; a dissertation on uniqueness/non-match read
 back as tool results, golden transcripts updated.
+
+  As built: `EditTool` is a unit struct in `crates/clanky/src/tools.rs`,
+  added to `default_tools` beside `bash`. Matching counts and replaces run
+  on raw bytes (a small non-overlapping subsequence scan, no regex crate):
+  byte-for-byte literal as specified, and a file with invalid UTF-8 beside
+  the edited region is editable — the edit is not blocked by encoding
+  issues elsewhere in the file (a `sed`/rewriting approach would have been;
+  the file is rewritten only with the replaced bytes, everything else
+  untouched). Empty `old_string` is rejected with an argument error (an
+  empty needle would match "everywhere"); the schema carries no
+  `minimum`-style guard for it, the check is in `execute` so the message is
+  the tool's own actionable one. Zero matches → "not found: `old_string`
+  occurs 0 times in <path> (check the exact text, including whitespace)";
+  multiple matches without `replace_all` → "`old_string` occurs N times in
+  <path>; provide more surrounding context to make it unique, or pass
+  `replace_all: true`"; success → "Replaced N occurrence(s) in <path>" (N
+  counted the same way for `replace_all`, so the count is verifiable).
+  All failures are `ToolError::Failed` — they rise through the existing
+  `ERROR:` prefixing / `is_failed_result` red-rendering path unchanged, no
+  new display code. The default deadline does not apply (the M17 design's
+  opt-out): the tool never consults a timeout — plain buffered IO that
+  finishes in milliseconds or fails has no recoverable hang to abandon, and
+  an abandonment timeout on a non-idempotent in-process tool would lie
+  (invite a retry while the abandoned work may complete → double-apply).
+  No read-before-edit requirement (per the milestone). Tests: unit tests
+  for all argument-validation and match-count paths (unique replace,
+  zero/multiple matches, `replace_all`, literal-not-regex matching,
+  invalid-UTF-8 preservation, missing file, multiline and adjacent
+  occurrences) in `tools.rs`, plus a new golden transcript
+  (`tests/golden/edit-tool.json`, test `edit_tool_transcript_matches_golden`)
+  that pins the wire tool definition and the exact fed-back confirmation
+  over an edit + bash-read-back turn; the existing tool goldens were
+  regenerated because the default tool set now includes `edit` (its
+  definition appears in every transcript). README: new "The `edit` tool"
+  section and the `timeout_seconds` bullet now notes the default applies
+  only to `bash` ('killable' tools).
 
 ## ☐ M20 — View-image (vision) tool
 A built-in `view-image` tool that puts an image file into the model's context,
