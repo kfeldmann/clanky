@@ -141,12 +141,22 @@ Client → plugin:
 
 Field rules:
 - `messages[].role` is `system` | `user` | `assistant` | `tool`.
-- `content` is a plain string (no multimodal parts in v1; extension point for
-  later versions).
+- `content` is a plain string (the primary field; the multimodal extension
+  point for later versions is the additive `images` list below).
 - Assistant messages may carry `toolCalls` with **parsed** `arguments` (an
   object, not a JSON string — avoids double-encoding bugs in plugin authors'
   adapters).
 - Tool results are `role: "tool"` messages with `toolCallId` + `content`.
+  A tool result may additionally carry `images` — an optional, additive
+  list of `{"dataBase64": …, "mediaType": "jpeg|png|gif|webp|heic|heif|avif"}`
+  parts the tool put into the model's context (`view-image`'s attachment,
+  M20); absent when there are none, so a plugin that ignores the field
+  still serves text-only sessions correctly. The plugin is responsible for
+  building its backend's multimodal shape: OpenAI-compatible endpoints get
+  `image_url` data-URI parts (`data:<media>;base64,<data>`) appended after
+  the text part; Anthropic gets `image` source blocks inside the
+  `tool_result` block (its `content` may be an array mixing text + image
+  blocks).
 - `tools` uses JSON Schema for `parameters` (OpenAI-compatible; maps directly
   to DeepInfra/function calling).
 - `sampling` is an **open map, passed through verbatim**: its keys are the
@@ -267,6 +277,10 @@ Plugin → client:
     the backend's parameter names (e.g. `top_p`, `max_tokens`). Breaking for
     v1 peers (renamed keys, changed semantics), so the handshake rejects
     them loudly instead of silently dropping parameters.
+  - **v2, additive** — `ChatMessage` tool results may carry `images`
+    (M20: inline image parts on a `tool` message, absent when there are
+    none; see §5 field rules). No version bump: additive and optional, and
+    the three provider plugins in the repo were updated in the same change.
 
 ## 10. M1 loopback transport
 

@@ -121,10 +121,24 @@ pub fn render(
                     wrote_anything = true;
                 }
             }
-            Record::ToolResult { name, output } => {
+            Record::ToolResult {
+                name,
+                output,
+                images,
+            } => {
                 if options.tools {
                     out.push_str(&format!("### Tool result: `{name}`\n\n"));
                     out.push_str(&fence(output, ""));
+                    // Image attachments are noted, never exported: the
+                    // base64 payload would dwarf the document and the
+                    // markdown file is for reading.
+                    for image in images.iter().flatten() {
+                        out.push_str(&format!(
+                            "_attached image: {} ({} bytes decoded)_\n\n",
+                            image.media_type.as_str(),
+                            image.data_base64.len() * 3 / 4
+                        ));
+                    }
                     out.push('\n');
                     wrote_anything = true;
                 }
@@ -292,6 +306,7 @@ mod tests {
             Record::ToolResult {
                 name: "bash".into(),
                 output: "42".into(),
+                images: None,
             },
             Record::Assistant {
                 text: "42 files.".into(),

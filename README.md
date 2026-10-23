@@ -152,6 +152,32 @@ Failures are data: they are fed back to the model as normal tool results
 turn errors. There is no permission boundary — `bash` already writes
 anywhere; the tool's value is intent and actionable failure messages.
 
+### The `view-image` tool
+
+The `view-image` tool puts an image file into the model's context, for
+multimodal models. The model passes `path`; the tool reads the file,
+base64-encodes it, and returns a result whose text is a size note
+(`623 bytes`, `256 kb`, `1.2 mb`) and whose image list carries the data
+beside the text. The TUI never displays the image — the transcript shows
+the size note like any tool result; the image is image → model only (the
+model never generates images).
+
+- The media type is resolved from the file's magic bytes when the format
+  carries one (JPEG, PNG, GIF, WEBP) and from the filename extension
+  otherwise (HEIC/HEIF/AVIF and any misnamed file); an unrecognizable
+  file with no known image extension fails with a data error the model
+  can recover from.
+- A model that cannot accept images 400s, and the backend's own error is
+  surfaced unchanged — there is no local capability whitelist.
+- On the wire, a tool result's images ride with the result: OpenAI-
+  compatible providers (DeepInfra, LiteLLM) get `image_url` data-URI
+  parts after the text, Anthropic gets `image` source blocks inside the
+  `tool_result` block.
+- Session files record the image in full base64 so a replay reconstructs
+  exactly what the model saw (a screenshot is ~300–400 KB encoded —
+  expect large JSONL lines). `/md` exports an `_attached image_` note
+  instead of the payload.
+
 ### Session precedence note
 
 Sessions always live in the **project scope** (`./.clanky/sessions/`);

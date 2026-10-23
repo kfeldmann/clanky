@@ -959,7 +959,7 @@ back as tool results, golden transcripts updated.
   section and the `timeout_seconds` bullet now notes the default applies
   only to `bash` ('killable' tools).
 
-## ☐ M20 — View-image (vision) tool
+## ☑ M20 — View-image (vision) tool
 A built-in `view-image` tool that puts an image file into the model's context,
 for multimodal models. Scope: **image → model only.** The TUI never displays the
 image (tool-result entry shows size like any result); the model never generates
@@ -1012,3 +1012,33 @@ Done when: `clanky -p "what's in /work/sample.jpg"` against a vision model
 returns a description; the session replays and the model answers about the
 image again; a text-only model surfaces the backend error unchanged. The user
 will handle the live testing.
+
+  As built (live testing against a vision model still pending — the user
+  runs it): the protocol change is additive in v2, no version bump —
+  `ChatMessage::Tool` gains an optional `images`
+  (`Vec<ImagePart { dataBase64, mediaType }>`), **absent when there are
+  none**, so every existing message, session record, and golden stays
+  byte-identical. `mediaType` is a closed enum (png/jpeg/gif/webp/heic/
+  heif/avif, IANA `image/…` strings), not a free string. The Anthropic
+  decision stands as the milestone drafted it: images ride **inside the
+  `tool_result` block** (its `content` is an array mixing text + image
+  blocks); OpenAI-compatible backends get `image_url` data-URI parts after
+  the text. Media-type resolution is sniff-first (JPEG/PNG/GIF/WEBP magic
+  bytes; the container formats HEIC/HEIF/AVIF share ISO-BMFF boxes with
+  video formats so a byte sniff deliberately declines them), extension
+  fallback (case-insensitive, `.jpeg` aliased), sniff wins over a wrong
+  extension; unrecognizable + unknown-extension files fail with a data
+  error ("unknown image media type"). The `Tool` trait's `execute` returns
+  `ToolOutput { text, images }` (a `From<String>` keeps plain tools
+  unchanged); the turn loop attaches non-empty image lists via
+  `ChatMessage::tool_with_images`; `TurnEvent::ToolResult` carries them to
+  the recorder (full base64 in the `toolResult` record — replayable) and
+  the transcript (size note only, never displayed); `/md` exports an
+  `_attached image_` note instead of the payload. Size note is SI:
+  `623 bytes` / `256 kb` / `1.2 mb`. Design notes and wire shapes:
+  `design-docs/view-image-plan.md`. Tests: protocol round-trip + legacy
+  parse, per-provider wire shapes (image-less results keep plain-string
+  content), tool unit tests, golden transcript
+  `tests/golden/view-image-tool.json`, and an integration test that an
+  image-carrying turn survives save/reload with the image re-attached
+  (`tests/sessions.rs`).

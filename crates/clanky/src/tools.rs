@@ -8,7 +8,10 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde_json::{Value, json};
+
+use clanky_protocol::MediaType;
 use wait_timeout::ChildExt as _;
 
 /// Why a tool execution failed. Failures are data, not crashes: they are fed
@@ -19,6 +22,31 @@ pub enum ToolError {
     InvalidArguments { tool: String, message: String },
     #[error("tool `{tool}` failed: {message}")]
     Failed { tool: String, message: String },
+}
+
+/// What a tool execution produced: the text result fed back to the model
+/// as the `tool` message's content, plus any inline images that ride
+/// beside it (a `view-image` attachment; empty for every other tool).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<clanky_protocol::ImagePart>,
+}
+
+impl ToolOutput {
+    /// A plain text result (no images) — what most tools return.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
 }
 
 /// A tool the agent can call.
@@ -33,7 +61,7 @@ pub trait Tool {
     fn parameters(&self) -> Value;
 
     /// Execute the tool with parsed arguments.
-    fn execute(&self, arguments: &Value) -> Result<String, ToolError>;
+    fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError>;
 
     /// The wire-format tool definition offered to the model.
     fn wire(&self) -> clanky_protocol::Tool {
@@ -48,9 +76,11 @@ pub trait Tool {
 /// Tools available to the agentic loop.
 pub type ToolSet = Vec<Box<dyn Tool>>;
 
-/// The default tool set: `bash`. `timeout_seconds` is the configured
-/// default tool-call deadline (huge default when unset, see below); a
-/// per-call `timeout_seconds` argument always wins over it.
+/// The default tool set: `bash`, `edit`, and `view-image`.
+/// `timeout_seconds` is the configured default tool-call deadline (huge
+/// default when unset, see below); a per-call `timeout_seconds` argument
+/// always wins over it (it applies to `bash` only — the other tools are
+/// plain buffered IO that never hangs).
 pub fn default_tools(timeout_seconds: Option<u64>) -> ToolSet {
     vec![
         Box::new(BashTool::new(
@@ -58,6 +88,7 @@ pub fn default_tools(timeout_seconds: Option<u64>) -> ToolSet {
             20_000,
         )),
         Box::new(EditTool),
+        Box::new(ViewImageTool),
     ]
 }
 
@@ -125,7 +156,7 @@ impl Tool for BashTool {
         })
     }
 
-    fn execute(&self, arguments: &Value) -> Result<String, ToolError> {
+    fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
         let Some(command) = arguments.get("command").and_then(Value::as_str) else {
             return Err(ToolError::InvalidArguments {
                 tool: self.name().into(),
@@ -157,7 +188,7 @@ impl Tool for BashTool {
 }
 
 impl BashTool {
-    fn run_with_timeout(&self, command: &str, timeout: Duration) -> Result<String, ToolError> {
+    fn run_with_timeout(&self, command: &str, timeout: Duration) -> Result<ToolOutput, ToolError> {
         let mut shell = Command::new("bash");
         shell
             .arg("-c")
@@ -239,7 +270,7 @@ impl BashTool {
             message,
         })?;
 
-        Ok(self.format(status, &stdout, &stderr))
+        Ok(ToolOutput::text(self.format(status, &stdout, &stderr)))
     }
 
     /// Combine stdout, stderr, and the exit status into the tool result.
@@ -326,7 +357,7 @@ impl Tool for EditTool {
         })
     }
 
-    fn execute(&self, arguments: &Value) -> Result<String, ToolError> {
+    fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
         // Argument extraction: every field the schema requires must be a
         // string, and each missing/mistyped field gets its own message so
         // the model can fix just that field.
@@ -400,8 +431,106 @@ impl Tool for EditTool {
         // A short confirmation: the count is how the model verifies it did
         // what it intended. No file contents, no diff — the tool call in
         // context already carries `old_string`/`new_string`.
-        Ok(format!("Replaced {count} occurrence(s) in {path}"))
+        Ok(ToolOutput::text(format!(
+            "Replaced {count} occurrence(s) in {path}"
+        )))
     }
+}
+
+/// The built-in `view-image` tool: read an image file from disk and put
+/// it into the model's context, for multimodal models (M20).
+///
+/// The tool result's *text* is a small size note; the image itself rides
+/// beside the text in the result's images list, which the turn loop
+/// places on the `tool` message and the provider adapters translate into
+/// their backend's multimodal shape. A text-only model 400s when the
+/// image reaches it — the backend's error is surfaced unchanged (project
+/// invariant: no local capability whitelist).
+pub struct ViewImageTool;
+
+impl Default for ViewImageTool {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl Tool for ViewImageTool {
+    fn name(&self) -> &str {
+        "view-image"
+    }
+
+    fn description(&self) -> &str {
+        "Read an image file from disk and attach it so you can see it."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The image file to view (relative paths resolve against the working directory)"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
+        let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+            return Err(ToolError::InvalidArguments {
+                tool: self.name().into(),
+                message: "expected a string field `path`".into(),
+            });
+        };
+        let bytes = std::fs::read(path).map_err(|err| ToolError::Failed {
+            tool: self.name().into(),
+            message: format!("failed to read {path}: {err}"),
+        })?;
+        let media_type = media_type_for(path, &bytes).map_err(|message| ToolError::Failed {
+            tool: self.name().into(),
+            message,
+        })?;
+        let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(ToolOutput {
+            text: size_note(bytes.len()),
+            images: vec![clanky_protocol::ImagePart {
+                data_base64,
+                media_type,
+            }],
+        })
+    }
+}
+
+/// Human-readable size note, in SI units: `623 bytes` under a kilobyte,
+/// `256 kb` below a megabyte, `1.2 mb` above. Matches the milestone's
+/// `256 kb` example.
+fn size_note(bytes: usize) -> String {
+    if bytes < 1000 {
+        format!("{bytes} bytes")
+    } else if bytes < 1_000_000 {
+        format!("{} kb", bytes / 1000)
+    } else {
+        format!("{:.1} mb", bytes as f64 / 1_000_000.0)
+    }
+}
+
+/// Resolve an image's media type: the file's magic bytes when the format
+/// carries one (JPEG, PNG, GIF, WEBP — the formats in practice), the
+/// filename extension otherwise (the container formats: HEIC/HEIF/AVIF
+/// and any misnamed file). An unknown extension is the error the model
+/// can recover from.
+fn media_type_for(path: &str, bytes: &[u8]) -> std::result::Result<MediaType, String> {
+    if let Some(detected) = MediaType::sniff(bytes) {
+        return Ok(detected);
+    }
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    MediaType::canonical_lookup(extension).ok_or_else(|| {
+        "unknown image media type: the file has no recognizable image signature and its extension is not a known image format".to_string()
+    })
 }
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
@@ -641,6 +770,7 @@ mod tests {
         BashTool::default()
             .execute(&json!({"command": command}))
             .unwrap()
+            .text
     }
 
     fn run_err(command: &str) -> ToolError {
@@ -741,7 +871,7 @@ mod tests {
         let out = tool
             .execute(&json!({"command": "sleep 2; echo done", "timeout_seconds": 10}))
             .unwrap();
-        assert_eq!(out, "done");
+        assert_eq!(out.text, "done");
         let err = tool
             .execute(&json!({"command": "sleep 30", "timeout_seconds": 1}))
             .unwrap_err();
@@ -756,7 +886,7 @@ mod tests {
         let ok = tool
             .execute(&json!({"command": "true", "timeout_seconds": 5}))
             .unwrap();
-        assert_eq!(ok, "(no output)");
+        assert_eq!(ok.text, "(no output)");
 
         let err = tool
             .execute(&json!({"command": "sleep 30", "timeout_seconds": 1}))
@@ -777,7 +907,7 @@ mod tests {
             let out = tool
                 .execute(&json!({"command": "true", "timeout_seconds": ok}))
                 .unwrap();
-            assert_eq!(out, "(no output)");
+            assert_eq!(out.text, "(no output)");
         }
         for bad in [json!("ten"), json!(-5), json!(1.5)] {
             let err = tool
@@ -853,7 +983,8 @@ mod tests {
         let tool = BashTool::new(Duration::from_secs(30), 10);
         let output = tool
             .execute(&json!({"command": "printf '%s' $(seq 1 500 | tr '\\n' ' ')"}))
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(output.chars().count() < 40);
         assert!(output.ends_with("… (output truncated)"));
     }
@@ -928,7 +1059,7 @@ mod tests {
     // ---- edit tool ----
 
     fn edit(arguments: Value) -> Result<String, ToolError> {
-        EditTool.execute(&arguments)
+        EditTool.execute(&arguments).map(|out| out.text)
     }
 
     /// Write a scratch file and return its (absolute) path.
@@ -1138,5 +1269,118 @@ mod tests {
         .unwrap();
         assert_eq!(result, format!("Replaced 2 occurrence(s) in {path}"));
         assert_eq!(read(&path), "yy\n");
+    }
+
+    // ---- view-image tool ----
+
+    fn view(arguments: Value) -> Result<ToolOutput, ToolError> {
+        ViewImageTool.execute(&arguments)
+    }
+
+    /// Write a scratch image file (bytes verbatim) and return its path.
+    fn image(name: &str, contents: &[u8]) -> String {
+        let dir = std::env::temp_dir().join(format!("clanky-view-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.display().to_string()
+    }
+
+    #[test]
+    fn view_image_attaches_sniffed_media_type() {
+        // A real PNG signature (sniffed, regardless of the extension).
+        let png = b"\x89PNG\r\n\x1a\nfakepngdata";
+        let path = image("shot.png", png);
+        let out = view(json!({"path": path})).unwrap();
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].media_type, MediaType::Png);
+        assert_eq!(
+            out.images[0].data_base64,
+            base64::engine::general_purpose::STANDARD.encode(png)
+        );
+        assert_eq!(out.text, format!("{} bytes", png.len()));
+    }
+
+    #[test]
+    fn view_image_resolves_extension_when_the_signature_is_unknown() {
+        // HEIC shares the ISO-BMFF box structure with video formats, so
+        // the byte sniff deliberately declines; the extension answers.
+        let path = image("photo.heic", b"\x00\x00\x00\x18ftypheic");
+        let out = view(json!({"path": path})).unwrap();
+        assert_eq!(out.images[0].media_type, MediaType::Heic);
+    }
+
+    #[test]
+    fn view_image_extension_is_case_insensitive_and_jpeg_aliases() {
+        let path = image("PHOTO.JPG", b"\xFF\xD8\xFF\xE0");
+        let out = view(json!({"path": path})).unwrap();
+        assert_eq!(out.images[0].media_type, MediaType::Jpeg);
+        // Sniffing wins over a wrong extension: a jpeg named .png is a jpeg.
+        let path = image("misnamed.png", b"\xFF\xD8\xFF\xE0");
+        let out = view(json!({"path": path})).unwrap();
+        assert_eq!(out.images[0].media_type, MediaType::Jpeg);
+    }
+
+    #[test]
+    fn view_image_rejects_unknown_types() {
+        let path = image("notes.txt", b"just text");
+        let err = view(json!({"path": path})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed { ref message, .. } if message.contains("unknown image media type")),
+            "{err}"
+        );
+        // A missing extension on an unrecognizable file is the same error.
+        let dir = std::env::temp_dir().join(format!("clanky-view-test-{}", std::process::id()));
+        let path = dir.join("noext");
+        std::fs::write(&path, b"data").unwrap();
+        let err = view(json!({"path": path.display().to_string()})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed { ref message, .. } if message.contains("unknown image media type")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn view_image_reports_missing_file() {
+        let dir = std::env::temp_dir().join(format!("clanky-view-test-{}", std::process::id()));
+        let path = dir.join("does-not-exist.png");
+        let err = view(json!({"path": path.display().to_string()})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed { ref message, .. } if message.contains("failed to read")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn view_image_validates_its_arguments() {
+        let err = view(json!({})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArguments { message, .. } if message.contains("`path`"))
+        );
+        let err = view(json!({"path": 42})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArguments { message, .. } if message.contains("`path`"))
+        );
+    }
+
+    #[test]
+    fn view_image_tool_metadata_matches_protocol_shape() {
+        let tool = ViewImageTool;
+        assert_eq!(tool.name(), "view-image");
+        assert_eq!(
+            tool.description(),
+            "Read an image file from disk and attach it so you can see it."
+        );
+        let wire = tool.wire();
+        assert_eq!(wire.name, "view-image");
+        assert_eq!(wire.parameters.unwrap()["required"][0], "path");
+    }
+
+    #[test]
+    fn size_note_uses_si_units() {
+        assert_eq!(size_note(623), "623 bytes");
+        assert_eq!(size_note(999), "999 bytes");
+        assert_eq!(size_note(256_000), "256 kb");
+        assert_eq!(size_note(1_234_567), "1.2 mb");
     }
 }

@@ -2161,6 +2161,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "y".repeat(300),
+            images: Vec::new(),
         });
         let (est_p, est_c) = app.estimated_tokens();
         assert_eq!((est_p, est_c), (96, 96));
@@ -3008,6 +3009,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "3 files".into(),
+            images: Vec::new(),
         });
         app.on_turn_event(TurnEvent::Text {
             delta: "There are 3".into(),

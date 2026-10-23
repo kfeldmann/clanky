@@ -1,4 +1,4 @@
-//! Clanky provider plugin protocol, version 1.
+//! Clanky provider plugin protocol, version 2.
 //!
 //! This crate defines the message shapes exchanged between Clanky and
 //! provider plugins (see `design-docs/provider-protocol.md`), a [`Transport`] trait that
@@ -31,8 +31,8 @@ pub mod transport;
 pub use client::ProviderClient;
 pub use handler::{CancelFlag, ChatDone, ChatRequest, Handler, PluginInfo};
 pub use messages::{
-    Capabilities, ChatMessage, ChunkPayload, Error, ErrorCode, FinishReason, Message, ModelInfo,
-    PROTOCOL_VERSION, Sampling, Thinking, Tool, ToolCall, Usage, parse_message,
+    Capabilities, ChatMessage, ChunkPayload, Error, ErrorCode, FinishReason, ImagePart, MediaType,
+    Message, ModelInfo, PROTOCOL_VERSION, Sampling, Thinking, Tool, ToolCall, Usage, parse_message,
 };
 pub use process::{CANCEL_TIMEOUT, CancelHandle, ProcessOptions, ProcessTransport};
 pub use serve::{serve, serve_stdio};

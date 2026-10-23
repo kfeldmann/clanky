@@ -1477,6 +1477,7 @@ mod tests {
                 "result" => app.on_turn_event(TurnEvent::ToolResult {
                     name: ev.name.clone(),
                     output: ev.text.clone(),
+                    images: Vec::new(),
                 }),
                 "done" => {
                     app.on_turn_done(&Ok(TurnOutput {
@@ -1522,6 +1523,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "file1\nfile2".into(),
+            images: Vec::new(),
         });
         frame(&mut app, &mut s, &mut stream);
         for n in 1..=6 {
@@ -1579,6 +1581,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "hi".into(),
+            images: Vec::new(),
         });
         app.on_turn_event(TurnEvent::Thinking {
             delta: "second thought\n".into(),
@@ -1625,7 +1628,7 @@ mod tests {
             TurnEvent::Thinking { delta: "Considering the request... thinking line one\n".into() },
             TurnEvent::Text { delta: "Let me check that. ".into() },
             TurnEvent::ToolCall { name: "bash".into(), arguments: "{\"command\":\"echo hi\"}".into() },
-            TurnEvent::ToolResult { name: "bash".into(), output: "hi".into() },
+            TurnEvent::ToolResult { name: "bash".into(), output: "hi".into(), images: Vec::new() },
             TurnEvent::Thinking { delta: "second thought\n".into() },
             TurnEvent::Text { delta: "Tool done. Final answer with a fairly long line to force wrapping of the display row.\nSecond paragraph.".into() },
         ] {
@@ -1687,6 +1690,7 @@ mod tests {
             TurnEvent::ToolResult {
                 name: "bash".into(),
                 output: "threedee".into(),
+                images: Vec::new(),
             },
             TurnEvent::Text {
                 delta: "All finished with the requested task.".into(),
@@ -2124,6 +2128,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "aaa\nbbb".into(),
+            images: Vec::new(),
         });
         let mut s = Screen::new(Buf::default(), 40, 12);
         s.render(&mut app, &status(), None, None, None).unwrap();

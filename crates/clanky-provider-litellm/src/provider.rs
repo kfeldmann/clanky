@@ -290,7 +290,20 @@ fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
             ChatMessage::Tool {
                 tool_call_id,
                 content,
-            } => Ok(json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })),
+                images,
+            } => {
+                // A tool result's inline images become `image_url`
+                // data-URI parts appended after the text part (the
+                // OpenAI-compatible array `content` form; see the
+                // DeepInfra provider's `openai_content_parts` — the
+                // same shape, built here for the proxy's surface).
+                let parts = openai_content_parts(content, images.as_deref());
+                Ok(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": parts,
+                }))
+            }
             ChatMessage::Assistant {
                 content,
                 tool_calls,
@@ -334,6 +347,30 @@ fn role_name(message: &ChatMessage) -> &'static str {
         ChatMessage::Assistant { .. } => "assistant",
         ChatMessage::Tool { .. } => "tool",
     }
+}
+
+/// Build an OpenAI-style `content` value for a message that may carry
+/// images: a plain string when there are none, an array of `text` +
+/// `image_url` parts otherwise (`data:` URIs carrying media type and
+/// base64 payload inline). Same shape as the DeepInfra provider's —
+/// the proxy presents the OpenAI-compatible surface.
+fn openai_content_parts(text: &str, images: Option<&[clanky_protocol::ImagePart]>) -> Value {
+    let Some(images) = images.filter(|imgs| !imgs.is_empty()) else {
+        return json!(text);
+    };
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    for image in images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.media_type.as_str(), image.data_base64),
+            },
+        }));
+    }
+    Value::Array(parts)
 }
 
 fn openai_tools(tools: &[Tool]) -> Value {
@@ -1139,6 +1176,55 @@ mod tests {
         );
         assert_eq!(body["messages"][2]["role"], "tool");
         assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+        assert_eq!(
+            body["messages"][2]["content"], "a\nb",
+            "no images: a plain string"
+        );
+    }
+
+    #[test]
+    fn tool_result_images_become_image_url_data_uri_parts() {
+        let mut provider = provider(
+            CATALOG,
+            MODEL_INFO,
+            vec![r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#.into()],
+        );
+        let req = ChatRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![
+                ChatMessage::user("show me the screenshot"),
+                ChatMessage::Assistant {
+                    content: String::new(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "view-image".into(),
+                        arguments: json!({"path": "/work/sample.jpg"}),
+                    }]),
+                },
+                ChatMessage::tool_with_images(
+                    "call_1",
+                    "256 kb",
+                    vec![clanky_protocol::ImagePart {
+                        data_base64: "aGVsbG8=".into(),
+                        media_type: clanky_protocol::MediaType::Jpeg,
+                    }],
+                ),
+            ],
+            tools: None,
+            sampling: None,
+            thinking: None,
+        };
+        run_chat(&mut provider, &req).1.unwrap();
+        let body = provider.backend.last_body();
+        let content = &body["messages"][2]["content"];
+        assert!(content.is_array(), "{content}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "256 kb");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/jpeg;base64,aGVsbG8="
+        );
     }
 
     #[test]

@@ -143,8 +143,19 @@ pub enum Record {
     /// an error or quit carries whatever had streamed when it was cut,
     /// with no tool calls.
     Assistant { text: String, calls: Vec<ToolCall> },
-    /// A tool result fed back to the model.
-    ToolResult { name: String, output: String },
+    /// A tool result fed back to the model. `images` carries the inline
+    /// images the result put into the model's context (`view-image`'s
+    /// attachment), in full base64 — a screenshot is ~300–400 KB encoded,
+    /// so the JSONL line is large, but the file format rests on "replay
+    /// reconstructs exactly what the model saw" and truncating the data
+    /// would break that. Absent when the result carries none (every
+    /// result before this field existed, and most results always).
+    ToolResult {
+        name: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<clanky_protocol::ImagePart>>,
+    },
     /// Token usage of one completed chat round. Every chat round is its
     /// own billed request (its `prompt_tokens` restates that request's
     /// whole prompt, and a turn re-sends the conversation every round),
@@ -587,9 +598,18 @@ pub fn history_from_records(records: &[Record]) -> Vec<ChatMessage> {
                     tool_calls: (!calls.is_empty()).then(|| calls.clone()),
                 });
             }
-            Record::ToolResult { output, .. } => {
+            Record::ToolResult { output, images, .. } => {
                 if let Some(id) = awaiting.pop_front() {
-                    messages.push(ChatMessage::tool(id, output));
+                    let message = if images.as_ref().is_some_and(|imgs| !imgs.is_empty()) {
+                        ChatMessage::tool_with_images(
+                            id,
+                            output.clone(),
+                            images.clone().expect("checked above"),
+                        )
+                    } else {
+                        ChatMessage::tool(id, output.clone())
+                    };
+                    messages.push(message);
                 }
             }
         }
@@ -656,6 +676,7 @@ mod tests {
             Record::ToolResult {
                 name: "bash".into(),
                 output: "42".into(),
+                images: None,
             },
             Record::Assistant {
                 text: "42 files.".into(),

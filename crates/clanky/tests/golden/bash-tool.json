@@ -67,6 +67,22 @@
             ],
             "type": "object"
           }
+        },
+        {
+          "description": "Read an image file from disk and attach it so you can see it.",
+          "name": "view-image",
+          "parameters": {
+            "properties": {
+              "path": {
+                "description": "The image file to view (relative paths resolve against the working directory)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          }
         }
       ]
     },
@@ -152,6 +168,22 @@
               "path",
               "old_string",
               "new_string"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "description": "Read an image file from disk and attach it so you can see it.",
+          "name": "view-image",
+          "parameters": {
+            "properties": {
+              "path": {
+                "description": "The image file to view (relative paths resolve against the working directory)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
             ],
             "type": "object"
           }

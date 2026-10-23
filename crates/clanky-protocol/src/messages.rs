@@ -7,6 +7,95 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Image media types a tool result (or image part) may carry. The wire
+/// spelling matches the IANA `image/` prefix, so `as_str()` composes
+/// directly into data URIs and Anthropic source blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaType {
+    Png,
+    Jpeg,
+    Gif,
+    WebP,
+    Heic,
+    Heif,
+    Avif,
+}
+
+impl MediaType {
+    /// The IANA media type string (`image/png`, `image/webp`, …).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::WebP => "image/webp",
+            Self::Heic => "image/heic",
+            Self::Heif => "image/heif",
+            Self::Avif => "image/avif",
+        }
+    }
+
+    /// The common filename extension (`.jpg`'s canonical `jpeg`).
+    pub fn canonical_extension(&self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::Gif => "gif",
+            Self::WebP => "webp",
+            Self::Heic => "heic",
+            Self::Heif => "heif",
+            Self::Avif => "avif",
+        }
+    }
+
+    /// The canonical lowercase extension spelling for lookup (`.jpeg`
+    /// canonicalizes to `jpg` so the lookup table has one key per type).
+    pub fn canonical_lookup(extension: &str) -> Option<Self> {
+        let known: &[(&str, Self)] = &[
+            ("png", Self::Png),
+            ("jpg", Self::Jpeg),
+            ("jpeg", Self::Jpeg),
+            ("gif", Self::Gif),
+            ("webp", Self::WebP),
+            ("heic", Self::Heic),
+            ("heif", Self::Heif),
+            ("avif", Self::Avif),
+        ];
+        let lower = extension.to_ascii_lowercase();
+        known.iter().find(|(ext, _)| *ext == lower).map(|(_, t)| *t)
+    }
+
+    /// Identify an image's media type from its magic bytes. Covers the
+    /// formats with a self-describing signature (JPEG, PNG, GIF, WEBP);
+    /// the container formats (HEIC/HEIF/AVIF) share the ISO-BMFF box
+    /// structure with unrelated video types, so a byte sniff cannot name
+    /// them reliably — callers fall back to the filename extension.
+    pub fn sniff(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            Some(Self::Jpeg)
+        } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+            Some(Self::Png)
+        } else if bytes.starts_with(b"GIF8") {
+            Some(Self::Gif)
+        } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            Some(Self::WebP)
+        } else {
+            None
+        }
+    }
+}
+
+/// One inline image carried on a message: base64 data and its media type.
+/// OpenAI-compatible backends get it as an `image_url` data-URI part,
+/// Anthropic as an `image` source block (both from these two fields).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImagePart {
+    pub data_base64: String,
+    pub media_type: MediaType,
+}
+
 /// The protocol version this crate implements (see §9 of the spec).
 /// v2 replaced the closed `Sampling` struct with an open, verbatim
 /// pass-through map — breaking for v1 peers, so the handshake rejects
@@ -144,7 +233,9 @@ pub struct ModelInfo {
     pub cache_read_price_per_mtok: Option<f64>,
 }
 
-/// One conversation message. `content` is always a plain string in v1.
+/// One conversation message. `content` is the text (always a plain
+/// string); a `tool` message may additionally carry inline images the
+/// backend request builds into multimodal parts (additive in v2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "role",
@@ -167,6 +258,11 @@ pub enum ChatMessage {
     Tool {
         tool_call_id: String,
         content: String,
+        /// Inline images the tool result carries in addition to its text
+        /// (e.g. `view-image`'s attachment). Absent when there are none,
+        /// which is every result before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<ImagePart>>,
     },
 }
 
@@ -194,6 +290,29 @@ impl ChatMessage {
         Self::Tool {
             tool_call_id: tool_call_id.into(),
             content: content.into(),
+            images: None,
+        }
+    }
+
+    /// A tool result with inline images (text plus the attachment).
+    pub fn tool_with_images(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        images: Vec<ImagePart>,
+    ) -> Self {
+        Self::Tool {
+            tool_call_id: tool_call_id.into(),
+            content: content.into(),
+            images: Some(images),
+        }
+    }
+
+    /// The result's inline images, if any (`tool` messages only; every
+    /// other role has none).
+    pub fn images(&self) -> Option<&[ImagePart]> {
+        match self {
+            Self::Tool { images, .. } => images.as_deref(),
+            _ => None,
         }
     }
 
@@ -618,5 +737,83 @@ mod tests {
         let msg: ChatMessage =
             serde_json::from_str(r#"{"role": "assistant", "toolCalls": []}"#).unwrap();
         assert_eq!(msg.content(), "");
+    }
+
+    #[test]
+    fn tool_message_omits_empty_images_and_accepts_them() {
+        // `ChatMessage::tool` (no images): the field is absent on the wire,
+        // so pre-vision peers and records stay byte-identical.
+        let plain = ChatMessage::tool("call_1", "42");
+        let json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(
+            json,
+            json!({"role": "tool", "toolCallId": "call_1", "content": "42"}),
+            "absent images are not serialized"
+        );
+
+        // A result with images round-trips, and the legacy shape (no
+        // `images` field) parses back as `None`.
+        let with_image = ChatMessage::tool_with_images(
+            "call_2",
+            "256 kb",
+            vec![ImagePart {
+                data_base64: "aGVsbG8=".into(),
+                media_type: MediaType::Png,
+            }],
+        );
+        let json = serde_json::to_value(&with_image).unwrap();
+        assert_eq!(json["images"][0]["mediaType"], "png");
+        assert_eq!(json["images"][0]["dataBase64"], "aGVsbG8=");
+        let parsed: ChatMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, with_image);
+
+        let legacy: ChatMessage =
+            serde_json::from_str(r#"{"role": "tool", "toolCallId": "call_1", "content": "42"}"#)
+                .unwrap();
+        assert_eq!(legacy.images(), None);
+    }
+
+    #[test]
+    fn media_type_sniff_and_extension_lookup_agree() {
+        assert_eq!(
+            MediaType::sniff(b"\xFF\xD8\xFF\xE0rest"),
+            Some(MediaType::Jpeg)
+        );
+        assert_eq!(
+            MediaType::sniff(b"\x89PNG\r\n\x1a\nrest"),
+            Some(MediaType::Png)
+        );
+        assert_eq!(MediaType::sniff(b"GIF89a..."), Some(MediaType::Gif));
+        assert_eq!(
+            MediaType::sniff(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some(MediaType::WebP)
+        );
+        // A truncated RIFF header is not a WEBP.
+        assert_eq!(MediaType::sniff(b"RIFF\x00\x00"), None);
+        // Nothing recognized: None (caller falls back to the extension).
+        assert_eq!(MediaType::sniff(b"\x00\x00\x00\x18ftypheic"), None);
+        assert_eq!(MediaType::sniff(b"plain text"), None);
+
+        // Extension lookup: canonical spellings and the `.jpeg` alias.
+        for (ext, expected) in [
+            ("png", MediaType::Png),
+            ("jpg", MediaType::Jpeg),
+            ("jpeg", MediaType::Jpeg),
+            ("gif", MediaType::Gif),
+            ("webp", MediaType::WebP),
+            ("heic", MediaType::Heic),
+            ("heif", MediaType::Heif),
+            ("avif", MediaType::Avif),
+        ] {
+            assert_eq!(MediaType::canonical_lookup(ext), Some(expected));
+        }
+        // Case-insensitive: `.PNG` is a png.
+        assert_eq!(MediaType::canonical_lookup("PNG"), Some(MediaType::Png));
+        assert_eq!(MediaType::canonical_lookup("txt"), None);
+        assert_eq!(MediaType::canonical_lookup(""), None);
+
+        // The wire strings compose into data URIs and Anthropic sources.
+        assert_eq!(MediaType::Jpeg.as_str(), "image/jpeg");
+        assert_eq!(MediaType::WebP.as_str(), "image/webp");
     }
 }

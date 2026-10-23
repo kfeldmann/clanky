@@ -8,12 +8,13 @@
 //!
 //! Regenerate goldens with: `CLANKY_UPDATE_GOLDEN=1 cargo test --test golden`
 
+use base64::Engine as _;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use clanky::tools::{Tool, ToolError, ToolSet};
+use clanky::tools::{Tool, ToolError, ToolOutput, ToolSet};
 use clanky::turn::{TurnConfig, run_turn};
 use clanky_protocol::{
     Capabilities, ChatDone, ChatMessage, ChatRequest, ChunkPayload, Error as ProtocolError,
@@ -133,9 +134,9 @@ impl Tool for FakeTool {
         })
     }
 
-    fn execute(&self, arguments: &Value) -> std::result::Result<String, ToolError> {
+    fn execute(&self, arguments: &Value) -> std::result::Result<ToolOutput, ToolError> {
         match arguments.get("input").and_then(Value::as_str) {
-            Some(input) => Ok(format!("fake ran with input={input}")),
+            Some(input) => Ok(ToolOutput::text(format!("fake ran with input={input}"))),
             None => Err(ToolError::InvalidArguments {
                 tool: "fake".into(),
                 message: "missing `input`".into(),
@@ -529,8 +530,106 @@ fn edit_tool_transcript_matches_golden() {
     std::fs::remove_file(&path).ok();
 }
 
-/// A `-p` run and a TUI run over the same transcript must leave the same
-/// session records (M14): print mode feeds its turn events through the same
+#[test]
+fn view_image_transcript_matches_golden() {
+    // A deterministic scratch image (a minimal PNG signature + payload),
+    // like the bash golden's `echo 42`. `target/tmp` is workspace
+    // scratch and never committed; the path is relative to the crate
+    // root so the golden stays machine-independent.
+    let path = "target/tmp/view-image-golden/sample.png".to_string();
+    std::fs::create_dir_all(
+        std::path::Path::new(&path)
+            .parent()
+            .expect("scratch parent"),
+    )
+    .unwrap();
+    let bytes: &[u8] = b"\x89PNG\r\n\x1a\nsample-image-payload";
+    std::fs::write(&path, bytes).unwrap();
+
+    let script = vec![
+        // Round 1: the model asks to view the image.
+        ScriptedTurn {
+            chunks: tool_call_chunks("call_1", "view-image", &json!({"path": path}).to_string()),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                prompt_tokens: Some(20),
+                completion_tokens: Some(8),
+                cached_tokens: None,
+            }),
+        },
+        // Round 2: it answers having "seen" the image.
+        text_turn("It is a sample image."),
+    ];
+    let (provider, requests) = ScriptedProvider::new(script);
+    let mut messages = vec![ChatMessage::user("what's in sample.png?")];
+    let output = run_turn(
+        Box::new(provider),
+        &clanky::tools::default_tools(None),
+        &mut messages,
+        &config(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(output.text, "It is a sample image.");
+
+    // The tool definition offered on the wire is pinned (name,
+    // description, schema).
+    let transcript = requests.borrow();
+    let tools = transcript[0].get("tools").unwrap().as_array().unwrap();
+    let view_tool = tools
+        .iter()
+        .find(|t| t.get("name").and_then(Value::as_str) == Some("view-image"))
+        .expect("view-image tool offered to the model");
+    let expected_wire = json!({
+        "name": "view-image",
+        "description": clanky::tools::ViewImageTool.description().to_string(),
+        "parameters": clanky::tools::ViewImageTool.parameters(),
+    });
+    assert_eq!(*view_tool, expected_wire);
+
+    // The fed-back tool result carries the size note as its text and the
+    // image inline — exactly what the model saw, so a replay of this
+    // transcript re-attaches the same image.
+    let round2 = transcript[1].get("messages").unwrap().as_array().unwrap();
+    let tool_message = round2
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        .expect("view-image result message in round 2");
+    assert_eq!(
+        tool_message.get("content").and_then(Value::as_str),
+        Some("28 bytes")
+    );
+    let images = tool_message
+        .get("images")
+        .expect("images list")
+        .as_array()
+        .unwrap();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0]["mediaType"], "png");
+    assert_eq!(
+        images[0]["dataBase64"],
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    );
+
+    // The in-memory history matches the transcript's fed-back message:
+    // the image parts live on the `tool` message, not on a synthetic
+    // user turn.
+    let history_tool = messages
+        .iter()
+        .find(|m| matches!(m, ChatMessage::Tool { .. }))
+        .expect("tool message in history");
+    assert_eq!(history_tool.content(), "28 bytes");
+    assert_eq!(history_tool.images().unwrap().len(), 1);
+
+    let transcript = json!({
+        "requests": *transcript,
+        "imageBytes": bytes.len(),
+    });
+    compare_or_update("view-image-tool", &transcript);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A `-p` run and a TUI run over the same transcript must leave the same/// session records (M14): print mode feeds its turn events through the same
 /// shared recorder the TUI uses, records the prompt the same way, and closes
 /// the turn with the same `record_done`. This drives both front ends'
 /// recording wirings over one event stream (the tool-loop transcript, so

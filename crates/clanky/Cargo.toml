@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
 clanky-protocol = { path = "../clanky-protocol" }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
@@ -21,3 +22,6 @@ wait-timeout = "0.2"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+base64 = "0.22"

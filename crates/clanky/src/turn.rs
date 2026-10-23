@@ -101,8 +101,16 @@ pub enum TurnEvent {
     },
     /// The model asked to call a tool; `arguments` is compact JSON.
     ToolCall { name: String, arguments: String },
-    /// The tool finished; `output` is the result fed back to the model.
-    ToolResult { name: String, output: String },
+    /// The tool finished; `output` is the result text fed back to the
+    /// model and `images` the inline images the result put into the
+    /// model's context (`view-image`'s attachment; empty otherwise).
+    /// The session record carries the images in full so a replay
+    /// reconstructs exactly what the model saw.
+    ToolResult {
+        name: String,
+        output: String,
+        images: Vec<clanky_protocol::ImagePart>,
+    },
     /// Token usage for one completed chat round. Emitted as soon as the
     /// backend reports it (the final chunk of the round's stream), so the
     /// status line tracks every model response — including the
@@ -289,7 +297,12 @@ pub fn run_turn_with<T: Transport>(
         });
         for call in &calls {
             let output = execute_tool_call(tools, call, on_event);
-            messages.push(ChatMessage::tool(call.id.clone(), output));
+            let message = if output.images.is_empty() {
+                ChatMessage::tool(call.id.clone(), output.text)
+            } else {
+                ChatMessage::tool_with_images(call.id.clone(), output.text, output.images)
+            };
+            messages.push(message);
         }
     }
 }
@@ -373,14 +386,14 @@ fn retry_delay(attempt: u32, hint: Option<Duration>) -> Duration {
     }
 }
 
-/// Execute one parsed tool call and return the content for the `tool`
-/// message. Unknown tools and malformed arguments become error results the
-/// model can react to.
+/// Execute one parsed tool call. Returns the tool's output (text plus
+/// any inline images) for the `tool` message. Unknown tools and
+/// malformed arguments become error results the model can react to.
 fn execute_tool_call(
     tools: &ToolSet,
     call: &ToolCall,
     on_event: &mut dyn FnMut(TurnEvent),
-) -> String {
+) -> crate::tools::ToolOutput {
     on_event(TurnEvent::ToolCall {
         name: call.name.clone(),
         arguments: call.arguments.to_string(),
@@ -404,11 +417,12 @@ fn execute_tool_call(
     };
     let output = match outcome {
         Ok(output) => output,
-        Err(err) => format!("ERROR: {err}"),
+        Err(err) => crate::tools::ToolOutput::text(format!("ERROR: {err}")),
     };
     on_event(TurnEvent::ToolResult {
         name: call.name.clone(),
-        output: output.clone(),
+        output: output.text.clone(),
+        images: output.images.clone(),
     });
     output
 }
@@ -702,9 +716,9 @@ mod tests {
         fn execute(
             &self,
             arguments: &Value,
-        ) -> std::result::Result<String, crate::tools::ToolError> {
+        ) -> std::result::Result<crate::tools::ToolOutput, crate::tools::ToolError> {
             match arguments.get("input").and_then(Value::as_str) {
-                Some(input) => Ok(format!("echoed: {input}")),
+                Some(input) => Ok(crate::tools::ToolOutput::text(format!("echoed: {input}"))),
                 None => Err(crate::tools::ToolError::InvalidArguments {
                     tool: "echo_tool".into(),
                     message: "missing `input`".into(),
@@ -882,6 +896,7 @@ mod tests {
                 TurnEvent::ToolResult {
                     name: "echo_tool".into(),
                     output: "echoed: hello".into(),
+                    images: Vec::new(),
                 },
                 TurnEvent::Text {
                     delta: "done".into()

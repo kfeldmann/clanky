@@ -203,6 +203,11 @@ fn reasoning_effort(thinking: Thinking) -> Option<&'static str> {
 }
 
 /// Serialize protocol chat messages into OpenAI-compatible JSON messages.
+///
+/// A tool result's inline images become `image_url` data-URI parts
+/// appended after the text part: OpenAI-style `content` may be an array
+/// mixing `text` and `image_url` objects, and `role: "tool"` accepts the
+/// same array form (the data URI itself carries `data:<media>;base64,`).
 fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
     messages
         .iter()
@@ -213,7 +218,15 @@ fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
             ChatMessage::Tool {
                 tool_call_id,
                 content,
-            } => Ok(json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })),
+                images,
+            } => {
+                let parts = openai_content_parts(content, images.as_deref());
+                Ok(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": parts,
+                }))
+            }
             ChatMessage::Assistant {
                 content,
                 tool_calls,
@@ -257,6 +270,30 @@ fn role_name(message: &ChatMessage) -> &'static str {
         ChatMessage::Assistant { .. } => "assistant",
         ChatMessage::Tool { .. } => "tool",
     }
+}
+
+/// Build an OpenAI-style `content` value for a message that may carry
+/// images: a plain string when there are none (the common case — short,
+/// and exactly what every pre-vision message sent), an array of `text` +
+/// `image_url` parts otherwise. The images ride as `data:` URIs, which
+/// carry the media type and base64 payload inline.
+fn openai_content_parts(text: &str, images: Option<&[clanky_protocol::ImagePart]>) -> Value {
+    let Some(images) = images.filter(|imgs| !imgs.is_empty()) else {
+        return json!(text);
+    };
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    for image in images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.media_type.as_str(), image.data_base64),
+            },
+        }));
+    }
+    Value::Array(parts)
 }
 
 fn openai_tools(tools: &[Tool]) -> Value {
@@ -1133,5 +1170,54 @@ mod tests {
         let done = done.unwrap();
         assert_eq!(done.finish_reason, FinishReason::Stop);
         assert_eq!(done.usage, None);
+    }
+
+    #[test]
+    fn tool_result_without_images_keeps_plain_string_content() {
+        let mut provider = DeepInfraProvider::new(
+            MockBackend::new(vec![done_chunk("stop")], "[]"),
+            "https://x.invalid",
+        );
+        let mut request = simple_request();
+        request.messages.push(ChatMessage::tool("call_1", "42"));
+        provider.chat(&request, &mut |_| {}).unwrap();
+        let (_, body) = provider.backend.posts.borrow()[0].clone();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        let message = &body["messages"][2];
+        assert_eq!(message["role"], "tool");
+        assert_eq!(message["tool_call_id"], "call_1");
+        assert_eq!(message["content"], "42", "no images: a plain string");
+    }
+
+    #[test]
+    fn tool_result_images_become_image_url_data_uri_parts() {
+        let mut provider = DeepInfraProvider::new(
+            MockBackend::new(vec![done_chunk("stop")], "[]"),
+            "https://x.invalid",
+        );
+        let mut request = simple_request();
+        request.messages.push(ChatMessage::tool_with_images(
+            "call_1",
+            "256 kb",
+            vec![clanky_protocol::ImagePart {
+                data_base64: "aGVsbG8=".into(),
+                media_type: clanky_protocol::MediaType::Png,
+            }],
+        ));
+        provider.chat(&request, &mut |_| {}).unwrap();
+        let (_, body) = provider.backend.posts.borrow()[0].clone();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        let content = &body["messages"][2]["content"];
+        assert!(
+            content.is_array(),
+            "images: content becomes a parts array: {content}"
+        );
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "256 kb");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
     }
 }

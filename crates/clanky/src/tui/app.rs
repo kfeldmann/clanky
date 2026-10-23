@@ -62,6 +62,11 @@ pub enum Entry {
     ToolResult {
         name: String,
         output: String,
+        /// Inline images the result put into the model's context
+        /// (`view-image`'s attachment), kept so `screen_records` and the
+        /// live history stay replayable even with recording off. Never
+        /// displayed: the transcript shows the text (a size note) only.
+        images: Vec<clanky_protocol::ImagePart>,
     },
     Error(String),
     /// A UI-only note (command feedback, etc.); not sent to the model
@@ -284,11 +289,19 @@ impl App {
                 self.entries.push(Entry::ToolCall { name, arguments });
                 self.open = None;
             }
-            TurnEvent::ToolResult { name, output } => {
+            TurnEvent::ToolResult {
+                name,
+                output,
+                images,
+            } => {
                 // The result is fed back to the model, so it counts as
                 // prompt-side content until the next round's report.
                 self.estimate_add(output.chars().count(), true);
-                self.entries.push(Entry::ToolResult { name, output });
+                self.entries.push(Entry::ToolResult {
+                    name,
+                    output,
+                    images,
+                });
                 self.open = None;
             }
             // Round summaries are for the session recorder only; the
@@ -483,11 +496,16 @@ impl App {
                         arguments,
                     });
                 }
-                Entry::ToolResult { name, output } => {
+                Entry::ToolResult {
+                    name,
+                    output,
+                    images,
+                } => {
                     flush_round(&mut records, &mut round);
                     records.push(Record::ToolResult {
                         name: name.clone(),
                         output: output.clone(),
+                        images: (!images.is_empty()).then(|| images.clone()),
                     });
                 }
                 Entry::Error(message) => {
@@ -543,9 +561,14 @@ impl App {
                         });
                     }
                 }
-                Record::ToolResult { name, output } => self.entries.push(Entry::ToolResult {
+                Record::ToolResult {
+                    name,
+                    output,
+                    images,
+                } => self.entries.push(Entry::ToolResult {
                     name: name.clone(),
                     output: output.clone(),
+                    images: images.clone().unwrap_or_default(),
                 }),
                 Record::Error { message } => self.entries.push(Entry::Error(message.clone())),
                 Record::Usage {
@@ -1075,7 +1098,11 @@ impl App {
                 ));
                 lines.push(Line::default());
             }
-            Entry::ToolResult { name, output } => {
+            Entry::ToolResult {
+                name,
+                output,
+                images: _,
+            } => {
                 let failed = crate::tools::is_failed_result(output);
                 let style = if failed {
                     Style::new().fg(Color::Red)
@@ -1227,6 +1254,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "out".into(),
+            images: Vec::new(),
         });
         app.entries.push(Entry::Error("boom".into()));
         app.entries.push(Entry::Info("note".into()));
@@ -1304,6 +1332,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "a".into(),
+            images: Vec::new(),
         });
         app.on_turn_event(TurnEvent::Thinking {
             delta: "reason 2".into(),
@@ -1318,7 +1347,8 @@ mod tests {
                 },
                 Entry::ToolResult {
                     name: "bash".into(),
-                    output: "a".into()
+                    output: "a".into(),
+                    images: Vec::new(),
                 },
                 Entry::ThinkingHidden,
             ],
@@ -1341,6 +1371,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "a\nb".into(),
+            images: Vec::new(),
         });
         app.on_turn_event(TurnEvent::Text {
             delta: "done".into(),
@@ -1355,7 +1386,8 @@ mod tests {
                 },
                 Entry::ToolResult {
                     name: "bash".into(),
-                    output: "a\nb".into()
+                    output: "a\nb".into(),
+                    images: Vec::new(),
                 },
                 Entry::Assistant("done".into()),
             ]
@@ -1515,6 +1547,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "y".repeat(96),
+            images: Vec::new(),
         });
         assert_eq!(app.estimated_tokens(), (64, 0));
 
@@ -1556,6 +1589,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "out\n[exit status: 1]".into(),
+            images: Vec::new(),
         });
         let lines = app.entry_lines(1, 80);
         assert!(
@@ -1571,6 +1605,7 @@ mod tests {
         app.entries.push(Entry::ToolResult {
             name: "bash".into(),
             output: "ok".into(),
+            images: Vec::new(),
         });
         let lines = app.entry_lines(2, 80);
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::DarkGray));
@@ -1582,6 +1617,7 @@ mod tests {
         app.entries.push(Entry::ToolResult {
             name: "nope".into(),
             output: "ERROR: unknown tool: nope".into(),
+            images: Vec::new(),
         });
         let lines = app.entry_lines(3, 80);
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
@@ -1599,6 +1635,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "one\ntwo\nthree".into(),
+            images: Vec::new(),
         });
         let lines = app.entry_lines(0, 80);
         for line in &lines {
@@ -1807,6 +1844,7 @@ mod tests {
         app.on_turn_event(TurnEvent::ToolResult {
             name: "bash".into(),
             output: "file.txt".into(),
+            images: Vec::new(),
         });
         let lines = app.transcript_lines(80);
         let texts: Vec<String> = lines
@@ -1950,6 +1988,7 @@ mod tests {
             Record::ToolResult {
                 name: "bash".into(),
                 output: "a\nb".into(),
+                images: None,
             },
             Record::Assistant {
                 text: "done".into(),

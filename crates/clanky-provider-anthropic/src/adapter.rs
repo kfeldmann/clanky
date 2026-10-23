@@ -74,13 +74,18 @@ pub fn build_request_body(
             ChatMessage::Tool {
                 tool_call_id,
                 content,
+                images,
             } => {
                 // Anthropic wants tool_result in a user message, immediately
                 // after the tool_use. Consecutive tool results are grouped.
+                // The result's inline images ride inside the tool_result
+                // block: its `content` may be an array mixing text + image
+                // blocks (Messages API), so no synthetic user turn is
+                // injected and replay stays identical across providers.
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": tool_call_id,
-                    "content": content,
+                    "content": anthropic_tool_result_content(content, images.as_deref()),
                 });
                 match conversation.last_mut() {
                     Some(last) if last["role"] == "user" && last["content"].is_array() => {
@@ -153,6 +158,34 @@ fn anthropic_tool(tool: &Tool) -> Value {
         "description": tool.description,
         "input_schema": tool.parameters.clone().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
     })
+}
+
+/// The `content` of a `tool_result` block: a plain string when the result
+/// carries no images (the common case), an array of text + image blocks
+/// otherwise. Anthropic's image source blocks take base64 data and the
+/// media type directly (no data-URI indirection).
+fn anthropic_tool_result_content(
+    text: &str,
+    images: Option<&[clanky_protocol::ImagePart]>,
+) -> Value {
+    let Some(images) = images.filter(|imgs| !imgs.is_empty()) else {
+        return json!(text);
+    };
+    let mut blocks = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        blocks.push(json!({ "type": "text", "text": text }));
+    }
+    for image in images {
+        blocks.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type.as_str(),
+                "data": image.data_base64,
+            },
+        }));
+    }
+    Value::Array(blocks)
 }
 
 /// Anthropic response content block (parsed leniently).
@@ -602,6 +635,56 @@ mod tests {
         assert_eq!(msgs[2]["role"], "user");
         assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
         assert_eq!(msgs[2]["content"][0]["content"], "42");
+    }
+
+    #[test]
+    fn tool_result_images_become_image_blocks_inside_the_tool_result() {
+        // The decided shape (M20): the images ride *inside* the
+        // tool_result block — its `content` may be an array mixing text
+        // and image blocks — never as a synthetic follow-up user message.
+        let messages = vec![
+            ChatMessage::user("show me /work/sample.jpg"),
+            ChatMessage::Assistant {
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "toolu_01".into(),
+                    name: "view-image".into(),
+                    arguments: json!({"path": "/work/sample.jpg"}),
+                }]),
+            },
+            ChatMessage::tool_with_images(
+                "toolu_01",
+                "256 kb",
+                vec![clanky_protocol::ImagePart {
+                    data_base64: "aGVsbG8=".into(),
+                    media_type: clanky_protocol::MediaType::Jpeg,
+                }],
+            ),
+        ];
+        let body: Value = serde_json::from_str(
+            &build_request_body(
+                "claude-haiku-4-5-20251001",
+                &messages,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3, "no synthetic user turn is injected");
+        let result = &msgs[2]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "toolu_01");
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "256 kb");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(content[1]["source"]["data"], "aGVsbG8=");
     }
 
     #[test]

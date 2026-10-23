@@ -123,11 +123,14 @@ impl clanky::tools::Tool for EchoTool {
         json!({"type": "object", "properties": {"input": {"type": "string"}}})
     }
 
-    fn execute(&self, arguments: &Value) -> Result<String, clanky::tools::ToolError> {
-        Ok(format!(
+    fn execute(
+        &self,
+        arguments: &Value,
+    ) -> Result<clanky::tools::ToolOutput, clanky::tools::ToolError> {
+        Ok(clanky::tools::ToolOutput::text(format!(
             "echoed: {}",
             arguments["input"].as_str().unwrap_or("")
-        ))
+        )))
     }
 }
 
@@ -183,9 +186,14 @@ impl Recorder {
                 }
                 return;
             }
-            TurnEvent::ToolResult { name, output } => Record::ToolResult {
+            TurnEvent::ToolResult {
+                name,
+                output,
+                images,
+            } => Record::ToolResult {
                 name: name.clone(),
                 output: output.clone(),
+                images: (!images.is_empty()).then(|| images.clone()),
             },
             _ => return,
         };
@@ -363,6 +371,127 @@ fn r_user_text(record: &Record) -> Option<&str> {
     }
 }
 
+/// An image-carrying turn (M20): a `view-image` result with its inline
+/// image is recorded in full base64, survives save/reload, and the
+/// rebuilt history re-attaches the same image — replay reconstructs
+/// exactly what the model saw.
+#[test]
+fn image_results_replay_after_a_restart() {
+    let dir = temp_dir("image-replay");
+    let path = dir.join("session.jsonl");
+    let mut recorder = Recorder::new(path.clone());
+
+    // A real scratch image (a PNG signature + payload) the tool can read.
+    let image_dir =
+        std::env::temp_dir().join(format!("clanky-image-replay-{}", std::process::id()));
+    std::fs::create_dir_all(&image_dir).unwrap();
+    let image_path = image_dir.join("sample.png");
+    std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nsample-payload").unwrap();
+    let image_path = image_path.display().to_string();
+
+    let image = clanky_protocol::ImagePart {
+        data_base64: "iVBORw0KGgpzYW1wbGUtcGF5bG9hZA==".into(),
+        media_type: clanky_protocol::MediaType::Png,
+    };
+
+    // --- first turn: view-image, then the answer ---
+    let provider_requests = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let provider = ScriptedProvider {
+        requests: std::rc::Rc::clone(&provider_requests),
+        script: RefCell::new(VecDeque::from(vec![
+            ScriptedRound {
+                chunks: [
+                    vec![ChunkPayload::Text {
+                        text: "Looking.".into(),
+                    }],
+                    tool_call_chunks(
+                        "call_1",
+                        "view-image",
+                        &json!({"path": image_path}).to_string(),
+                    ),
+                ]
+                .concat(),
+                finish_reason: FinishReason::ToolCalls,
+            },
+            text_round("It shows a sample."),
+        ])),
+    };
+    let tools: clanky::tools::ToolSet = vec![Box::new(clanky::tools::ViewImageTool)];
+    let mut messages = vec![ChatMessage::user("what's in sample.png?")];
+    recorder
+        .writer
+        .append(&Record::User {
+            text: "what's in sample.png?".into(),
+        })
+        .unwrap();
+    let output = run_turn(
+        Box::new(provider),
+        &tools,
+        &mut messages,
+        &config(),
+        &mut |event| recorder.on_turn_event(&event),
+    )
+    .unwrap();
+    recorder.on_done(&Ok(output));
+
+    // --- kill the session: drop everything, reload from disk ---
+    drop(recorder);
+    let data = session::load(&path).unwrap();
+    let rebuilt = session::history_from_records(&data.records);
+
+    // The rebuilt tool message carries the same inline image.
+    let tool_message = rebuilt
+        .iter()
+        .find(|m| matches!(m, ChatMessage::Tool { .. }))
+        .expect("tool message in rebuilt history");
+    assert_eq!(tool_message.content(), "22 bytes");
+    assert_eq!(
+        tool_message.images().unwrap()[0].data_base64,
+        image.data_base64
+    );
+    assert_eq!(
+        tool_message.images().unwrap()[0].media_type,
+        image.media_type
+    );
+
+    // The live turn's history matches the rebuilt one (this test seeds
+    // no system message; a real resume re-assembles it fresh).
+    assert_eq!(rebuilt, messages);
+
+    // --- continue the conversation on a fresh process ---
+    let provider2_requests = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let provider2 = ScriptedProvider {
+        requests: std::rc::Rc::clone(&provider2_requests),
+        script: RefCell::new(VecDeque::from(vec![text_round("Still a sample.")])),
+    };
+    let mut resumed = vec![ChatMessage::system("Be terse.")];
+    resumed.extend(rebuilt);
+    resumed.push(ChatMessage::user("and again?"));
+    let _ = run_turn(
+        Box::new(provider2),
+        &tools,
+        &mut resumed,
+        &config(),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    // The provider saw the image again, exactly as before the restart.
+    let sent = &provider2_requests.borrow()[0].messages;
+    let sent_tool = sent
+        .iter()
+        .find(|m| matches!(m, ChatMessage::Tool { .. }))
+        .expect("tool message in the resumed request");
+    assert_eq!(sent_tool.images().unwrap().len(), 1);
+    assert_eq!(
+        sent_tool.images().unwrap()[0].data_base64,
+        image.data_base64
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::remove_dir_all(&image_dir).ok();
+}
+
 /// `/md` acceptance: the document exported from a session file is the
 /// same conversation a resume would rebuild, and the flags gate exactly
 /// the record types they name.
@@ -400,6 +529,7 @@ fn markdown_export_covers_the_session_and_honors_its_flags() {
         Record::ToolResult {
             name: "bash".into(),
             output: "42".into(),
+            images: None,
         },
         Record::Assistant {
             text: "42 files.".into(),

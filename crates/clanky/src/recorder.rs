@@ -395,12 +395,17 @@ pub fn record_turn_event(recorder: &mut Recorder, errors: &mut dyn ErrorSink, ev
                 );
             }
         }
-        TurnEvent::ToolResult { name, output } => {
+        TurnEvent::ToolResult {
+            name,
+            output,
+            images,
+        } => {
             recorder.record(
                 errors,
                 session::Record::ToolResult {
                     name: name.clone(),
                     output: output.clone(),
+                    images: (!images.is_empty()).then(|| images.clone()),
                 },
             );
         }
@@ -708,6 +713,7 @@ mod tests {
             TurnEvent::ToolResult {
                 name: "bash".into(),
                 output: "ok".into(),
+                images: Vec::new(),
             },
         ] {
             record_turn_event(state, errors, &event);

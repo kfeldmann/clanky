@@ -1,0 +1,201 @@
+{
+  "imageBytes": 28,
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "what's in sample.png?",
+          "role": "user"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "Run a bash shell command in the project directory and return its stdout and stderr.",
+          "name": "bash",
+          "parameters": {
+            "properties": {
+              "command": {
+                "description": "The bash command to run",
+                "type": "string"
+              },
+              "timeout_seconds": {
+                "description": "Optional per-call timeout override in seconds (wins over the configured default; without it the configured default applies, unbounded when none is set)",
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "description": "Replace a literal substring in a file (byte-for-byte, no patterns). Fails on zero matches; fails on multiple matches unless `replace_all` is set.",
+          "name": "edit",
+          "parameters": {
+            "properties": {
+              "new_string": {
+                "description": "The replacement text",
+                "type": "string"
+              },
+              "old_string": {
+                "description": "The exact text to replace (must match the file byte-for-byte)",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file to edit (relative paths resolve against the working directory)",
+                "type": "string"
+              },
+              "replace_all": {
+                "description": "Replace every occurrence instead of failing on multiple matches (default: false)",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "path",
+              "old_string",
+              "new_string"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "description": "Read an image file from disk and attach it so you can see it.",
+          "name": "view-image",
+          "parameters": {
+            "properties": {
+              "path": {
+                "description": "The image file to view (relative paths resolve against the working directory)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "content": "what's in sample.png?",
+          "role": "user"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "toolCalls": [
+            {
+              "arguments": {
+                "path": "target/tmp/view-image-golden/sample.png"
+              },
+              "id": "call_1",
+              "name": "view-image"
+            }
+          ]
+        },
+        {
+          "content": "28 bytes",
+          "images": [
+            {
+              "dataBase64": "iVBORw0KGgpzYW1wbGUtaW1hZ2UtcGF5bG9hZA==",
+              "mediaType": "png"
+            }
+          ],
+          "role": "tool",
+          "toolCallId": "call_1"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "Run a bash shell command in the project directory and return its stdout and stderr.",
+          "name": "bash",
+          "parameters": {
+            "properties": {
+              "command": {
+                "description": "The bash command to run",
+                "type": "string"
+              },
+              "timeout_seconds": {
+                "description": "Optional per-call timeout override in seconds (wins over the configured default; without it the configured default applies, unbounded when none is set)",
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "description": "Replace a literal substring in a file (byte-for-byte, no patterns). Fails on zero matches; fails on multiple matches unless `replace_all` is set.",
+          "name": "edit",
+          "parameters": {
+            "properties": {
+              "new_string": {
+                "description": "The replacement text",
+                "type": "string"
+              },
+              "old_string": {
+                "description": "The exact text to replace (must match the file byte-for-byte)",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file to edit (relative paths resolve against the working directory)",
+                "type": "string"
+              },
+              "replace_all": {
+                "description": "Replace every occurrence instead of failing on multiple matches (default: false)",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "path",
+              "old_string",
+              "new_string"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "description": "Read an image file from disk and attach it so you can see it.",
+          "name": "view-image",
+          "parameters": {
+            "properties": {
+              "path": {
+                "description": "The image file to view (relative paths resolve against the working directory)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

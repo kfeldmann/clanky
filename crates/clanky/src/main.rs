@@ -354,7 +354,7 @@ impl PrintSink {
                 writeln!(err, "● {name} {preview}").ok();
                 writeln!(err).ok();
             }
-            TurnEvent::ToolResult { name, output } => {
+            TurnEvent::ToolResult { name, output, .. } => {
                 self.close_blocks(out, err);
                 if self.quiet {
                     return;
@@ -593,6 +593,7 @@ mod tests {
                 TurnEvent::ToolResult {
                     name: "bash".into(),
                     output: "ok".into(),
+                    images: Vec::new(),
                 },
                 TurnEvent::Text {
                     delta: "done".into(),
@@ -660,6 +661,7 @@ mod tests {
             &[TurnEvent::ToolResult {
                 name: "bash".into(),
                 output: "aaa\nbbb".into(),
+                images: Vec::new(),
             }],
         );
         assert_eq!(err, "  └─ bash: aaa\n           bbb\n\n");
@@ -676,6 +678,7 @@ mod tests {
             &[TurnEvent::ToolResult {
                 name: "bash".into(),
                 output,
+                images: Vec::new(),
             }],
         );
         assert!(err.contains("(+12 more lines)"), "{err:?}");
@@ -697,6 +700,7 @@ mod tests {
                 TurnEvent::ToolResult {
                     name: "bash".into(),
                     output: "noise".into(),
+                    images: Vec::new(),
                 },
                 TurnEvent::Text {
                     delta: "answer".into(),
