@@ -3,6 +3,21 @@
 
 An AI coding agent/harness for the terminal, written in Rust.
 
+## Features
+
+- Small, simple, efficient. Low resource consumption
+- Terminal interface (TUI) or pure command line (perfect for scripting)
+- Open source with no spyware
+- Isolation/safety comes from containeraization, not from built-in rules
+- Three provider plugins included. You can write additional provider plugins easily in any language
+- Parallel subagents
+- Multimodal input (send images and text as input - output is always text)
+- Full control over sampling parameters
+- Export sessions as Markdown
+- Resume previous sessions; can name session files for easy identification
+
+To get started, read the [QUICKSTART.md](QUICKSTART.md).
+
 ## Configuration & context
 
 Clanky reads configuration and context from two scopes. The **user scope**

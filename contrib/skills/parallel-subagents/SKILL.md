@@ -1,6 +1,6 @@
 ---
 name: parallel-subagents
-description: Run multiple clanky subagents in parallel via the clanky-subagents binary and the bash tool. Use when a task decomposes into several independent agent-sized subtasks — e.g. investigate several files or areas at once, review and test in parallel, or gather answers from multiple independent questions.
+description: Run multiple clanky subagents in parallel via the clanky-subagents binary and the bash tool. Use when a task decomposes into several independent agent-sized subtasks — e.g. investigate several files or areas at once, review and test in parallel, or gather answers from multiple independent questions (90 lines, 618 words).
 ---
 
 # Parallel subagents
