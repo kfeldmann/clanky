@@ -27,7 +27,21 @@ Architectural decisions already made:
   tools beside it; it does not replace it.
 - Settings: TOML. Sessions: JSONL.
 
-## ️✔ M0 — Skeleton
+## Open Questions
+1. ✔ **Provider plugin protocol details:** exact message shapes, streaming
+   granularity, cancellation semantics, how `list-models` interacts with
+   `/model` picker. Mostly settled during M1 design.
+   ANSWER: See ./provider-protocol.md
+2. ✔ **Plugin startup policy:** eager at launch (catches broken plugins early) vs
+   lazy on first use (faster startup). Recommend lazy with error surfacing.
+   ANSWER: lazy
+3. ✔ **Discovery details:** how aggressively to auto-discover sibling binaries
+   (`clanky-provider-*` naming convention?) vs requiring settings entries.
+   ANSWER: naming convension (refined in M8 planning to PATH-only lookup, no
+   sibling scan and no settings entries — see `provider-plugins-plan.md`)
+4. ☐ **MCP scope when it arrives:** tools first; prompts/resources later if wanted.
+
+## ✔ M0 — Skeleton
 - Cargo workspace, CI (fmt, clippy, test)
 - CLI arg parsing (`clap`): `-p`, `--provider`, `--model`, `--thinking`, `--sampling`, prompt args
 - Settings file loading (TOML via `serde`): `~/.clanky/settings.toml`, `./.clanky/settings.toml` with layering
@@ -138,8 +152,8 @@ Architectural decisions already made:
 - Plugin declarations may name an MCP server instead of a provider
 - Done when: a third-party MCP server's tools work in a session.
 
-## ☐ M10 — Polish & release
-- Error messages, logging, docs, packaging (crates.io / release binaries)
+## ✔ M10 — Polish & release
+- DONE - Error messages, logging, docs, packaging (crates.io / release binaries)
 - DONE - Example provider plugin in the repo (hello-world, Python) — already added
   in M8 (`examples/hello-world-provider/`), so M10 only needs to link it
 - DONE - **LiteLLM provider plugin** (`clanky-provider-litellm`, `crates/
@@ -231,7 +245,7 @@ Architectural decisions already made:
   column"), so the whole layout is computed one column narrower and the
   reserved column stays blank. Everything else (native scrolling, printed
   history, popups) is unchanged.
-- Done when: a stranger can `cargo install` and use it.
+- DONE - Done when: a stranger can `cargo install` and use it.
 
 ## ✔ M11 — Anthropic provider plugin (OAuth)
 New provider plugin `crates/clanky-provider-anthropic` (Anthropic Messages
@@ -593,7 +607,7 @@ As built notes:
   is gone. The TUI's `load_session` took the path/name instead of a
   `SessionInfo` (that type stays for the `/resume` picker).
 
-## ☑ M15 — TUI markdown tables: box borders, fitted widths, wrapped cells
+## ✔ M15 — TUI markdown tables: box borders, fitted widths, wrapped cells
 The M3 table renderer draws tables as plain `|`-and-`-` markdown source rows
 at natural width, so the generic word-wrapper reflows them afterwards — in a
 narrow terminal a wide table becomes an unreadable tangle of border fragments
@@ -650,7 +664,7 @@ As built notes:
   as the record of the port. Golden fixtures contain no tables; the
   golden suite passes unchanged.
 
-## ☑ M16 — TUI input: multi-line caret movement, ctrl+a/e/j, paste-safe Enter
+## ✔ M16 — TUI input: multi-line caret movement, ctrl+a/e/j, paste-safe Enter
 
 The TUI input rendered multi-line text (paste, `$EDITOR`, templates) but the
 caret could not travel between lines: ↑/↓ always recalled history, so editing
@@ -695,20 +709,6 @@ As built notes:
   left on — the guard's drop fires on every exit path through `run`.
 - Paste is inserted with `App::insert_str` (chars, `\r` filtered), not
   per-key events, so a large paste is one edit and one redraw.
-
-## Open Questions
-1. ✔ **Provider plugin protocol details:** exact message shapes, streaming
-   granularity, cancellation semantics, how `list-models` interacts with
-   `/model` picker. Mostly settled during M1 design.
-   Answer: See ./provider-protocol.md
-2. ✔ **Plugin startup policy:** eager at launch (catches broken plugins early) vs
-   lazy on first use (faster startup). Recommend lazy with error surfacing.
-   Answer: lazy
-3. ✔ **Discovery details:** how aggressively to auto-discover sibling binaries
-   (`clanky-provider-*` naming convention?) vs requiring settings entries.
-   Answer: naming convension (refined in M8 planning to PATH-only lookup, no
-   sibling scan and no settings entries — see `provider-plugins-plan.md`)
-4. ☐ **MCP scope when it arrives:** tools first; prompts/resources later if wanted.
 
 ## ✔ M17 — Config knobs & CLI additions
 Four small, independent additions that all ride the existing settings-precedence
@@ -959,7 +959,7 @@ back as tool results, golden transcripts updated.
   section and the `timeout_seconds` bullet now notes the default applies
   only to `bash` ('killable' tools).
 
-## ☑ M20 — View-image (vision) tool
+## ✔ M20 — View-image (vision) tool
 A built-in `view-image` tool that puts an image file into the model's context,
 for multimodal models. Scope: **image → model only.** The TUI never displays the
 image (tool-result entry shows size like any result); the model never generates

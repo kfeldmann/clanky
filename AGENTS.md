@@ -29,7 +29,7 @@ lynx -dump https://lite.duckduckgo.com/lite?q=<url-encoded-query>
 
 ## Project state
 
-Milestones are complete through M14 (except for M9 which is deferred, and the first item in M10 which is low priority).
+Milestones are complete through M20 (except for M9 which is deferred).
 
 See `design-docs/milestones.md` — checkboxes mark progress, and its "As built" notes record
 decisions made during implementation. Check them before redesigning something.
