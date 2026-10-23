@@ -16,6 +16,9 @@ pub enum MediaType {
     Png,
     Jpeg,
     Gif,
+    /// Spec spelling is `"webp"`, not snake_case's `"web_p"` (see
+    /// `design-docs/provider-protocol.md`).
+    #[serde(rename = "webp")]
     WebP,
     Heic,
     Heif,
@@ -815,5 +818,24 @@ mod tests {
         // The wire strings compose into data URIs and Anthropic sources.
         assert_eq!(MediaType::Jpeg.as_str(), "image/jpeg");
         assert_eq!(MediaType::WebP.as_str(), "image/webp");
+
+        // The serde wire spelling matches `as_str()` for every type,
+        // including the `WebP` variant whose snake_case form (`"web_p"`)
+        // is not the spec spelling (`"webp"`).
+        for (media_type, wire) in [
+            (MediaType::Png, "png"),
+            (MediaType::Jpeg, "jpeg"),
+            (MediaType::Gif, "gif"),
+            (MediaType::WebP, "webp"),
+            (MediaType::Heic, "heic"),
+            (MediaType::Heif, "heif"),
+            (MediaType::Avif, "avif"),
+        ] {
+            assert_eq!(serde_json::to_value(media_type).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<MediaType>(wire.into()).unwrap(),
+                media_type
+            );
+        }
     }
 }

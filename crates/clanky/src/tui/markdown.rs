@@ -282,7 +282,14 @@ fn table_delimiter(line: &str) -> Option<Vec<Align>> {
         let c = cell.trim();
         let left = c.starts_with(':');
         let right = c.ends_with(':');
-        let dashes = &c[if left { 1 } else { 0 }..c.len() - if right { 1 } else { 0 }];
+        // A bare `:` (len 1, both ends colons) would make start == end; not
+        // dashes, so bail out rather than slice.
+        let start = usize::from(left);
+        let end = c.len().saturating_sub(usize::from(right));
+        if start >= end {
+            return None;
+        }
+        let dashes = &c[start..end];
         if !dashes.chars().all(|ch| ch == '-') || dashes.is_empty() {
             return None;
         }
@@ -844,6 +851,17 @@ mod tests {
 
     fn span_text(spans: &[Span<'static>]) -> String {
         spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn bare_colon_delimiter_cell_does_not_panic() {
+        // A delimiter cell of `:` (no dashes) is not a valid table: the
+        // old `c[1..c.len()-1]` slice computed `c[1..0]` and panicked. It
+        // must instead fail to form a table and render as plain text.
+        let md = "| a | b |\n| : | : |";
+        let lines = render(md, Style::new(), 80);
+        let texts: Vec<String> = lines.iter().map(|l| span_text(&l.spans)).collect();
+        assert!(texts.iter().any(|t| t.contains('|')));
     }
 
     #[test]
