@@ -204,28 +204,39 @@ fn reasoning_effort(thinking: Thinking) -> Option<&'static str> {
 
 /// Serialize protocol chat messages into OpenAI-compatible JSON messages.
 ///
-/// A tool result's inline images become `image_url` data-URI parts
-/// appended after the text part: OpenAI-style `content` may be an array
-/// mixing `text` and `image_url` objects, and `role: "tool"` accepts the
-/// same array form (the data URI itself carries `data:<media>;base64,`).
+/// A tool result's inline images cannot ride in the `tool` message:
+/// DeepInfra's tool-message schema accepts only a plain string (or a
+/// text-only array) for `content` — an `image_url` part there is a 422
+/// ("messages.N.tool.content.str: Input should be a valid string",
+/// observed live against a vision model). The images instead ride in a
+/// *trailing `user` message* with `image_url` data-URI parts, emitted
+/// only when the tool result carries images (so every image-free request
+/// is byte-identical to the old shape) and deterministically ordered —
+/// directly after the `tool` message it belongs to — so replay
+/// reconstructs exactly what the model saw.
 fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
-    messages
-        .iter()
-        .map(|m| match m {
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        match m {
             ChatMessage::System { content } | ChatMessage::User { content } => {
-                Ok(json!({ "role": role_name(m), "content": content }))
+                out.push(json!({ "role": role_name(m), "content": content }));
             }
             ChatMessage::Tool {
                 tool_call_id,
                 content,
                 images,
             } => {
-                let parts = openai_content_parts(content, images.as_deref());
-                Ok(json!({
+                // `role: "tool"` takes only a plain string `content`
+                // (see the function doc); the text is the result, the
+                // images (if any) follow in a synthetic user turn.
+                out.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": parts,
-                }))
+                    "content": content,
+                }));
+                if let Some(images) = images.as_deref().filter(|imgs| !imgs.is_empty()) {
+                    out.push(image_parts_user_message(images));
+                }
             }
             ChatMessage::Assistant {
                 content,
@@ -257,10 +268,30 @@ fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
                         ),
                     );
                 }
-                Ok(msg)
+                out.push(msg);
             }
-        })
-        .collect()
+        }
+    }
+    Ok(out)
+}
+
+/// The `user` message that carries a tool result's images: an array of
+/// bare `image_url` data-URI parts (no text — the result's text stays in
+/// the `tool` message; duplicating it would send it twice). `role:
+/// "user"` is the only role whose schema accepts `image_url` parts.
+fn image_parts_user_message(images: &[clanky_protocol::ImagePart]) -> Value {
+    json!({
+        "role": "user",
+        "content": images
+            .iter()
+            .map(|image| json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", image.media_type.as_str(), image.data_base64),
+                },
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn role_name(message: &ChatMessage) -> &'static str {
@@ -270,30 +301,6 @@ fn role_name(message: &ChatMessage) -> &'static str {
         ChatMessage::Assistant { .. } => "assistant",
         ChatMessage::Tool { .. } => "tool",
     }
-}
-
-/// Build an OpenAI-style `content` value for a message that may carry
-/// images: a plain string when there are none (the common case — short,
-/// and exactly what every pre-vision message sent), an array of `text` +
-/// `image_url` parts otherwise. The images ride as `data:` URIs, which
-/// carry the media type and base64 payload inline.
-fn openai_content_parts(text: &str, images: Option<&[clanky_protocol::ImagePart]>) -> Value {
-    let Some(images) = images.filter(|imgs| !imgs.is_empty()) else {
-        return json!(text);
-    };
-    let mut parts = Vec::with_capacity(images.len() + 1);
-    if !text.is_empty() {
-        parts.push(json!({ "type": "text", "text": text }));
-    }
-    for image in images {
-        parts.push(json!({
-            "type": "image_url",
-            "image_url": {
-                "url": format!("data:{};base64,{}", image.media_type.as_str(), image.data_base64),
-            },
-        }));
-    }
-    Value::Array(parts)
 }
 
 fn openai_tools(tools: &[Tool]) -> Value {
@@ -1190,7 +1197,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_images_become_image_url_data_uri_parts() {
+    fn tool_result_images_ride_in_a_trailing_user_message() {
+        // DeepInfra's tool-message schema allows only a plain-string
+        // `content` (a live 422 proved `image_url` parts are rejected
+        // there), so the images ride in a trailing `user` message with
+        // bare `image_url` data-URI parts, right after the `tool`
+        // message; the `tool` message itself keeps its string text.
         let mut provider = DeepInfraProvider::new(
             MockBackend::new(vec![done_chunk("stop")], "[]"),
             "https://x.invalid",
@@ -1207,16 +1219,19 @@ mod tests {
         provider.chat(&request, &mut |_| {}).unwrap();
         let (_, body) = provider.backend.posts.borrow()[0].clone();
         let body: Value = serde_json::from_str(&body).unwrap();
-        let content = &body["messages"][2]["content"];
-        assert!(
-            content.is_array(),
-            "images: content becomes a parts array: {content}"
-        );
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "256 kb");
-        assert_eq!(content[1]["type"], "image_url");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4, "tool message + trailing image user turn");
+        let tool = &messages[2];
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["tool_call_id"], "call_1");
+        assert_eq!(tool["content"], "256 kb", "text stays a plain string");
+        let images = &messages[3];
+        assert_eq!(messages[3]["role"], "user");
+        let parts = images["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "the result text is not duplicated");
+        assert_eq!(parts[0]["type"], "image_url");
         assert_eq!(
-            content[1]["image_url"]["url"],
+            parts[0]["image_url"]["url"],
             "data:image/png;base64,aGVsbG8="
         );
     }

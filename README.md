@@ -171,8 +171,9 @@ model never generates images).
   surfaced unchanged — there is no local capability whitelist.
 - On the wire, a tool result's images ride with the result: OpenAI-
   compatible providers (DeepInfra, LiteLLM) get `image_url` data-URI
-  parts after the text, Anthropic gets `image` source blocks inside the
-  `tool_result` block.
+  parts in a `user` message that directly follows the `tool` message
+  (their `tool`-message schema accepts only plain-string content),
+  Anthropic gets `image` source blocks inside the `tool_result` block.
 - Session files record the image in full base64 so a replay reconstructs
   exactly what the model saw (a screenshot is ~300–400 KB encoded —
   expect large JSONL lines). `/md` exports an `_attached image_` note

@@ -1022,8 +1022,13 @@ will handle the live testing.
   heif/avif, IANA `image/…` strings), not a free string. The Anthropic
   decision stands as the milestone drafted it: images ride **inside the
   `tool_result` block** (its `content` is an array mixing text + image
-  blocks); OpenAI-compatible backends get `image_url` data-URI parts after
-  the text. Media-type resolution is sniff-first (JPEG/PNG/GIF/WEBP magic
+  blocks); OpenAI-compatible backends put `image_url` data-URI parts in a
+  trailing `user` message directly after the `tool` message — **amended
+  after live testing**: array `content` on a `tool` message is a 422
+  (`messages.N.tool.content.str: Input should be a valid string`), so the
+  `tool` message keeps its plain-string text and the images ride in the
+  trailing user turn (deterministically ordered, emitted only when
+  images are present, so image-free requests stay byte-identical). Media-type resolution is sniff-first (JPEG/PNG/GIF/WEBP magic
   bytes; the container formats HEIC/HEIF/AVIF share ISO-BMFF boxes with
   video formats so a byte sniff deliberately declines them), extension
   fallback (case-insensitive, `.jpeg` aliased), sniff wins over a wrong

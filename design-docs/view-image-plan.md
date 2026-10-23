@@ -1,8 +1,10 @@
 # Plan — View-image (vision) tool (M20)
 
-> **Status: implemented** (except live verification of a vision model,
-> which the user handles — see the "Done when" list in `milestones.md`).
-> Wire shapes below are as built; the protocol change is additive in v2.
+> **Status: implemented and live-verified** against a vision model —
+> live testing amended the OpenAI-compatible wire shape (see the
+> amendment note in §2): array `content` on a `tool` message is a 422,
+> so images ride in a trailing `user` message. The protocol change is
+> additive in v2.
 
 A built-in `view-image` tool that puts an image file into the model's
 context, for multimodal models. Scope: **image → model only.** The TUI
@@ -41,6 +43,35 @@ message does):
              {"type": "image_url",
               "image_url": {"url": "data:image/jpeg;base64,…"}}]}
 ```
+
+> **Amended after live testing (the plan's one wrong guess):** the array
+> form above is rejected by DeepInfra — its tool-message schema allows
+> only a plain string (or a text-only array) for `content`, so an
+> `image_url` part inside a `tool` message is a 422
+> (`messages.5.tool.content.str: "Input should be a valid string"`),
+> observed live against a vision model. The OpenAI-compatible shape as
+> built keeps the `tool` message's `content` a plain string and carries
+> the images in a **trailing `user` message** with bare `image_url`
+> data-URI parts (no text — the result text stays in the `tool`
+> message, unduplicated), emitted only when the result carries images
+> so every image-free request is byte-identical, and always directly
+> after the `tool` message it belongs to so replay reconstructs exactly
+> what the model saw:
+>
+> ```json
+> {"role": "tool", "toolCallId": "call_1", "content": "256 kb"}
+> {"role": "user",
+>  "content": [{"type": "image_url",
+>               "image_url": {"url": "data:image/jpeg;base64,…"}}]}
+> ```
+>
+> This supersedes the milestone's rejection of the follow-up-`user`
+> shape: that argument was about a *bare* image turn with no tool
+> context (replay divergence between providers); here the trailing user
+> turn is deterministic and the protocol `ChatMessage` stream is
+> unchanged — it is still one `tool` message carrying the images, and
+> only the plugin's backend serialization differs. Anthropic keeps the
+> in-`tool_result` shape (verified permitted by the Messages API).
 
 Anthropic — **inside the `tool_result` block**, whose `content` may be an
 array mixing text + image blocks (the Messages API permits this):

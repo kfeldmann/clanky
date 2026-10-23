@@ -153,8 +153,11 @@ Field rules:
   M20); absent when there are none, so a plugin that ignores the field
   still serves text-only sessions correctly. The plugin is responsible for
   building its backend's multimodal shape: OpenAI-compatible endpoints get
-  `image_url` data-URI parts (`data:<media>;base64,<data>`) appended after
-  the text part; Anthropic gets `image` source blocks inside the
+  `image_url` data-URI parts (`data:<media>;base64,<data>`) in a trailing
+  `user` message (as built: the `tool` message's own `content` accepts only
+  a plain string there — an `image_url` part inside it is a live 422,
+  "messages.N.tool.content.str: Input should be a valid string"; see
+  `design-docs/view-image-plan.md`); Anthropic gets `image` source blocks inside the
   `tool_result` block (its `content` may be an array mixing text + image
   blocks).
 - `tools` uses JSON Schema for `parameters` (OpenAI-compatible; maps directly
