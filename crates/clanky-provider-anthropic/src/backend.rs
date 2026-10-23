@@ -71,8 +71,8 @@ pub trait Backend {
     /// `GET <url>` with OAuth bearer + beta headers (model listing).
     fn get_model_list(&self, url: &str, auth: &AuthMode) -> Result<String, BackendError>;
 
-    /// `POST <url>` with OAuth bearer + beta headers, returning the body.
-    /// Non-streaming in M11a (the whole response is read).
+    /// `POST <url>` with auth headers, returning the whole response body —
+    /// the one-shot Messages call (`stream: false`).
     fn post_message(&self, url: &str, auth: &AuthMode, body: &str) -> Result<String, BackendError>;
 
     /// POST a request and stream the response as SSE payloads — one item

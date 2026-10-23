@@ -118,8 +118,10 @@ pub fn build_request_body(
 
     // Streaming on by default (M11b): `stream: true` buys SSE deltas, which
     // map onto the protocol's chunks. As everywhere else, the user's own
-    // `stream` entry in `sampling` wins — a non-streaming request is legal
-    // (`post_message`'s one-shot shape answers it too).
+    // `stream` entry in `sampling` wins — a non-streaming request is legal,
+    // and the provider routes it to `post_message` (see `wants_stream`).
+    // The `stream` value computed here and the transport choice in
+    // `provider::chat` must agree; both read the same `sampling` entry.
     obj.entry("stream").or_insert(json!(stream));
 
     // The conversation shape belongs to the protocol and cannot be
@@ -243,11 +245,9 @@ pub struct AnthropicErrorBody {
 /// plus the streamed events a non-streaming backend emits up front. Every
 /// content block is emitted as exactly one chunk (text/thinking), tool_use
 /// blocks as a start plus a single args chunk carrying the whole JSON.
-/// Non-streaming translation of a whole Messages response (M11a's chat
-/// path). The streaming path ([`StreamState`]) is now the default; this
-/// stays for requests that asked `stream: false` and as the canonical
-/// reference mapping the stream events reproduce.
-#[allow(dead_code)]
+/// Serves the provider's non-streaming path (a `stream = false` entry in
+/// `sampling` — the user's value is honored end to end) and is the
+/// canonical reference mapping the stream events reproduce.
 pub fn response_to_events(
     response: &AnthropicResponse,
     sink: &mut dyn FnMut(clanky_protocol::ChunkPayload),

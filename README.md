@@ -105,8 +105,10 @@ Notes:
   Values may be any TOML value; a string that is JSON (e.g. `"0.7"`) is sent
   as that JSON value, so `temperature = "0.7"` and `temperature = 0.7` mean
   the same thing (a string like `"high"` stays a string). The request's
-  structural fields (`model`, `messages`, `tools`, `stream`, …) are set by
-  the provider and cannot be overridden through `sampling`.
+  structural fields (`model`, `messages`, `tools`, …) are set by
+  the provider and cannot be overridden through `sampling`. The one
+  exception is `stream` on the Anthropic provider: setting `stream =
+  false` there is honored end to end (see above).
 - `max_retries` covers transient provider failures — rate limits (429
   `Model busy`), backend errors, and network timeouts. Retries use
   backoff growing ×1.25 per retry (500 ms, 625 ms, 781 ms, 976 ms, 1.2 s,
@@ -409,6 +411,12 @@ An explicitly set key wins over stored credentials (your choice, not the
 program's). The key path sends the documented `x-api-key` headers; the
 OAuth path sends bearer headers and identifies as Claude Code. Everything
 else — streaming, tools, thinking — is identical through both.
+
+Streaming is the default. Setting `stream = false` in your `sampling`
+config takes the non-streaming path end to end: the request goes out with
+`stream: false`, the whole response body is read at once, and it is
+translated into the same streamed chunks every other provider emits —
+so nothing downstream changes, only the wire shape to the API.
 
 Notes:
 

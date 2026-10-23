@@ -330,6 +330,22 @@ real tenant.
   tests + a mock-backend chat pinned to the same fixtures); first live
   key-user should sanity-check against the real API.
 
+  Later fix (code review): a `stream = false` entry in `sampling` is now
+  honored end to end. Previously the request body carried the user's value
+  but `chat()` always POSTed via the SSE transport and fed the response
+  through the stream parser — a legal non-streaming JSON body parsed as SSE
+  errored ("malformed stream event") or produced garbage, so the user's
+  explicit value was accepted then functionally discarded. Now
+  `provider::chat` derives the same `stream` decision the body does
+  (`wants_stream`: any non-`true` value in the open sampling map means
+  non-streaming) and routes `stream = false` to the one-shot
+  `post_message` path, translating the whole body via
+  `adapter::response_to_events` — the same chunks the SSE path emits, so
+  the client cannot tell which transport served the turn. `post_message`
+  and `response_to_events` are live code again; HTTP-status and in-body
+  (`{"type":"error",...}`) failures map through the same error mapping as
+  the streaming path.
+
 ### ✔ M12 — Refinements, Bug Fixes
 1. [x] Add support for ctl+u in the input field (clear from cursor to beginning of line)
 2. [x] Print-mode (-p) output changes

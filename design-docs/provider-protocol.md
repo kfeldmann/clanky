@@ -169,10 +169,15 @@ Field rules:
   Neither Clanky nor the plugin renames, validates, or drops them — the
   backend does, and its own error message is what the user sees. The one
   caveat: the request's structural fields (`model`, `messages`, `system`,
-  `tools`, `stream`, …) belong to the protocol and are set by the plugin
-  afterwards; they cannot be overridden through `sampling`. Filling a
+  `tools`, …) belong to the protocol and are set by the plugin afterwards;
+  they cannot be overridden through `sampling`. Filling a
   required knob the user did not set (e.g. Anthropic's `max_tokens`) is
-  fine; overwriting a key the user did set is not.
+  fine; overwriting a key the user did set is not. `stream` is the
+  sanctioned exception to "structural": the Anthropic plugin honors a
+  user-set `stream` entry (any non-`true` value takes the one-shot
+  `post_message` path and translates the whole body through the same
+  chunk mapping), because a stream toggle only changes the wire shape,
+  not the protocol contract.
 - `sampling` and `thinking` are optional; `thinking` is only sent if
   `capabilities.thinking`.
 - `thinking.budgetTokens: 0` means the user explicitly disabled thinking

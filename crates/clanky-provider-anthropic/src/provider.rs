@@ -1,5 +1,7 @@
 //! Anthropic provider logic: protocol messages ⇄ the Anthropic Messages API
-//! (SSE-streaming since M11b). Auth is [`crate::backend::AuthMode`] (M11c):
+//! (SSE-streaming by default; a `stream = false` entry in `sampling` takes
+//! the one-shot `post_message` path). Auth is [`crate::backend::AuthMode`]
+//! (M11c):
 //!
 //! - **API key** (`ANTHROPIC_API_KEY`, checked per request): the documented
 //!   third-party surface — `x-api-key` headers, no refresh, no expiry. An
@@ -15,13 +17,29 @@ use std::cell::RefCell;
 
 use clanky_protocol::{
     CancelFlag, Capabilities, ChatDone, ChatRequest, ChunkPayload, Error, ErrorCode, FinishReason,
-    Handler, ModelInfo, PluginInfo,
+    Handler, ModelInfo, PluginInfo, Sampling,
 };
+use serde_json::Value;
 
 use crate::adapter;
 use crate::auth::{self, Credentials};
 use crate::backend::AuthMode;
 use crate::oauth::{self, OAuthError};
+
+/// Whether the request body ends up asking for a stream: the user's
+/// `stream` entry in `sampling` wins over the provider's streaming default
+/// (invariant: a user-supplied value is authoritative — this decides which
+/// transport `chat` uses, so it must match what `build_request_body` puts
+/// on the wire; `sampling` is an open JSON map and any non-`true` value
+/// there means "do not stream").
+fn wants_stream(sampling: Option<&Sampling>) -> bool {
+    match sampling.and_then(|s| s.get("stream")) {
+        Some(Value::Bool(false)) | Some(Value::Null) => false,
+        // Absent, or any other value the backend will judge on its own
+        // merits (a string, a number, …): the provider default is streaming.
+        _ => true,
+    }
+}
 
 /// Provider name reported at handshake.
 pub const PROVIDER_NAME: &str = "anthropic";
@@ -344,14 +362,22 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
         sink: &mut dyn FnMut(ChunkPayload),
     ) -> Result<ChatDone, Error> {
         let auth = self.current_auth()?;
+        let streaming = wants_stream(request.sampling.as_ref());
         let body = adapter::build_request_body(
             &request.model,
             &request.messages,
             request.tools.as_deref(),
             request.sampling.as_ref(),
             request.thinking,
-            true,
+            streaming,
         )?;
+        // The same `stream` decision that went into the body picks the
+        // transport: a `stream = false` response is one JSON object, not
+        // SSE — feeding it through the stream parser would corrupt or
+        // discard the user's explicitly requested shape.
+        if !streaming {
+            return self.chat_non_streaming(&auth, &body, sink);
+        }
         let payloads = self
             .backend
             .post_stream(&self.url("v1/messages"), &auth, &body)
@@ -379,6 +405,55 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
             }
         }
         let parts = state.finish();
+        Ok(ChatDone {
+            finish_reason: parts.finish_reason,
+            usage: parts.usage,
+        })
+    }
+}
+
+impl<B: crate::backend::Backend> AnthropicProvider<B> {
+    /// The non-streaming path (`stream = false` in `sampling`): POST and
+    /// read the whole response, then translate it via
+    /// [`adapter::response_to_events`], which emits the same chunks the
+    /// streaming path would have — the protocol stays streaming-first
+    /// regardless of what the backend wire request asked for.
+    ///
+    /// Cancellation granularity here is whole-response (no event
+    /// boundaries to check between); that is the shape the user asked for.
+    fn chat_non_streaming(
+        &self,
+        auth: &AuthMode,
+        body: &str,
+        sink: &mut dyn FnMut(ChunkPayload),
+    ) -> Result<ChatDone, Error> {
+        let response = self
+            .backend
+            .post_message(&self.url("v1/messages"), auth, body)
+            .map_err(|e| map_backend_error(e, "chat completion"))?;
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            return Err(Error::Protocol(
+                "empty response body from a non-streaming request".into(),
+            ));
+        }
+        let parsed: adapter::AnthropicResponse = serde_json::from_str(trimmed)
+            .map_err(|e| Error::Protocol(format!("malformed messages response: {e}")))?;
+        if let Some(err) = parsed.error.as_ref() {
+            // The non-streaming error shape rides in the 200/body the
+            // adapter parses (`{"type":"error","error":{...}}`).
+            let message = err
+                .message
+                .clone()
+                .unwrap_or_else(|| "unknown provider error".into());
+            return Err(Error::Provider {
+                code: ErrorCode::Backend,
+                message,
+                retryable: true,
+                retry_after_ms: None,
+            });
+        }
+        let parts = adapter::response_to_events(&parsed, sink);
         Ok(ChatDone {
             finish_reason: parts.finish_reason,
             usage: parts.usage,
@@ -486,6 +561,10 @@ mod tests {
         posts: RefCell<Vec<(String, String)>>,
         /// API keys seen by `post_stream` (empty on the bearer path).
         api_keys: RefCell<Vec<String>>,
+        /// Bodies recorded by `post_message` (the non-streaming path).
+        non_stream_posts: RefCell<Vec<(String, String)>>,
+        /// The canned non-streaming body `post_message` returns.
+        response: RefCell<Option<Result<String, crate::backend::BackendError>>>,
         sse: Vec<String>,
         post_error: Option<crate::backend::BackendError>,
     }
@@ -501,15 +580,28 @@ mod tests {
 
         fn post_message(
             &self,
-            _url: &str,
-            _auth: &AuthMode,
-            _body: &str,
+            url: &str,
+            auth: &AuthMode,
+            body: &str,
         ) -> Result<String, crate::backend::BackendError> {
-            // Not on the chat path since M11b; fail loudly if it comes back.
-            Err(crate::backend::BackendError::new(
-                None,
-                "unexpected non-streaming call",
-            ))
+            self.non_stream_posts
+                .borrow_mut()
+                .push((url.to_string(), body.to_string()));
+            match auth {
+                AuthMode::Bearer(c) => {
+                    assert_eq!(
+                        c.access_token, "sk-ant-oat01-test",
+                        "unexpected auth: {auth:?}"
+                    )
+                }
+                AuthMode::ApiKey(k) => {
+                    assert_eq!(k, "sk-ant-api03-test", "unexpected auth: {auth:?}")
+                }
+            }
+            self.response
+                .borrow_mut()
+                .take()
+                .expect("a non-streaming chat ran without a canned response")
         }
 
         fn post_stream(
@@ -559,6 +651,32 @@ mod tests {
             "https://api.anthropic.com",
         )
         .with_credentials(Box::new(|| Some(test_creds())), Box::new(|_| {}))
+    }
+
+    /// A provider whose backend serves one canned whole-body response (the
+    /// non-streaming path) and no stream.
+    fn non_streaming_provider(
+        response: Result<String, crate::backend::BackendError>,
+    ) -> AnthropicProvider<MockBackend> {
+        AnthropicProvider::new(
+            MockBackend {
+                response: RefCell::new(Some(response)),
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_credentials(Box::new(|| Some(test_creds())), Box::new(|_| {}))
+    }
+
+    /// A chat request asking `stream: false` in `sampling` (the user's
+    /// explicit choice, honored end to end).
+    fn non_streaming_request(model: &str, messages: Vec<ChatMessage>) -> ChatRequest {
+        let mut req = request(model, messages);
+        req.sampling = Some(clanky_protocol::Sampling::from_iter([(
+            "stream".into(),
+            serde_json::json!(false),
+        )]));
+        req
     }
 
     fn run_chat(
@@ -695,8 +813,10 @@ mod tests {
     #[test]
     fn a_user_sampling_stream_false_wins_over_the_provider_default() {
         // Invariant: the user's `stream = false` in sampling is authoritative
-        // — the provider never flips it back on.
-        let mut provider = provider(Vec::new());
+        // — the provider never flips it back on, and the wire body carries
+        // the user's value, not the streaming default.
+        let mut provider =
+            non_streaming_provider(Ok(include_str!("../tests/fixtures/resp-basic.json").into()));
         let mut req = request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]);
         req.sampling = Some(clanky_protocol::Sampling::from_iter([(
             "stream".into(),
@@ -704,7 +824,7 @@ mod tests {
         )]));
         let _ = run_chat(&mut provider, &req).1;
         let body: serde_json::Value =
-            serde_json::from_str(&provider.backend.posts.borrow()[0].1).unwrap();
+            serde_json::from_str(&provider.backend.non_stream_posts.borrow()[0].1).unwrap();
         assert_eq!(body["stream"], false);
     }
 
@@ -720,6 +840,181 @@ mod tests {
             provider.backend.posts.borrow()[0].0,
             "https://api.anthropic.com/v1/messages"
         );
+    }
+
+    // --- non-streaming chat (`stream = false` in sampling) ----------------
+
+    #[test]
+    fn a_user_sampling_stream_false_takes_the_non_streaming_path() {
+        // Invariant: the user's `stream = false` is accepted *and* used —
+        // the response is one JSON body, never fed through the SSE parser.
+        let mut provider =
+            non_streaming_provider(Ok(include_str!("../tests/fixtures/resp-basic.json").into()));
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &non_streaming_request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        );
+        let done = done.unwrap();
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hi! 👋");
+        assert_eq!(done.finish_reason, FinishReason::Stop);
+        let usage = done.usage.expect("usage from the response body");
+        assert_eq!(usage.prompt_tokens, Some(675));
+        assert_eq!(usage.completion_tokens, Some(8));
+
+        // The request went out asking for exactly what the user set…
+        let body: serde_json::Value =
+            serde_json::from_str(&provider.backend.non_stream_posts.borrow()[0].1).unwrap();
+        assert_eq!(body["stream"], false);
+        // …over the one-shot transport, with no streaming call at all.
+        assert!(
+            provider.backend.posts.borrow().is_empty(),
+            "a stream=false request must not hit the SSE transport"
+        );
+    }
+
+    #[test]
+    fn a_non_streaming_tool_call_matches_the_streamed_shape() {
+        // The whole-body path emits the same chunks the SSE path does —
+        // the client cannot tell which transport served the turn.
+        let mut provider =
+            non_streaming_provider(Ok(include_str!("../tests/fixtures/resp-tools.json").into()));
+        let mut req = non_streaming_request(
+            "claude-haiku-4-5-20251001",
+            vec![ChatMessage::user("list /tmp with the bash tool")],
+        );
+        req.tools = Some(vec![Tool {
+            name: "bash".into(),
+            description: Some("Run a shell command".into()),
+            parameters: None,
+        }]);
+        let (chunks, done) = run_chat(&mut provider, &req);
+
+        let starts: Vec<&ChunkPayload> = chunks
+            .iter()
+            .filter(|c| matches!(c, ChunkPayload::ToolCallStart { .. }))
+            .collect();
+        assert_eq!(starts.len(), 1);
+        match starts[0] {
+            ChunkPayload::ToolCallStart { index, id, name } => {
+                assert_eq!(*index, 0);
+                assert_eq!(id, "toolu_01BhVetyfKsqmX56rNskCQuh");
+                assert_eq!(name, "bash");
+            }
+            _ => unreachable!(),
+        }
+        let args: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::ToolCallArgs { args_chunk, .. } => Some(args_chunk.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
+            json!({"command": "ls -1 /tmp | wc -l"})
+        );
+        assert_eq!(done.unwrap().finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn a_non_streaming_thinking_response_surfaces_thinking_chunks() {
+        let mut provider = non_streaming_provider(Ok(include_str!(
+            "../tests/fixtures/resp-thinking.json"
+        )
+        .into()));
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &non_streaming_request(
+                "claude-haiku-4-5-20251001",
+                vec![ChatMessage::user("17*23?")],
+            ),
+        );
+        let thinking: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(thinking.contains("17 * 23"), "{thinking}");
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "17 × 23 = **391**");
+        assert_eq!(done.unwrap().finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn a_malformed_non_streaming_body_is_a_protocol_error_not_sse_garbage() {
+        // Before this fix, stream=false bodies went through the SSE parser
+        // and surfaced as a confusing "malformed stream event" (or worse,
+        // silent garbage). The one-shot path names the actual failure.
+        let mut provider = non_streaming_provider(Ok("<html>gateway</html>".into()));
+        let err = run_chat(
+            &mut provider,
+            &non_streaming_request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap_err();
+        match err {
+            Error::Protocol(message) => {
+                assert!(message.contains("malformed messages response"), "{message}")
+            }
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn an_error_body_on_the_non_streaming_path_surfaces_as_a_provider_error() {
+        let body = r#"{"type":"error","error":{"type":"api_error","message":"boom"}}"#;
+        let mut provider = non_streaming_provider(Ok(body.into()));
+        let err = run_chat(
+            &mut provider,
+            &non_streaming_request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap_err();
+        match err {
+            Error::Provider { code, message, .. } => {
+                assert_eq!(code, ErrorCode::Backend);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn an_http_error_on_the_non_streaming_path_maps_like_the_streaming_one() {
+        let mut provider = non_streaming_provider(Err(crate::backend::BackendError::new(
+            Some(429),
+            "rate limited",
+        )));
+        let err = run_chat(
+            &mut provider,
+            &non_streaming_request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap_err();
+        match err {
+            Error::Provider {
+                code, retryable, ..
+            } => {
+                assert_eq!(code, ErrorCode::RateLimit);
+                assert!(retryable);
+            }
+            other => panic!("unexpected: {other}"),
+        }
     }
 
     // --- cancellation -----------------------------------------------------
