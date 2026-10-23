@@ -974,13 +974,20 @@ images. Cards on the table:
    building the backend request shapes:
    - OpenAI-compatible (DeepInfra, LiteLLM): `image_url` data-URI parts
      (`data:<media>;base64,<data>`)
-   - Anthropic: `image` source blocks (inside the `tool_result` block, which
-     the Messages API permits, or a follow-up `user` message — decided at
-     implementation)
-   A model that can't accept images 400s; the backend's error is surfaced
-   unchanged (invariant 2) — no local capability whitelist. A future optional
-   `supportsImages` hint (LiteLLM-style) could curate the picker, like
-   `supportsTools` in M10 — not required for this milestone.
+   - Anthropic: `image` source blocks (decided: inside the `tool_result`
+     block, whose `content` may be an array mixing text + image blocks —
+     the Messages API permits this). A follow-up `user` message with a
+     bare image block was considered and rejected: it injects a synthetic
+     user turn no other backend produces, so replay/history reconstruction
+     would diverge between providers. If a live probe or doc check shows
+     tool_result images need extra headers or are rejected, fall back to
+     the follow-up message and record the decision here.
+
+A model that can't accept images 400s; the backend's error is surfaced
+unchanged (invariant 2) — no local capability whitelist. A future optional
+`supportsImages` hint (LiteLLM-style) could curate the picker, like
+`supportsTools` in M10 — not required for this milestone.
+
 2. Tool: `view-image {"path": …}`, description: "Read an image file from disk
    and attach it so you can see it." (Name chosen over `read-image`/`vision`:
    action-shaped verb matching how users phrase the intent — "show me", "take a
@@ -1000,6 +1007,8 @@ images. Cards on the table:
 Design notes (wire shapes for all three backends, media-type table, session
 size caveat) go in a short `design-docs/read-image-plan.md`, matching the
 pattern of M10/M11 planning docs.
+
 Done when: `clanky -p "what's in /work/sample.jpg"` against a vision model
 returns a description; the session replays and the model answers about the
-image again; a text-only model surfaces the backend error unchanged.
+image again; a text-only model surfaces the backend error unchanged. The user
+will handle the live testing.
