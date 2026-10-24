@@ -48,6 +48,18 @@ fn run(cli: &cli::Cli) -> Result<()> {
     // CLI flags win over both scopes.
     settings.overlay(cli.overrides());
 
+    // A configured timeout past `Instant`'s range cannot be honored as a
+    // deadline (it would overflow into "no timeout", the opposite of what
+    // was asked), so it is rejected up front instead of being rewritten.
+    if let Some(seconds) = settings.timeout_seconds
+        && seconds > tools::MAX_DEADLINE_SECS
+    {
+        return Err(clanky::error::Error::InvalidConfig(format!(
+            "timeout_seconds is too large ({seconds}s); the largest supported value is {}",
+            tools::MAX_DEADLINE_SECS
+        )));
+    }
+
     // One shared rejection for both front ends: with recording off there
     // is no session to load into and none would be saved.
     if !settings.record_sessions() && cli.resume.is_some() {

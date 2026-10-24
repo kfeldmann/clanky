@@ -21,6 +21,9 @@ pub enum Error {
         source: toml::de::Error,
     },
 
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+
     #[error("no prompt given: pass a prompt on the command line or pipe one via stdin")]
     NoPrompt,
 

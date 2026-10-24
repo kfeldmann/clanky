@@ -90,6 +90,7 @@ use crate::provider::ProviderSession;
 use crate::recorder;
 use crate::session::{self, SessionInfo};
 use crate::settings::{SamplingParams, SessionSettings, Settings};
+use crate::tools;
 use crate::turn::{TurnConfig, TurnEvent, TurnOutput};
 use commands::{Command, SamplingEdit, TimeoutEdit};
 
@@ -1385,10 +1386,17 @@ fn handle_command(
                         .push(app::Entry::Info("tool timeout cleared (unbounded)".into()));
                 }
                 TimeoutEdit::Seconds(seconds) => {
-                    launch.timeout_seconds = Some(seconds);
-                    observe_settings(state, launch);
-                    app.entries
-                        .push(app::Entry::Info(format!("tool timeout set to {seconds}s")));
+                    if seconds > tools::MAX_DEADLINE_SECS {
+                        app.entries.push(app::Entry::Info(format!(
+                            "timeout too large: {seconds}s — the largest supported value is {}s",
+                            tools::MAX_DEADLINE_SECS
+                        )));
+                    } else {
+                        launch.timeout_seconds = Some(seconds);
+                        observe_settings(state, launch);
+                        app.entries
+                            .push(app::Entry::Info(format!("tool timeout set to {seconds}s")));
+                    }
                 }
             }
             Action::None
@@ -2675,6 +2683,44 @@ mod tests {
                 timeout_seconds: Some(5),
                 ..SessionSettings::default()
             })
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_timeout_past_instants_range_is_rejected_not_set() {
+        // `/timeout u64::MAX` would overflow `Instant` into "no timeout"
+        // (the opposite of what was asked), so it must be rejected with a
+        // message rather than recorded.
+        let (mut state, dir) = recording_state("timeout-reject");
+        let mut cfg = launch();
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::Timeout(TimeoutEdit::Seconds(u64::MAX)),
+            &tx,
+        );
+        assert_eq!(
+            cfg.effective.timeout_seconds, None,
+            "the too-large value must not be set"
+        );
+        let info: Vec<_> = app
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                app::Entry::Info(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            info.iter().any(|t| t.contains("too large")),
+            "expected a `too large` notice, got {info:?}"
         );
         std::fs::remove_dir_all(dir).ok();
     }

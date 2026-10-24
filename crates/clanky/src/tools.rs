@@ -98,6 +98,13 @@ pub fn default_tools(timeout_seconds: Option<u64>) -> ToolSet {
 /// the timeout machinery can run unconditionally).
 const UNSET_DEADLINE: u64 = u64::MAX / 2;
 
+/// The largest duration a `bash` deadline can actually use: `Instant`'s
+/// representable range is roughly half of `u64` nanoseconds, and beyond it
+/// `Instant::now() + deadline` overflows — which used to silently disable
+/// the timeout. Anything at or above this is not a timeout, it is a typo,
+/// so we reject it instead of rewriting it.
+pub const MAX_DEADLINE_SECS: u64 = u64::MAX / 2 / 1_000_000_000;
+
 /// The built-in `bash` tool: run a shell command, return stdout and stderr.
 pub struct BashTool {
     /// Default deadline for commands; huge (unset) runs them unbounded.
@@ -118,9 +125,10 @@ impl Default for BashTool {
 
 impl BashTool {
     /// A `bash` tool with an explicit default deadline (used by tests);
-    /// [`BashTool::default`] is unbounded. A deadline past `Instant`'s
-    /// range (`UNSET_DEADLINE`) never fires, so an unset configured
-    /// deadline is simply passed through and behaves as no deadline.
+    /// [`BashTool::default`] is unbounded. The configured deadline is
+    /// user-provided and passed through verbatim: `BashTool`'s caller
+    /// (settings) is responsible for keeping it within `Instant`'s
+    /// range, exactly as it is for the per-call argument.
     pub fn new(timeout: Duration, max_output_chars: usize) -> Self {
         Self {
             timeout,
@@ -172,12 +180,25 @@ impl Tool for BashTool {
                         message: "expected a positive integer field `timeout_seconds`".into(),
                     });
                 };
-                // Any positive value is a legitimate voluntary timeout;
-                // only zero is rejected.
+                // Only zero and beyond-`Instant` values are rejected:
+                // any positive second count up to `Instant`'s range is a
+                // legitimate voluntary timeout, however large. Something
+                // past the range cannot be honored (it would overflow
+                // into "no timeout", the opposite of what was asked), so
+                // it gets an honest error.
                 if seconds == 0 {
                     return Err(ToolError::InvalidArguments {
                         tool: self.name().into(),
                         message: "`timeout_seconds` must be at least 1".into(),
+                    });
+                }
+                if seconds > MAX_DEADLINE_SECS {
+                    return Err(ToolError::InvalidArguments {
+                        tool: self.name().into(),
+                        message: format!(
+                            "`timeout_seconds` is too large ({}s); the largest supported value is {MAX_DEADLINE_SECS}",
+                            seconds
+                        ),
                     });
                 }
                 Some(Duration::from_secs(seconds))
@@ -451,6 +472,13 @@ impl Tool for EditTool {
 /// invariant: no local capability whitelist).
 pub struct ViewImageTool;
 
+/// Ceiling on one `view-image` attachment: the file is read wholly,
+/// base64'd (~1.33×), and written into the session file, so an unbounded
+/// read lets a model-directed path to a multi-GB file (or `/dev/zero`, or
+/// a FIFO) bloat the session into uselessness. Anything larger is
+/// rejected with a clean error before any of it is read.
+const MAX_IMAGE_BYTES: u64 = 5_000_000;
+
 impl Default for ViewImageTool {
     fn default() -> Self {
         Self
@@ -486,6 +514,36 @@ impl Tool for ViewImageTool {
                 message: "expected a string field `path`".into(),
             });
         };
+        // Size and kind check before the read: a multi-GB file would be
+        // read wholly, base64'd (~1.33×), and written into the session
+        // file, and special files make it worse — `/dev/zero` (a char
+        // device) reports `len() == 0` but reads forever, and a FIFO
+        // blocks on open until a writer shows up. `metadata().len()`
+        // catches the size case without touching the contents; a
+        // non-regular file is rejected outright.
+        let meta = std::fs::metadata(path).map_err(|err| ToolError::Failed {
+            tool: self.name().into(),
+            message: format!("failed to read {path}: {err}"),
+        })?;
+        if !meta.is_file() {
+            return Err(ToolError::Failed {
+                tool: self.name().into(),
+                message: format!(
+                    "{path} is not a regular file; view-image needs a real image file on disk"
+                ),
+            });
+        }
+        let size = meta.len();
+        if size > MAX_IMAGE_BYTES {
+            return Err(ToolError::Failed {
+                tool: self.name().into(),
+                message: format!(
+                    "{path} is {} — larger than the {} limit for view-image; use bash to inspect or downsize it instead",
+                    size_note(size as usize),
+                    size_note(MAX_IMAGE_BYTES as usize),
+                ),
+            });
+        }
         let bytes = std::fs::read(path).map_err(|err| ToolError::Failed {
             tool: self.name().into(),
             message: format!("failed to read {path}: {err}"),
@@ -928,13 +986,22 @@ mod tests {
     #[test]
     fn per_call_timeout_is_validated() {
         let tool = BashTool::default();
-        // Zero is the only rejected value: any positive second count is a
-        // legitimate voluntary timeout, however large.
+        // Zero is rejected, and so is anything past `Instant`'s range —
+        // such a deadline cannot be honored (it would overflow into "no
+        // timeout", the opposite of what was asked) — but any positive
+        // second count within the range is a legitimate voluntary timeout.
         let err = tool
             .execute(&json!({"command": "true", "timeout_seconds": 0}))
             .unwrap_err();
         assert!(err.to_string().contains("`timeout_seconds`"), "{err}");
-        for ok in [1u64, 601, 86_400, u64::MAX] {
+        let err = tool
+            .execute(&json!({"command": "true", "timeout_seconds": u64::MAX}))
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArguments { .. }),
+            "u64::MAX must be rejected, got {err}"
+        );
+        for ok in [1u64, 601, 86_400, MAX_DEADLINE_SECS, MAX_DEADLINE_SECS - 1] {
             let out = tool
                 .execute(&json!({"command": "true", "timeout_seconds": ok}))
                 .unwrap();
@@ -1400,6 +1467,53 @@ mod tests {
         let err = view(json!({"path": path.display().to_string()})).unwrap_err();
         assert!(
             matches!(err, ToolError::Failed { ref message, .. } if message.contains("failed to read")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn view_image_rejects_oversized_files_before_reading() {
+        // A sparse file: huge on disk, nothing actually written. The cap
+        // must trigger on `metadata().len()` before any read — a model
+        // pointing at a multi-GB file (or `/dev/zero`) must get a clean
+        // error instead of a base64 blob in the session file.
+        let dir = std::env::temp_dir().join(format!("clanky-view-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.png");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(5_100_000)
+            .unwrap();
+        let err = view(json!({"path": path.display().to_string()})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed { ref message, .. }
+                if message.contains("larger than the 5.0 mb limit")),
+            "{err}"
+        );
+        // Just under the cap still goes through (zeros with a `.png`
+        // extension resolve by extension, so the read succeeds).
+        let path = dir.join("fitting.png");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(4_900_000)
+            .unwrap();
+        assert!(
+            view(json!({"path": path.display().to_string()})).is_ok(),
+            "a file under the cap must not be rejected"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn view_image_rejects_special_files_without_reading() {
+        // `/dev/zero` reports `metadata().len() == 0`, so the size cap
+        // alone would not stop an endless read; a non-regular file must
+        // be rejected on kind before the contents are touched. (A FIFO
+        // would be the same class: open blocks on a writer.)
+        let err = view(json!({"path": "/dev/zero"})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed { ref message, .. }
+                if message.contains("not a regular file")),
             "{err}"
         );
     }

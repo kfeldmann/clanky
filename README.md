@@ -73,7 +73,7 @@ All fields are optional; unknown keys are rejected with a parse error.
 | `prompt`   | string           | Prompt text (mainly useful on the CLI, not in a file) |
 | `session`  | boolean          | `false` disables session recording in every mode (default: on) |
 | `project`  | string           | Label shown at the left of the TUI input prompt (TUI only) |
-| `timeout_seconds` | integer  | Default tool-call timeout in seconds (`bash` calls without their own `timeout_seconds` run unbounded when unset; `edit` ignores it) |
+| `timeout_seconds` | integer  | Default tool-call timeout in seconds (`bash` calls without their own `timeout_seconds` run unbounded when unset; `edit` ignores it; values past `Instant`'s range are rejected) |
 
 Example:
 
@@ -113,7 +113,9 @@ Notes:
   `Model busy`), backend errors, and network timeouts. Retries use
   backoff growing ×1.25 per retry (500 ms, 625 ms, 781 ms, 976 ms, 1.2 s,
   …, capped at 30 s), honoring a server
-  `Retry-After` when it asks for longer, and are shown in the transcript
+  `Retry-After` when it asks for longer — including past the 30 s cap,
+  since the server's instruction wins over the backoff — and are shown in
+  the transcript
   (TUI) or on stderr (pipe mode). A round that already streamed content is
   never replayed, so a retry cannot duplicate output. Set it on the CLI
   with `--max-retries`.
@@ -123,7 +125,10 @@ Notes:
   means unbounded, exactly as before; a per-call `timeout_seconds` on the
   call always wins over the configured default, in both directions. Set it
   on the CLI with `--timeout-seconds`, or live in the TUI with
-  `/timeout <seconds|off>` (`off` clears back to unbounded). An expired
+  `/timeout <seconds|off>` (`off` clears back to unbounded). A value too
+  large for a real deadline (past `Instant`'s range, ~292 billion years
+  with seconds — a typo, not a timeout) is rejected up front with an
+  error rather than silently turning into "no timeout". An expired
   killable call (e.g. `bash`) is real cancellation: the whole command tree
   is TERM/KILLed and the model sees the timeout error.
 - Precedence is per field: CLI flag > project file > user file, and a
@@ -136,10 +141,13 @@ Notes:
 
 Commands run in the project directory with **no timeout**: they run until
 they finish. If the model wants a deadline it passes `timeout_seconds`
-(any positive number of seconds) on the call — and a configured default
+(any positive number of seconds up to `Instant`'s range) on the call —
+and a configured default
 (`timeout_seconds` setting, `--timeout-seconds`, `/timeout`) applies when
 the call passes none. The per-call value always wins over the configured
-default; without either, a command runs unbounded. Any deadline is
+default; without either, a command runs unbounded. A `timeout_seconds`
+value too large for a real deadline (past `Instant`'s range) is rejected
+with an error instead of silently disabling the timeout. Any deadline is
 honored by killing the command's **whole process tree** (TERM, then KILL)
 when it expires, so grandchildren cannot outlive the deadline and wedge
 the call. Without any deadline the group is never killed and the command
@@ -186,6 +194,12 @@ model never generates images).
   can recover from.
 - A model that cannot accept images 400s, and the backend's own error is
   surfaced unchanged — there is no local capability whitelist.
+- Files larger than 5 MB — and anything that is not a regular file
+  (`/dev/zero`, FIFOs) — are rejected with a clean error (checked via
+  `metadata()` before any read, so a model-directed path to a multi-GB
+  file or an endless special file cannot be pulled into the session); the
+  error tells the model to inspect or downsize the file with `bash`
+  instead.
 - On the wire, a tool result's images ride with the result: OpenAI-
   compatible providers (DeepInfra, LiteLLM) get `image_url` data-URI
   parts in a `user` message that directly follows the `tool` message
@@ -537,8 +551,9 @@ therefore affects text from that point on:
 line), `/timeout N` sets it to `N` seconds, and `/timeout off` clears it
 back to unbounded. The default applies to any tool call that passes no
 `timeout_seconds` of its own (`bash`; the `edit` tool ignores it); a
-per-call value always wins. Same effect as the `timeout_seconds` setting
-or `--timeout-seconds`; the TUI edit changes the live session (and is not
+per-call value always wins. Values past `Instant`'s range are rejected as
+too large (same as the `timeout_seconds` setting or `--timeout-seconds`);
+the TUI edit changes the live session (and is not
 written back to any settings file).
 
 ### `/md` — export the session as Markdown

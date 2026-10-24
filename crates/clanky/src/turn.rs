@@ -40,6 +40,8 @@ pub const DEFAULT_MAX_RETRIES: u32 = 5;
 pub const BASE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Ceiling for one backoff delay, so a long retry chain stays bounded.
+/// A server `Retry-After` longer than this is still honored as-is (see
+/// [`retry_delay`]): the server's instruction wins over our comfort.
 pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, Clone)]
@@ -364,9 +366,10 @@ fn retry_after(err: &ProtocolError) -> Option<Duration> {
 
 /// Backoff for retry `attempt` (1-based): grows from
 /// [`BASE_RETRY_DELAY`] by ×1.25 each step (500 ms, 625 ms, 781 ms,
-/// 976 ms, 1.2 s …), clamped to [`MAX_RETRY_DELAY`]. A longer server
-/// hint wins (also clamped), so a `Retry-After` never has us knocking
-/// sooner than the backoff would.
+/// 976 ms, 1.2 s …), clamped to [`MAX_RETRY_DELAY`]. A longer server hint
+/// wins as-is — *including* past the cap: the server told us to stay away
+/// for that long, and knocking sooner just burns an attempt on another
+/// rejection. A shorter hint does not undercut the backoff.
 fn retry_delay(attempt: u32, hint: Option<Duration>) -> Duration {
     // ×1.25 per step as integer ×5/4 on whole nanoseconds, truncating
     // at each step; stopping early at the cap keeps any attempt count
@@ -381,7 +384,7 @@ fn retry_delay(attempt: u32, hint: Option<Duration>) -> Duration {
     }
     let backoff = Duration::from_nanos(nanos.min(cap) as u64);
     match hint {
-        Some(hint) if hint > backoff => hint.min(MAX_RETRY_DELAY),
+        Some(hint) if hint > backoff => hint,
         _ => backoff,
     }
 }
@@ -1285,6 +1288,37 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_longer_than_the_cap_is_honored_end_to_end() {
+        // The turn loop sees the server's `Retry-After` and waits exactly
+        // that long, even though it is past MAX_RETRY_DELAY: the clamp is
+        // for our own backoff, not the server's instruction.
+        let handler = Box::new(MockHandler::flaky(
+            vec![clanky_protocol::Error::Provider {
+                code: ErrorCode::RateLimit,
+                message: "429: slow down".into(),
+                retryable: true,
+                retry_after_ms: Some(45_000),
+            }],
+            vec![text_turn("hi there")],
+        ));
+        let cfg = TurnConfig {
+            max_retries: Some(5),
+            ..config("mock/model")
+        };
+        let (output, sink) = run(handler, &toolset(), vec![], "hi", &cfg);
+        output.unwrap();
+        let delay = sink
+            .into_inner()
+            .iter()
+            .find_map(|e| match e {
+                TurnEvent::Retrying { delay, .. } => Some(*delay),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(delay, Duration::from_secs(45));
+    }
+
+    #[test]
     fn retryable_errors_are_retried_until_they_succeed() {
         // Two "Model busy" 429s, then the real answer.
         let handler = Box::new(MockHandler::flaky(
@@ -1556,6 +1590,13 @@ mod tests {
         assert_eq!(
             retry_delay(3, Some(Duration::from_millis(100))),
             Duration::from_nanos(781_250_000)
+        );
+        // A hint longer than the cap is honored as-is: the server's
+        // Retry-After is an instruction, not a suggestion to be clamped
+        // (knocking sooner just burns an attempt on another rejection).
+        assert_eq!(
+            retry_delay(1, Some(Duration::from_secs(120))),
+            Duration::from_secs(120)
         );
     }
 }
