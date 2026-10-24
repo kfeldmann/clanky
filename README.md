@@ -398,7 +398,9 @@ authorize URL, you open it anywhere, and paste the code back. Credentials
 live in `~/.clanky/providers/anthropic/credentials.json` (0600) and are
 refreshed automatically before expiry. The refresh token is finite and
 rotates on every refresh — when it expires (weeks later), requests start
-failing with an actionable `auth` error and you re-run `login`.
+failing with an actionable `auth` error and you re-run `login`. Re-running
+`login` works while Clanky is up: the next request picks up the fresh
+credentials, no restart needed.
 
 **API key (if your account has one):**
 

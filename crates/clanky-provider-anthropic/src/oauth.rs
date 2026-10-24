@@ -177,8 +177,54 @@ pub enum OAuthError {
     Malformed(String),
 }
 
-/// POST the token endpoint with a JSON body.
-pub fn post_token_request(body: &str) -> Result<String, OAuthError> {
+#[cfg(test)]
+pub(crate) mod cache_test_hooks {
+    // Test-only hook: refresh POSTs are served a canned token-endpoint
+    // response instead of the network, so `provider::tests` can exercise
+    // the credential cache without an HTTP round trip. Production code is
+    // untouched.
+
+    use std::sync::Mutex;
+
+    /// The canned response while armed: `Ok(body)` on success,
+    /// `Err((status, body))` on an HTTP error status.
+    pub(crate) static CANNED: Mutex<Option<Result<String, (u16, String)>>> = Mutex::new(None);
+
+    /// Begin serving `canned` from refresh POSTs; an `Err` status serves
+    /// the canned `invalid_grant` error body. Subsequent tests must reset
+    /// the hooks.
+    pub fn arm(canned: Result<&str, u16>) {
+        let canned = canned.map(str::to_string).map_err(|status| {
+            (
+                status,
+                r#"{"error":"invalid_grant","error_description":"test canned"}"#.to_string(),
+            )
+        });
+        *CANNED.lock().unwrap() = Some(canned);
+    }
+
+    /// Tear the hooks down: every later refresh POST fails loudly rather
+    /// than silently hitting the network from a test.
+    pub fn disarm() {
+        *CANNED.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+fn post_token_request(_body: &str) -> Result<String, OAuthError> {
+    let canned = cache_test_hooks::CANNED.lock().unwrap().clone();
+    match canned {
+        Some(Ok(body)) => Ok(body),
+        Some(Err((status, body))) => Err(OAuthError::Http { status, body }),
+        // Not armed: refuse to hit the network from a test.
+        None => Err(OAuthError::Network(
+            "oauth cache_test_hooks not armed: refusing to hit the network".into(),
+        )),
+    }
+}
+
+#[cfg(not(test))]
+fn post_token_request(body: &str) -> Result<String, OAuthError> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(60))

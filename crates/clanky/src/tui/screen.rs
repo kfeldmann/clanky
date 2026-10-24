@@ -558,9 +558,7 @@ fn footer_lines(
     lines.extend(input.lines);
     Footer {
         lines,
-        caret: modal_caret
-            .map(|col| (0, col))
-            .or_else(|| input.caret.map(|(row, col)| (input_start + row, col))),
+        caret: modal_caret.or_else(|| input.caret.map(|(row, col)| (input_start + row, col))),
     }
 }
 
@@ -1027,12 +1025,12 @@ fn completion_box(completion: &CompletionState, width: u16, height: u16) -> Vec<
 }
 
 /// The text-entry modal: a prompt row and the field being typed, windowed
-/// so the caret stays visible. Returns the box rows and the caret column
-/// within them (the box may be skipped on a tiny terminal, in which case
-/// the caller keeps the main input caret).
-fn modal_box(modal: &Modal, width: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+/// so the caret stays visible. Returns the box rows plus the caret's
+/// (row, column) within them (the box may be skipped on a tiny terminal,
+/// in which case the caller keeps the main input caret).
+fn modal_box(modal: &Modal, width: u16, height: u16) -> (Vec<Line<'static>>, (usize, u16)) {
     if width < 24 || height < 8 {
-        return (Vec::new(), 0);
+        return (Vec::new(), (0, 0));
     }
     let title = format!(" {} ", modal.title());
     let prompt = Line::from(Span::styled(
@@ -1043,8 +1041,14 @@ fn modal_box(modal: &Modal, width: u16, height: u16) -> (Vec<Line<'static>>, u16
     // it can never widen it) and window the field to that inner width.
     let inner = box_width(title.width(), line_width(&prompt), width) - 4;
     let (field, caret_col) = input_window(&modal.input, Some(modal.cursor), inner);
+    // Rows: top border, prompt, field, bottom border — the caret lives on
+    // the field row, the second row inside the box.
     let rows = vec![prompt, Line::from(field)];
-    (boxed(&title, rows, width), 2 + caret_col as u16)
+    let field_row = 2;
+    (
+        boxed(&title, rows, width),
+        (field_row, 2 + caret_col as u16),
+    )
 }
 
 /// The box width for a title and content of the given widths: wide enough
@@ -2706,7 +2710,7 @@ mod tests {
     #[test]
     fn modal_box_shows_the_prompt_and_the_field() {
         let modal = Modal::new("export markdown", "file name", "notes.md");
-        let (rows, caret) = modal_box(&modal, 60, 20);
+        let (rows, (caret_row, caret_col)) = modal_box(&modal, 60, 20);
         let texts: Vec<String> = rows
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
@@ -2716,8 +2720,10 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("file name")), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("notes.md")), "{texts:?}");
         assert!(texts[texts.len() - 1].starts_with('╰'));
-        // Caret column: border + padding, then the field text.
-        assert_eq!(caret, 2 + "notes.md".len() as u16);
+        // Caret position: on the field row (top border, prompt, field), at
+        // border + padding, then the field text.
+        assert_eq!(caret_row, 2);
+        assert_eq!(caret_col, 2 + "notes.md".len() as u16);
 
         // Every row is the same display width.
         let widths: Vec<usize> = rows.iter().map(line_width).collect();
@@ -2735,8 +2741,9 @@ mod tests {
     fn modal_box_windows_a_long_value_and_keeps_the_caret_inside() {
         let long = "x".repeat(200);
         let modal = Modal::new("export markdown", "file name", &long);
-        let (rows, caret) = modal_box(&modal, 40, 20);
+        let (rows, (caret_row, caret)) = modal_box(&modal, 40, 20);
         assert!(!rows.is_empty());
+        assert_eq!(caret_row, 2, "the caret sits on the field row");
         assert!((2..40).contains(&caret), "caret inside the box: {caret}");
         assert!(
             rows.iter().all(|l| line_width(l) <= 40),

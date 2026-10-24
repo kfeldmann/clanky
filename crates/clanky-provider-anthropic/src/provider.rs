@@ -73,11 +73,20 @@ pub struct AnthropicProvider<B: crate::backend::Backend> {
     /// cancel stops generation at the next event boundary. A cancel during a
     /// single blocked read is covered by the client's kill fallback.
     cancel: CancelFlag,
-    /// Credentials loaded lazily (they may have been written by `login`
-    /// after this process started) and refreshed on expiry. `None` until the
-    /// first successful load; `Some(Err)` caches the failure so every
-    /// request surfaces the same actionable error.
+    /// The *loaded* failure, if the last load found no usable credentials
+    /// (`Some(Err)`): a failed load is not re-attempted per request, but
+    /// it is cheap to re-check the disk store for a later `login` (see
+    /// `current_credentials`). Live credentials live in
+    /// `session_credentials` instead, so the disk stays authoritative.
     credentials: RefCell<Option<Result<Credentials, Error>>>,
+    /// Live credentials obtained this process (a fresh load or a
+    /// successful in-place refresh); checked before the disk. Always
+    /// unexpired — every past-expiry reload goes back to the disk.
+    session_credentials: RefCell<Option<Credentials>>,
+    /// Test-only introspection (set by `provider::tests`): the refresh
+    /// tokens `oauth::refresh` was called with, in order.
+    #[cfg(test)]
+    refresh_tokens_offered: Option<std::rc::Rc<RefCell<Vec<String>>>>,
     /// Credential source (defaults to the on-disk store; injectable in
     /// tests). `None` models "no usable credentials".
     loader: CredentialLoader,
@@ -119,6 +128,9 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
             loader: Box::new(auth::load),
             key_loader: Box::new(load_api_key),
             credentials: RefCell::new(None),
+            session_credentials: RefCell::new(None),
+            #[cfg(test)]
+            refresh_tokens_offered: None,
             saver: Box::new(|creds| {
                 if let Err(err) = auth::store(creds) {
                     eprintln!(
@@ -158,40 +170,64 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
     }
 
     /// Current request auth: the API key if set, else the OAuth store
-    /// (refreshing past-expiry tokens in place). The `Some(Err)` cache means
-    /// "login expired" is not re-attempted per turn.
+    /// (refreshing past-expiry tokens in place). A failed load is cached
+    /// (not re-attempted per request) until the disk store changes or a
+    /// key is set — see `current_credentials`.
     fn current_auth(&self) -> Result<AuthMode, Error> {
         // The key wins: an explicitly set env var is the user's choice.
         if let Some(key) = (self.key_loader)() {
+            // The key's arrival resets any cached "no usable credentials"
+            // failure: when the key is later unset, the next OAuth-path
+            // request reloads from scratch instead of repeating the old one.
+            *self.credentials.borrow_mut() = None;
             return Ok(AuthMode::ApiKey(key));
         }
         self.current_credentials().map(AuthMode::Bearer)
     }
 
-    /// Current OAuth credentials, refreshing past-expiry ones in place. The
-    /// `Some(Err)` cache means "login expired" is not re-attempted per turn.
+    /// Current OAuth credentials: the in-process ones if live, else a
+    /// (re)load from disk — refreshing past-expiry tokens in place. A
+    /// failed load is cached until the disk store changes (a `login`
+    /// while Clanky runs) or a key is set — see `current_auth`.
     fn current_credentials(&self) -> Result<Credentials, Error> {
-        // A cached failure ("login expired") short-circuits every request.
-        let cached_err = match self.credentials.borrow().as_ref() {
-            Some(Err(err)) => Some(reissue_error(err)),
-            _ => None,
-        };
-        if let Some(err) = cached_err {
-            return Err(err);
+        // In-process credentials first: they may be fresher than the disk
+        // (a token refreshed in this process, persisted best-effort). They
+        // are always live — every past-expiry refresh reloads from disk.
+        if let Some(creds) = self.session_credentials.borrow().as_ref() {
+            return Ok(creds.clone());
         }
-        if let Some(Ok(creds)) = self
+        // A cached failure means "the load ran and found no usable
+        // credentials" — the per-request cost (one token-endpoint POST) is
+        // already paid, so it is not repeated per request. But the failure
+        // goes stale when the disk store changes: `login` succeeding while
+        // Clanky runs is a documented workflow. A cheap disk read (no
+        // network) checks for that: fresh on-disk credentials replace the
+        // cached failure; an unchanged store repeats the cached error
+        // without paying for another refresh attempt.
+        let cached_err = self
             .credentials
             .borrow()
             .as_ref()
-            .filter(|c| creds_fresh(c))
-        {
-            return Ok(creds.clone());
+            .and_then(|c| c.as_ref().err().map(reissue_error));
+        if let Some(err) = cached_err {
+            if let Some(creds) = (self.loader)()
+                && !creds.expired()
+            {
+                *self.credentials.borrow_mut() = None;
+                *self.session_credentials.borrow_mut() = Some(creds.clone());
+                return Ok(creds);
+            }
+            return Err(err);
         }
         // Otherwise (re)load: `login` may have written credentials after
         // this process started, or the cached token has since expired.
         match self.load_and_refresh() {
             Ok(creds) => {
-                *self.credentials.borrow_mut() = Some(Ok(creds.clone()));
+                // Live credentials live in `session_credentials` until they
+                // expire; the next (past-expiry) request reloads from disk
+                // and refreshes there, keeping the disk authoritative.
+                *self.credentials.borrow_mut() = None;
+                *self.session_credentials.borrow_mut() = Some(creds.clone());
                 Ok(creds)
             }
             Err(err) => {
@@ -213,6 +249,8 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
 
     /// Refresh via the token endpoint and persist the rotated credentials.
     fn refresh(&self, stale: &Credentials) -> Result<Credentials, Error> {
+        #[cfg(test)]
+        self.record_refresh(&stale.refresh_token);
         let response = oauth::refresh(&stale.refresh_token).map_err(map_oauth_error)?;
         let creds = Credentials {
             access_token: response.access_token,
@@ -225,14 +263,17 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
         // Non-fatal persistence: the turn proceeds with the in-memory
         // token; the next process pays for one extra refresh.
         (self.saver)(&creds);
-        *self.credentials.borrow_mut() = Some(Ok(creds.clone()));
         Ok(creds)
     }
-}
 
-/// Whether a cached credential entry is a live (unexpired) token.
-fn creds_fresh(entry: &Result<Credentials, Error>) -> bool {
-    matches!(entry, Ok(creds) if !creds.expired())
+    /// Test-only hook: record the refresh token about to be offered to the
+    /// token endpoint (used by `provider::tests` to pin what rotates).
+    #[cfg(test)]
+    fn record_refresh(&self, refresh_token: &str) {
+        if let Some(offered) = self.refresh_tokens_offered.as_ref() {
+            offered.borrow_mut().push(refresh_token.to_string());
+        }
+    }
 }
 
 /// `clanky_protocol::Error` is not `Clone`; reissue a provider error.
@@ -538,6 +579,18 @@ mod tests {
     use clanky_protocol::{ChatMessage, ChunkPayload, Tool, Usage};
     use serde_json::json;
     use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Run `f` when the guard is dropped (test cleanup).
+    fn defer<F: FnMut()>(f: F) -> impl Drop {
+        struct Guard<F: FnMut()>(F);
+        impl<F: FnMut()> Drop for Guard<F> {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+        Guard(f)
+    }
 
     /// The spike's streaming captures, pinned in `tests/fixtures/`
     /// (one per shape: plain text, thinking, tool_use).
@@ -615,6 +668,7 @@ mod tests {
         > {
             assert!(
                 matches!(auth, AuthMode::Bearer(c) if c.access_token == "sk-ant-oat01-test")
+                    || matches!(auth, AuthMode::Bearer(c) if c.access_token == "sk-ant-oat01-fresh")
                     || matches!(auth, AuthMode::ApiKey(k) if k == "sk-ant-api03-test"),
                 "unexpected auth mode: {auth:?}"
             );
@@ -1132,6 +1186,111 @@ mod tests {
             }
             other => panic!("unexpected: {other}"),
         }
+    }
+
+    /// The README's live-relogin workflow: after the refresh token expires
+    /// (an `invalid_grant` from the token endpoint → "login expired"), a
+    /// `clanky-provider-anthropic login` *while Clanky is running* writes
+    /// fresh credentials to disk — the very next request must pick them up
+    /// without a restart, and the expired token is not re-offered to the
+    /// token endpoint.
+    #[test]
+    fn a_login_written_while_running_is_picked_up_on_the_next_request() {
+        oauth::cache_test_hooks::arm(Err(400));
+        let refreshes = |provider: &mut AnthropicProvider<MockBackend>| -> Vec<String> {
+            let offered = provider
+                .refresh_tokens_offered
+                .as_ref()
+                .expect("test set refresh_tokens_offered")
+                .borrow()
+                .clone();
+            oauth::cache_test_hooks::disarm();
+            offered
+        };
+        let _guard = defer(|| {
+            oauth::cache_test_hooks::disarm();
+        });
+
+        // Expired credentials on disk (as after ~8h of access-token life,
+        // past the refresh token's own lifetime).
+        let expired = |refresh_token: &str| Credentials {
+            access_token: "stale".into(),
+            refresh_token: refresh_token.into(),
+            expires_at: auth::now_ms() - 1_000,
+            refresh_token_expires_at: None,
+        };
+        let live = |token: &str| Credentials {
+            access_token: token.into(),
+            refresh_token: "on-disk".into(),
+            expires_at: auth::now_ms() + 3_600_000,
+            refresh_token_expires_at: None,
+        };
+        // The disk store starts expired; the loader reads whatever is on
+        // disk at call time (like the real on-disk store).
+        let disk: Rc<RefCell<Option<Credentials>>> = Rc::new(RefCell::new(Some(expired("r0"))));
+        let offered: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let read_disk = Rc::clone(&disk);
+        let write_disk = Rc::clone(&disk);
+        let mut provider = AnthropicProvider::new(
+            MockBackend {
+                sse: payloads(STREAM_BASIC),
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_api_key(Box::new(|| None))
+        .with_credentials(
+            Box::new(move || read_disk.borrow().clone()),
+            Box::new(move |c| *write_disk.borrow_mut() = Some(c.clone())),
+        );
+        provider.refresh_tokens_offered = Some(offered.clone());
+
+        // Turn 1: the refresh with the stale token fails — the error is
+        // the actionable one, and no credentials get cached as usable.
+        let err = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap_err();
+        match &err {
+            Error::Provider { code, message, .. } => {
+                assert_eq!(*code, ErrorCode::Auth);
+                assert_eq!(
+                    message,
+                    "login expired — run `clanky-provider-anthropic login`"
+                );
+            }
+            other => panic!("unexpected: {other}"),
+        }
+        assert_eq!(offered.borrow().as_slice(), ["r0"]);
+
+        // The user runs `login` (fresh credentials land on disk).
+        *disk.borrow_mut() = Some(live("sk-ant-oat01-fresh"));
+
+        // Turn 2, same process: the fresh store is picked up; the stale
+        // refresh token is not offered again and no refresh happens at all.
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &request(
+                "claude-haiku-4-5-20251001",
+                vec![ChatMessage::user("list 5 numbers")],
+            ),
+        );
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "1,2,3,4,5");
+        assert_eq!(done.unwrap().finish_reason, FinishReason::Stop);
+        assert_eq!(
+            refreshes(&mut provider),
+            vec!["r0".to_string()],
+            "only the first turn's stale token reached the token endpoint"
+        );
     }
 
     // --- error mapping ---------------------------------------------------

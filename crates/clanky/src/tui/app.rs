@@ -688,6 +688,10 @@ impl App {
         let cleaned: String = text.chars().filter(|&c| c != '\r').collect();
         self.input.insert_str(self.cursor, &cleaned);
         self.cursor += cleaned.len();
+        // The paste may have landed inside (or shifted) the completed
+        // token: the popup's prefix/suffix no longer describe `input`, so
+        // cycling on the next Tab would overwrite the pasted text.
+        self.completion = None;
     }
 
     pub fn backspace(&mut self) {
