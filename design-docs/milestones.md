@@ -1063,3 +1063,32 @@ will handle the live testing.
   `tests/golden/view-image-tool.json`, and an integration test that an
   image-carrying turn survives save/reload with the image re-attached
   (`tests/sessions.rs`).
+
+Later fixes (code review, post-M20):
+- **Bash tool: a backgrounded grandchild could wedge a call with *no* deadline**
+  (`crates/clanky/src/tools.rs`). With the default (unset) deadline the reader
+  joins took the plain-`join()` branch, so `sleep 30 & echo ok` — the direct
+  child exits, a grandchild holds the stdout pipe — hung the tool call
+  forever: the process-group kill machinery was only armed when a deadline
+  existed. Now the reader-join loop always carries its own `JOIN_GRACE`
+  grace window independent of the deadline, ending in a TERM/KILL of the
+  group plus a short `KILL_FLUSH` pass that lets the readers observe EOF and
+  hand over what they captured (so the output is not discarded — without
+  that flush `sleep 30 & echo ok` returned "(no output)"). The
+  `join_with_deadline` signature drops the deadline parameter; the wait
+  loop's deadline logic is unchanged.
+- **Process transport: a malformed line from a live plugin is skipped, not
+  fatal** (`crates/clanky-protocol/src/process.rs`). The client-side reader
+  used to surface a parse `Err` as a terminal item in the response stream,
+  aborting the in-flight turn — asymmetric with `serve`, where the *plugin*
+  side ignores malformed lines per spec §9. Now the client reader ignores
+  them too (`Err(_) => {}`), matching the unknown-type handling. Framing was
+  never actually at risk (the reader is line-buffered), but one glitchy
+  line should not kill the session. Test:
+  `a_malformed_line_from_a_live_plugin_is_skipped_not_fatal`.
+- **`is_failed_result` no longer misreads a quoted marker** (`crates/clanky/
+  src/tools.rs`). It matched `output.contains("[exit status: ")`, so any
+  successful tool whose output merely *mentioned* the marker (a `cat` of a
+  session transcript, a review quoting it) was classified as failed. It now
+  checks only that the output's final line starts with `[exit status: ` and
+  ends with `]` — the exact shape `BashTool::format` emits as the last line.

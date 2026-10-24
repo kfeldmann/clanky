@@ -4,13 +4,11 @@
 //! ASCII chars, well inside the 43–128 range §4.1 requires). The challenge
 //! is BASE64URL(SHA256(verifier)).
 //!
-//! `getrandom` is not pulled in; the generator draws entropy from
-//! `RandomState` (per-process OS seed + per-instance counter, the same
-//! source `HashMap` relies on to resist HashDoS), mixed with a counter and
-//! the clock, and rehashed.
+//! Verifier bytes come straight from the OS CSPRNG via `getrandom`
+//! (RFC 7636 §4.1 and the OAuth BCP require CSPRNG-strength verifiers);
+//! no hash mixing or clock/counter entropy is layered on top.
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
+use getrandom::getrandom;
 
 /// A generated PKCE pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,28 +32,13 @@ pub fn challenge_of(verifier: &str) -> String {
     base64url(&sha256(verifier.as_bytes()))
 }
 
-/// Draw `n` pseudo-random bytes. `RandomState::new()` reads the process-lazy
-/// OS seed and mixes in a per-instance counter, so two instances differ;
-/// successive draws are independent, and each process gets a fresh OS seed.
+/// Draw `n` bytes from the OS CSPRNG (via `getrandom`). Verifiers are
+/// security material, so this is a hard failure rather than a fallback to
+/// weaker entropy.
 fn random_bytes(n: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(n);
-    while out.len() < n {
-        let h1 = RandomState::new().build_hasher();
-        let mut h2 = RandomState::new().build_hasher();
-        h2.write_u128(now_nanos());
-        h2.write_u64(out.len() as u64);
-        out.extend_from_slice(&h1.finish().to_ne_bytes());
-        out.extend_from_slice(&h2.finish().to_ne_bytes());
-    }
-    out.truncate(n);
+    let mut out = vec![0u8; n];
+    getrandom(&mut out).expect("OS CSPRNG unavailable while generating a PKCE verifier");
     out
-}
-
-fn now_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
 }
 
 /// Base64url without padding.

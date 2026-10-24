@@ -253,17 +253,14 @@ pub fn extract_error(body: &str) -> String {
     body.to_string()
 }
 
+/// Parse a 2xx token-endpoint response body. On failure the raw body is
+/// deliberately *not* embedded in the error: a misbehaving or hostile
+/// endpoint can answer 200 with anything (an HTML login page, a partial
+/// body echoing the request), and echoing it here would leak
+/// access/refresh tokens into logs and session files. Report the serde
+/// error alone, which identifies the break without quoting the payload.
 fn parse_token_body(body: String) -> Result<TokenResponse, OAuthError> {
-    serde_json::from_str(&body)
-        .map_err(|e| OAuthError::Malformed(format!("{e}: {}", truncate(&body))))
-}
-
-fn truncate(text: &str) -> String {
-    if text.chars().count() <= 200 {
-        text.to_string()
-    } else {
-        text.chars().take(200).collect()
-    }
+    serde_json::from_str(&body).map_err(|e| OAuthError::Malformed(e.to_string()))
 }
 
 /// Run the interactive headless login: print the authorize URL, read the

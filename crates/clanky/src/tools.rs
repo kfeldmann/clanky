@@ -258,13 +258,16 @@ impl BashTool {
         };
 
         // Killing the group closes the pipes, so the readers finish even
-        // on timeout. The joins are still deadline-aware: a backgrounded
+        // on timeout. The joins still carry their own grace: a backgrounded
         // grandchild can outlive the direct child holding a pipe (the
-        // direct child exited before the deadline, `kill -KILL` missed
-        // because the child was not in our group, ...) — whatever
-        // slipped through must not wedge the call past its deadline.
-        let (stdout, stderr) =
-            join_with_deadline([stdout_reader, stderr_reader], deadline, child.id());
+        // direct child exited, `kill -KILL` missed because the child was
+        // not in our group, ...) — whatever slipped through must not
+        // wedge the call past its deadline.
+        // That hold-up is not a timeout phenomenon, though: with *no*
+        // deadline (`sleep 5 & echo ok` is legal and unbounded) the same
+        // backgrounded writer would hang a plain `join` forever, so the
+        // group-kill fallback runs on the reader loop, not the wait loop.
+        let (stdout, stderr) = join_with_deadline([stdout_reader, stderr_reader], child.id());
         let status = status.map_err(|message| ToolError::Failed {
             tool: "bash".into(),
             message,
@@ -562,26 +565,63 @@ fn replace_subsequence(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> (V
 /// giving up on an escaped writer and returning what was captured.
 const JOIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Join the output reader threads, but never past `deadline` (plus
-/// [`JOIN_GRACE`]): a writer that slipped through every kill — typically
-/// a backgrounded grandchild that outlived the direct child — would
-/// otherwise wedge the tool call indefinitely. On grace expiry the
-/// group is signalled once more (TERM, then KILL) and whatever was
-/// captured is returned; the stuck reader threads stay detached and die
-/// with the process.
+/// After the final group kill, how long the readers may take to observe
+/// EOF and hand over what they captured before the call returns.
+const KILL_FLUSH: Duration = Duration::from_millis(1_000);
+
+/// Join the output reader threads, but never past [`JOIN_GRACE`]: a writer
+/// that outlived the direct child — typically a backgrounded grandchild
+/// (`sleep 5 & echo ok`) holding one of the pipes — would otherwise wedge
+/// the tool call indefinitely, *deadline or no deadline*: with no deadline
+/// configured this used to be a plain `join` and hung forever. On grace
+/// expiry the group is signalled once more (TERM, then KILL) and whatever
+/// was captured is returned; the stuck reader threads stay detached and
+/// die with the process.
 fn join_with_deadline(
     readers: [std::thread::JoinHandle<Vec<u8>>; 2],
-    deadline: Option<Instant>,
     pgid: u32,
 ) -> (Vec<u8>, Vec<u8>) {
     let mut outputs = (Vec::new(), Vec::new());
     let mut pending: Vec<(usize, std::thread::JoinHandle<Vec<u8>>)> =
         readers.into_iter().enumerate().collect();
-    let Some(deadline) = deadline else {
-        // Unbounded command: the pipes close when the child tree exits;
-        // a plain join is the honest wait.
-        pending.sort_by_key(|(index, _)| *index);
-        for (index, reader) in pending.drain(..) {
+    let grace_end = Instant::now() + JOIN_GRACE;
+    while !pending.is_empty() {
+        if Instant::now() >= grace_end {
+            // Last resort: the group survived TERM+KILL (or the writer
+            // daemonized into another group). Kill it once more, then give
+            // the readers a moment to observe EOF and finish: the kill
+            // closes the pipes, so the captured output lands in the very
+            // last polling pass below instead of being discarded.
+            #[cfg(unix)]
+            {
+                let _ = kill_process_group(pgid, "TERM");
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = kill_process_group(pgid, "KILL");
+            }
+            let flush = Instant::now() + KILL_FLUSH;
+            while Instant::now() < flush {
+                collect_finished(&mut pending, &mut outputs);
+                if pending.is_empty() {
+                    return outputs;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        collect_finished(&mut pending, &mut outputs);
+    }
+    outputs
+}
+
+/// Move any finished reader's bytes into `outputs`.
+fn collect_finished(
+    pending: &mut Vec<(usize, std::thread::JoinHandle<Vec<u8>>)>,
+    outputs: &mut (Vec<u8>, Vec<u8>),
+) {
+    for i in (0..pending.len()).rev() {
+        if pending[i].1.is_finished() {
+            let (index, reader) = pending.swap_remove(i);
             let bytes = reader.join().unwrap_or_default();
             if index == 0 {
                 outputs.0 = bytes;
@@ -589,36 +629,7 @@ fn join_with_deadline(
                 outputs.1 = bytes;
             }
         }
-        return outputs;
-    };
-    let grace_end = deadline + JOIN_GRACE;
-    while !pending.is_empty() {
-        if Instant::now() >= grace_end {
-            // Last resort: the group survived TERM+KILL (or the writer
-            // daemonized into another group). Return what was captured;
-            // the detached readers can no longer wedge anything.
-            #[cfg(unix)]
-            {
-                let _ = kill_process_group(pgid, "TERM");
-                std::thread::sleep(Duration::from_millis(100));
-                let _ = kill_process_group(pgid, "KILL");
-            }
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-        for i in (0..pending.len()).rev() {
-            if pending[i].1.is_finished() {
-                let (index, reader) = pending.swap_remove(i);
-                let bytes = reader.join().unwrap_or_default();
-                if index == 0 {
-                    outputs.0 = bytes;
-                } else {
-                    outputs.1 = bytes;
-                }
-            }
-        }
     }
-    outputs
 }
 
 /// Signal a command's whole process group by running `kill -<SIG> -PGID`
@@ -663,11 +674,18 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 /// Whether a tool result reports a failure. Bash embeds an exit-status
-/// marker on a non-zero status (see `BashTool::format`), and the agentic
-/// loop prefixes `ERROR:` when the call itself fails (unknown tool,
-/// malformed arguments, timeout, interruption).
+/// marker as the *final line* on a non-zero status (see `BashTool::format`),
+/// and the agentic loop prefixes `ERROR:` when the call itself fails
+/// (unknown tool, malformed arguments, timeout, interruption). The marker
+/// is matched only as an exact final line so a successful tool whose
+/// output merely *mentions* it (a `cat` of a session transcript, a review
+/// quoting the marker) is not misclassified as failed.
 pub fn is_failed_result(output: &str) -> bool {
-    output.starts_with("ERROR:") || output.contains("[exit status: ")
+    output.starts_with("ERROR:")
+        || output
+            .lines()
+            .next_back()
+            .is_some_and(|line| line.starts_with("[exit status: ") && line.ends_with(']'))
 }
 
 /// Default number of output lines shown when previewing a tool result for
@@ -786,6 +804,19 @@ mod tests {
         assert!(is_failed_result("out\n[exit status: 1]"));
         assert!(is_failed_result("[exit status: 143]"));
         assert!(is_failed_result("ERROR: unknown tool: nope"));
+    }
+
+    #[test]
+    fn failure_detection_ignores_a_mentioned_marker() {
+        // A successful tool whose output merely echoes the marker (a `cat`
+        // of a transcript, a review quoting it) must not read as failed:
+        // only the exact final line counts.
+        assert!(!is_failed_result(
+            "[exit status: 1] was the last error\nall good"
+        ));
+        assert!(!is_failed_result(
+            "review: the result ended in [exit status: 2]"
+        ));
     }
 
     #[test]
@@ -971,6 +1002,28 @@ mod tests {
             }))
             .unwrap_err();
         assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "returned promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn no_deadline_still_returns_when_a_grandchild_holds_the_pipe() {
+        // Third wedge, and the one that hits the *default* configuration:
+        // no timeout configured, the direct child exits, and a backgrounded
+        // grandchild holds the stdout pipe (`sleep 5 & echo ok`). The wait
+        // loop finishes, but a plain reader join would block until the
+        // grandchild exits — indefinitely, since there is no deadline to
+        // arm the kill. The reader loop must reap the group itself.
+        let tool = BashTool::default(); // no timeout: unbounded
+        let started = Instant::now();
+        let output = tool
+            .execute(&json!({"command": "sleep 30 & echo ok"}))
+            .unwrap()
+            .text;
+        assert_eq!(output, "ok");
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "returned promptly, took {:?}",

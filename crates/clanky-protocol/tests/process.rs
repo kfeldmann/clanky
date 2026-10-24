@@ -310,6 +310,42 @@ on_cancel() {{ :; }}
 }
 
 #[test]
+fn a_malformed_line_from_a_live_plugin_is_skipped_not_fatal() {
+    // One glitchy line mid-stream must not abort the turn (it used to
+    // surface as a terminal `Err`, ending the request). The plugin stays
+    // alive and the very next request still works.
+    let mut transport = spawn(
+        "glitch",
+        &format!(
+            r#"
+on_chat() {{
+  printf 'this is not json\n'
+  printf '{{"type":"chunk","requestId":%s,"payload":{{"kind":"text","text":"A"}}}}\n' "$1"
+  printf '{{"broken\n'
+  printf '{{"type":"done","requestId":%s,"finishReason":"stop"}}\n' "$1"
+}}
+on_cancel() {{ :; }}
+{LOOP}
+"#
+        ),
+    );
+    let mut sink = |_: ChunkPayload| {};
+    let responses: Vec<Message> = transport
+        .send(chat(1), &mut sink)
+        .unwrap()
+        .map(|m| m.unwrap())
+        .collect();
+    assert!(matches!(responses.last(), Some(Message::Done { .. })));
+    // The transport is still healthy: another request round-trips.
+    let again: Vec<Message> = transport
+        .send(chat(2), &mut sink)
+        .unwrap()
+        .map(|m| m.unwrap())
+        .collect();
+    assert!(matches!(again.last(), Some(Message::Done { .. })));
+}
+
+#[test]
 fn a_clean_shutdown_closes_stdin_and_reaps_the_child() {
     // The plugin exits on stdin EOF by itself (spec §1); shutdown must not
     // need to kill it.

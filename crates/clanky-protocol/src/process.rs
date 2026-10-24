@@ -266,11 +266,14 @@ impl ProcessTransport {
                                 break;
                             }
                         }
-                        Err(err) => {
-                            if tx.send(Err(err)).is_err() {
-                                break;
-                            }
-                        }
+                        // Malformed lines are ignored, not fatal (spec §9:
+                        // the same leniency `serve` shows its plugin peer).
+                        // A strict parse would abort the in-flight turn and
+                        // desync nothing later — the reader is line-framed —
+                        // but one glitchy line (e.g. a stray stderr bleed on
+                        // a misconfigured plugin) should never kill the
+                        // session when unknown *types* are merely skipped.
+                        Err(_) => {}
                     }
                 }
                 // Dropping `tx` here signals EOF / exit to the iterator.

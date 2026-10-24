@@ -135,6 +135,7 @@ version = "0.1.0"
 dependencies = [
  "clanky-protocol",
  "dirs",
+ "getrandom",
  "serde",
  "serde_json",
  "thiserror",
