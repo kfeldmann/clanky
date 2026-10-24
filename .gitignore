@@ -1,5 +1,6 @@
 /target
 .clanky/
+__pycache__/
 
 # docker
 /.cargo-cache/
