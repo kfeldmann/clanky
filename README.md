@@ -424,15 +424,23 @@ clanky --provider anthropic -p "say hi"
 ```
 
 An explicitly set key wins over stored credentials (your choice, not the
-program's). The key path sends the documented `x-api-key` headers; the
-OAuth path sends bearer headers and identifies as Claude Code. Everything
-else — streaming, tools, thinking — is identical through both.
+program's). The key path sends the documented `x-api-key` headers and your
+system prompts as-is; the OAuth path sends bearer headers, identifies as
+Claude Code (the identity system block is prepended to your system
+prompts), and is the only surface that needs that. Everything else —
+streaming, tools, thinking — is identical through both.
 
 Streaming is the default. Setting `stream = false` in your `sampling`
 config takes the non-streaming path end to end: the request goes out with
 `stream: false`, the whole response body is read at once, and it is
 translated into the same streamed chunks every other provider emits —
 so nothing downstream changes, only the wire shape to the API.
+
+Long turns that Anthropic interrupts server-side (`pause_turn` stop
+reason) resume automatically: the partial response is sent back as-is and
+the request repeated, per Anthropic's continuation contract, until the
+turn really finishes — the same round cap that bounds tool-call loops
+bounds a runaway continuation.
 
 Notes:
 

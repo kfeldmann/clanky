@@ -266,7 +266,13 @@ pub fn run_turn_with<T: Transport>(
             thinking: round_thinking,
             calls: calls.clone(),
         });
-        if let Some(usage) = done.usage {
+        // A `Continuable` round's usage is not billed: its tokens ride the
+        // next request (the partial response is sent back) and the provider
+        // reports them again, cumulatively, in the round that finishes.
+        if let Some(usage) = done
+            .usage
+            .filter(|_| done.finish_reason != FinishReason::Continuable)
+        {
             usage_seen = true;
             on_event(TurnEvent::Usage { usage });
             usage_total.prompt_tokens =
@@ -280,6 +286,23 @@ pub fn run_turn_with<T: Transport>(
 
         let calls = assembler.tool_calls();
         if done.finish_reason != FinishReason::ToolCalls || calls.is_empty() {
+            // Provider-reported continuation (Anthropic `pause_turn`): the
+            // round was interrupted server-side before it finished, and the
+            // provider's documented resume is to send the partial response
+            // back and request again. Push the partial text as a normal
+            // assistant message, drop the round's usage from the bill (the
+            // tokens ride the next request and come back cumulative), and
+            // re-enter the loop under the same round cap tool-call rounds
+            // answer to.
+            if done.finish_reason == FinishReason::Continuable {
+                if !round_text.is_empty() {
+                    messages.push(ChatMessage::Assistant {
+                        content: round_text,
+                        tool_calls: None,
+                    });
+                }
+                continue;
+            }
             // The final plain-text round is part of the conversation too.
             messages.push(ChatMessage::Assistant {
                 content: round_text,
@@ -789,6 +812,123 @@ mod tests {
                 usage_event(3, 2),
             ]
         );
+    }
+
+    #[test]
+    fn a_continuable_round_resumes_until_the_turn_really_finishes() {
+        // A provider-reported continuation (Anthropic `pause_turn`): the
+        // partial round is kept in the conversation and the loop re-enters
+        // immediately — the final done is the turn's real finish, with the
+        // continuation rounds' usage left out (the provider reports usage
+        // cumulatively across the continuation).
+        let handler = Box::new(MockHandler::scripted(vec![
+            ScriptedTurn {
+                chunks: vec![ChunkPayload::Text {
+                    text: "half ".into(),
+                }],
+                finish_reason: FinishReason::Continuable,
+                usage: Some(Usage {
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(5),
+                    cached_tokens: None,
+                }),
+            },
+            ScriptedTurn {
+                chunks: vec![ChunkPayload::Text {
+                    text: "answer".into(),
+                }],
+                finish_reason: FinishReason::Stop,
+                usage: Some(Usage {
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(9),
+                    cached_tokens: None,
+                }),
+            },
+        ]));
+        let (output, sink) = run(
+            handler,
+            &toolset(),
+            vec![],
+            "long answer",
+            &config("mock/model"),
+        );
+        let output = output.unwrap();
+        assert_eq!(output.text, "half answer");
+        assert_eq!(output.finish_reason, FinishReason::Stop);
+        // Only the finishing round's usage is billed — a `pause_turn`
+        // response's tokens ride the next request and come back cumulative.
+        assert_eq!(output.usage.and_then(|u| u.completion_tokens), Some(9));
+        // Both rounds were streamed and recorded as rounds.
+        let events = sink.into_inner();
+        assert!(matches!(
+            &events[0],
+            TurnEvent::Text { delta } if delta == "half "
+        ));
+        let rounds: Vec<&TurnEvent> = events
+            .iter()
+            .filter(|e| matches!(e, TurnEvent::Round { .. }))
+            .collect();
+        assert_eq!(rounds.len(), 2, "both rounds recorded");
+    }
+
+    #[test]
+    fn a_continuable_round_keeps_the_partial_text_in_the_conversation() {
+        // The resume request must carry the partial response back: the
+        // provider's continuation contract is "send what you got, ask
+        // again". The round text is a normal assistant message.
+        let handler = Box::new(MockHandler::scripted(vec![
+            ScriptedTurn {
+                chunks: vec![ChunkPayload::Text {
+                    text: "half".into(),
+                }],
+                finish_reason: FinishReason::Continuable,
+                usage: None,
+            },
+            text_turn("rest"),
+        ]));
+        let mut messages = vec![ChatMessage::system("Be terse."), ChatMessage::user("go")];
+        let output = run_turn(
+            handler,
+            &toolset(),
+            &mut messages,
+            &config("mock/model"),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(output.text, "halfrest");
+        assert_eq!(
+            messages.len(),
+            4,
+            "system, user, continuation round, final round"
+        );
+        assert!(
+            matches!(&messages[2], ChatMessage::Assistant { content, tool_calls: None } if content == "half"),
+            "the partial response went back as an assistant message: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn continuable_rounds_honor_the_tool_round_cap() {
+        // A runaway continuation is bounded by the same cap tool-call
+        // rounds answer to.
+        let handler = Box::new(MockHandler::scripted(
+            std::iter::repeat_with(|| ScriptedTurn {
+                chunks: vec![ChunkPayload::Text {
+                    text: "half".into(),
+                }],
+                finish_reason: FinishReason::Continuable,
+                usage: None,
+            })
+            .take(5)
+            .collect(),
+        ));
+        let cfg = TurnConfig {
+            max_tool_rounds: Some(3),
+            ..config("mock/model")
+        };
+        let (output, _) = run(handler, &toolset(), vec![], "keep pausing", &cfg);
+        let err = output.unwrap_err();
+        assert!(matches!(err, Error::ToolLoopLimit(3)), "{err}");
     }
 
     /// Records the `thinking` payload of every request it receives and

@@ -308,6 +308,16 @@ real tenant.
 - Done when: `clanky -p "count files in /tmp" --provider anthropic --model claude-haiku-4-5-20251001` runs
   bash and answers, streamed.
 
+  Later fix (code review): `pause_turn` no longer collapses into a plain
+  stop. The protocol gained a `FinishReason::Continuable` ("turn
+  interrupted server-side; resume by sending the partial response back
+  and requesting again" — Anthropic's documented `pause_turn` contract),
+  the adapter maps it, and the turn loop resumes automatically: the
+  partial round's text goes back as a normal assistant message, its
+  usage is not billed (the next request re-reports it, cumulatively), and
+  the same round cap that bounds tool-call loops bounds a runaway
+  continuation. DeepInfra/LiteLLM have no such concept and never emit it.
+
 ### ✔ M11c — API-key fallback + polish
 - `x-api-key` request mode beside bearer (the two auth modes differ only in
   headers) — covers any tenant/user that *does* have a key
@@ -345,6 +355,20 @@ real tenant.
   and `response_to_events` are live code again; HTTP-status and in-body
   (`{"type":"error",...}`) failures map through the same error mapping as
   the streaming path.
+
+  Later fixes (code review, together with the M11b `pause_turn` note):
+  the Claude Code identity system block is now prepended on the OAuth
+  path only — `build_request_body` takes an `adapter::Identity` derived
+  from the request's `AuthMode`, matching the header split in
+  `apply_auth`; the key path sends the user's system prompts as-is (it is
+  the documented plain third-party surface, not a stand-in for real
+  Clanky identity). The token-endpoint refresh error mapping matches
+  `invalid_grant` exactly (the documented "refresh token expired/rotated"
+  code) instead of the bare substring "invalid", so other 400/401 errors
+  (e.g. `invalid_client`, which a re-login cannot fix) surface verbatim
+  with their status. And the backend parses HTTP-date `Retry-After`
+  values the same way the DeepInfra/LiteLLM backends do (delay-seconds or
+  IMF-fixdate, negative/past dates clamping to 0).
 
 ### ✔ M12 — Refinements, Bug Fixes
 1. [x] Add support for ctl+u in the input field (clear from cursor to beginning of line)

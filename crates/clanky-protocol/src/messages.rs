@@ -415,6 +415,14 @@ pub enum ChunkPayload {
 }
 
 /// Why a chat turn finished.
+///
+/// `Continuable` is provider-reported: the turn was interrupted server-side
+/// before it was really finished, and the provider's documented way to
+/// continue it is to send the partial response back and request again
+/// (Anthropic's `pause_turn` stop reason, which reports usage for the
+/// partial turn — the client must not bill it as the turn's final usage).
+/// Clanky core resumes automatically; a provider that never emits it costs
+/// nothing, so no capability flag is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FinishReason {
@@ -423,6 +431,7 @@ pub enum FinishReason {
     Length,
     Cancelled,
     ContentFilter,
+    Continuable,
 }
 
 impl FinishReason {
@@ -435,6 +444,7 @@ impl FinishReason {
             Self::Length => "length",
             Self::Cancelled => "cancelled",
             Self::ContentFilter => "contentFilter",
+            Self::Continuable => "continuable",
         }
     }
 }
@@ -727,6 +737,25 @@ mod tests {
             .unwrap()
             .expect("known type with extra field");
         assert_eq!(parsed.request_id(), Some(7));
+    }
+
+    #[test]
+    fn continuable_finish_reason_roundtrips() {
+        // The additive v2 value (Anthropic `pause_turn`): new wire spelling,
+        // and a `done` carrying it parses through the standard path.
+        let done = Message::Done {
+            request_id: 42,
+            finish_reason: FinishReason::Continuable,
+            usage: None,
+        };
+        let json = serde_json::to_value(&done).unwrap();
+        assert_eq!(json["finishReason"], "continuable");
+        let parsed =
+            parse_message(r#"{"type": "done", "requestId": 42, "finishReason": "continuable"}"#)
+                .unwrap()
+                .expect("done");
+        assert_eq!(parsed, done);
+        assert_eq!(FinishReason::Continuable.as_str(), "continuable");
     }
 
     #[test]

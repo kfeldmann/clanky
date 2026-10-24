@@ -218,7 +218,14 @@ Rules:
   fragment of that call's JSON arguments string, which the client assembles and
   parses on `done`. `index` is a 0-based counter per response (maps directly to
   OpenAI-style `tool_calls[i].index` deltas).
-- `finishReason`: `stop` | `toolCalls` | `length` | `cancelled` | `contentFilter`.
+- `finishReason`: `stop` | `toolCalls` | `length` | `cancelled` | `contentFilter` |
+  `continuable`. `continuable` is provider-reported: the turn was interrupted
+  server-side before it finished, and the provider's documented way to continue
+  it is to send the partial response back as-is and request again (Anthropic's
+  `pause_turn` stop reason). The client keeps the partial round's text in the
+  conversation, does *not* bill its usage (the next request re-reports it,
+  cumulatively), and resumes automatically. A provider that never emits it
+  costs nothing, so no capability flag is needed.
 - `usage` is optional; present it when the backend reports it.
 - **Ordering:** chunks for a given `requestId` arrive in order. **Only one chat
   may be in flight per plugin connection.** This removes all interleaving
@@ -289,6 +296,13 @@ Plugin → client:
     (M20: inline image parts on a `tool` message, absent when there are
     none; see §5 field rules). No version bump: additive and optional, and
     the three provider plugins in the repo were updated in the same change.
+  - **v2, additive** — a new `finishReason` value `continuable`
+    (Anthropic's `pause_turn`: the turn was interrupted server-side; the
+    client sends the partial response back and requests again — see §6).
+    No version bump: a peer that never emits it changes nothing, and an
+    older client receiving it treats it as its previous fallback (a plain
+    stop) via serde's default enum handling. The turn loop in core resumes
+    automatically.
 
 ## 10. M1 loopback transport
 

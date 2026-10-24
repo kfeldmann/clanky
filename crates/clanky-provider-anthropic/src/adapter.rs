@@ -1,9 +1,11 @@
 //! Request/response adapter: clanky protocol ⇄ Anthropic Messages.
 //!
 //! Shape of the mapping (planning, "Adapter mapping notes"):
-//! - `system` is a top-level parameter, not a message; the identity block is
-//!   prepended on the OAuth surface (spike-confirmed: required to identify
-//!   as Claude Code, and the model answers *as* Claude Code with it).
+//! - `system` is a top-level parameter, not a message; the Claude Code
+//!   identity block is prepended on the OAuth surface only (spike-confirmed:
+//!   required to identify as Claude Code, and the model answers *as* Claude
+//!   Code with it). The API-key surface is the documented plain one — no
+//!   identity block, matching the plain headers `apply_auth` sends there.
 //! - assistant `tool_calls` ⇄ `tool_use` content blocks; `role: "tool"`
 //!   results are sent as a `user` message of `tool_result` blocks.
 //! - `thinking` budget → `thinking: {type: "enabled", budget_tokens}`.
@@ -21,13 +23,36 @@ use serde_json::{Value, json};
 /// Claude Code — visible in the captured fixtures).
 pub const IDENTITY_SYSTEM_TEXT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+/// Whether the request identifies as Claude Code. The identity system
+/// block belongs to the OAuth surface only — its substitute for not
+/// presenting real Clanky identity — while the API-key surface is the
+/// documented plain third-party one. Matches the header split in
+/// `backend::apply_auth`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Identity {
+    /// OAuth surface: prepend [`IDENTITY_SYSTEM_TEXT`] to `system`.
+    ClaudeCode,
+    /// API-key surface: send the user's system content only.
+    Plain,
+}
+
+impl From<&crate::backend::AuthMode> for Identity {
+    fn from(auth: &crate::backend::AuthMode) -> Self {
+        match auth {
+            crate::backend::AuthMode::Bearer(_) => Identity::ClaudeCode,
+            crate::backend::AuthMode::ApiKey(_) => Identity::Plain,
+        }
+    }
+}
+
 /// `max_tokens` used when the request carries none.
 pub const DEFAULT_MAX_TOKENS: u32 = 64_000;
 
 /// Serialize protocol chat messages into an Anthropic `/v1/messages` body.
 ///
 /// `system` messages (clanky allows several) are concatenated — in wire
-/// order — into the system parameter after the identity block.
+/// order — into the system parameter, after the identity block on the
+/// Claude Code (OAuth) surface.
 pub fn build_request_body(
     model: &str,
     messages: &[ChatMessage],
@@ -35,8 +60,12 @@ pub fn build_request_body(
     sampling: Option<&Sampling>,
     thinking: Option<Thinking>,
     stream: bool,
+    identity: Identity,
 ) -> Result<String, clanky_protocol::Error> {
-    let mut system_blocks = vec![json!({"type": "text", "text": IDENTITY_SYSTEM_TEXT})];
+    let mut system_blocks = Vec::new();
+    if identity == Identity::ClaudeCode {
+        system_blocks.push(json!({"type": "text", "text": IDENTITY_SYSTEM_TEXT}));
+    }
     let mut conversation: Vec<Value> = Vec::new();
 
     for message in messages {
@@ -308,8 +337,15 @@ fn map_stop_reason(reason: Option<&str>) -> FinishReason {
         Some("tool_use") => FinishReason::ToolCalls,
         Some("max_tokens") => FinishReason::Length,
         Some("refusal") | Some("sensitive") => FinishReason::ContentFilter,
-        // `end_turn`, `stop_sequence`, `pause_turn` and anything unknown map
-        // to a plain stop; only Clanky itself produces `cancelled`.
+        // `pause_turn`: Anthropic paused a long-running turn server-side.
+        // Its documented contract is to send the partial response back and
+        // request again — the protocol's Continuable, which Clanky core
+        // resumes automatically (mapping it to a plain stop would silently
+        // truncate the turn and drop that contract).
+        Some("pause_turn") => FinishReason::Continuable,
+        // `end_turn`, `stop_sequence` and anything unknown map to a plain
+        // stop (a future stop reason should never lose the turn's output);
+        // only Clanky itself produces `cancelled`.
         _ => FinishReason::Stop,
     }
 }
@@ -562,6 +598,7 @@ mod tests {
                 None,
                 None,
                 false,
+                Identity::ClaudeCode,
             )
             .unwrap(),
         )
@@ -583,7 +620,16 @@ mod tests {
             ChatMessage::system("Second."),
         ];
         let body: Value = serde_json::from_str(
-            &build_request_body("m", &messages, None, None, None, false).unwrap(),
+            &build_request_body(
+                "m",
+                &messages,
+                None,
+                None,
+                None,
+                false,
+                Identity::ClaudeCode,
+            )
+            .unwrap(),
         )
         .unwrap();
         let system = body["system"].as_array().unwrap();
@@ -591,6 +637,62 @@ mod tests {
         assert_eq!(system[0]["text"], IDENTITY_SYSTEM_TEXT);
         assert_eq!(system[1]["text"], "First.");
         assert_eq!(system[2]["text"], "Second.");
+    }
+
+    #[test]
+    fn the_api_key_path_sends_no_identity_block() {
+        // The identity block is the OAuth surface's substitute for not
+        // presenting real Clanky identity; the documented key surface gets
+        // the user's system content only.
+        let messages = vec![ChatMessage::system("You are terse.")];
+        let body: Value = serde_json::from_str(
+            &build_request_body("m", &messages, None, None, None, false, Identity::Plain).unwrap(),
+        )
+        .unwrap();
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["text"], "You are terse.");
+        assert!(
+            !serde_json::to_string(&body["system"])
+                .unwrap()
+                .contains("Claude Code"),
+        );
+
+        // And the same request on the OAuth surface keeps the block.
+        let oauth: Value = serde_json::from_str(
+            &build_request_body(
+                "m",
+                &messages,
+                None,
+                None,
+                None,
+                false,
+                Identity::ClaudeCode,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let oauth_system = oauth["system"].as_array().unwrap();
+        assert_eq!(oauth_system.len(), 2);
+        assert_eq!(oauth_system[0]["text"], IDENTITY_SYSTEM_TEXT);
+    }
+
+    #[test]
+    fn the_identity_follows_the_auth_mode() {
+        let creds = crate::auth::Credentials {
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            expires_at: 0,
+            refresh_token_expires_at: None,
+        };
+        assert_eq!(
+            Identity::from(&crate::backend::AuthMode::Bearer(creds)),
+            Identity::ClaudeCode
+        );
+        assert_eq!(
+            Identity::from(&crate::backend::AuthMode::ApiKey("k".into())),
+            Identity::Plain
+        );
     }
 
     #[test]
@@ -623,6 +725,7 @@ mod tests {
                 None,
                 None,
                 false,
+                Identity::ClaudeCode,
             )
             .unwrap(),
         )
@@ -669,6 +772,7 @@ mod tests {
                 None,
                 None,
                 false,
+                Identity::ClaudeCode,
             )
             .unwrap(),
         )
@@ -715,7 +819,16 @@ mod tests {
             ChatMessage::tool("b", "two"),
         ];
         let body: Value = serde_json::from_str(
-            &build_request_body("m", &messages, Some(&[tool]), None, None, false).unwrap(),
+            &build_request_body(
+                "m",
+                &messages,
+                Some(&[tool]),
+                None,
+                None,
+                false,
+                Identity::ClaudeCode,
+            )
+            .unwrap(),
         )
         .unwrap();
         let msgs = body["messages"].as_array().unwrap();
@@ -740,6 +853,7 @@ mod tests {
                     budget_tokens: Some(1024),
                 }),
                 false,
+                Identity::ClaudeCode,
             )
             .unwrap(),
         )
@@ -772,6 +886,7 @@ mod tests {
                     budget_tokens: Some(0),
                 }),
                 false,
+                Identity::ClaudeCode,
             )
             .unwrap(),
         )
@@ -801,6 +916,7 @@ mod tests {
                     budget_tokens: Some(1024),
                 }),
                 false,
+                Identity::ClaudeCode,
             )
             .unwrap(),
         )
@@ -828,6 +944,7 @@ mod tests {
                     budget_tokens: Some(0),
                 }),
                 false,
+                Identity::ClaudeCode,
             )
             .unwrap(),
         )
@@ -904,7 +1021,14 @@ mod tests {
     fn stop_reasons_map_onto_the_protocol() {
         assert_eq!(map_stop_reason(Some("end_turn")), FinishReason::Stop);
         assert_eq!(map_stop_reason(Some("stop_sequence")), FinishReason::Stop);
-        assert_eq!(map_stop_reason(Some("pause_turn")), FinishReason::Stop);
+        // A server-side pause is continuable, not a plain stop: Anthropic's
+        // documented resume is to send the partial response back and
+        // request again (a plain stop would truncate the turn and drop
+        // that contract).
+        assert_eq!(
+            map_stop_reason(Some("pause_turn")),
+            FinishReason::Continuable
+        );
         assert_eq!(map_stop_reason(Some("tool_use")), FinishReason::ToolCalls);
         assert_eq!(map_stop_reason(Some("max_tokens")), FinishReason::Length);
         assert_eq!(
@@ -912,6 +1036,11 @@ mod tests {
             FinishReason::ContentFilter
         );
         assert_eq!(map_stop_reason(None), FinishReason::Stop);
+        // An unknown stop reason falls back to Stop, never Continuable.
+        assert_eq!(
+            map_stop_reason(Some("model_context_window_exceeded")),
+            FinishReason::Stop
+        );
     }
 
     #[test]
@@ -1105,19 +1234,38 @@ mod tests {
     fn request_body_sets_stream_by_default_and_sampling_wins() {
         let messages = vec![ChatMessage::user("hi")];
         let streaming = serde_json::from_str::<Value>(
-            &build_request_body("m", &messages, None, None, None, true).unwrap(),
+            &build_request_body("m", &messages, None, None, None, true, Identity::ClaudeCode)
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(streaming["stream"], true, "the provider's streaming path");
         let non_streaming = serde_json::from_str::<Value>(
-            &build_request_body("m", &messages, None, None, None, false).unwrap(),
+            &build_request_body(
+                "m",
+                &messages,
+                None,
+                None,
+                None,
+                false,
+                Identity::ClaudeCode,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(non_streaming["stream"], false);
         // The user's own `stream` in sampling wins over the derived value.
         let sampling = Sampling::from_iter([("stream".into(), json!(false))]);
         let user_wins = serde_json::from_str::<Value>(
-            &build_request_body("m", &messages, None, Some(&sampling), None, true).unwrap(),
+            &build_request_body(
+                "m",
+                &messages,
+                None,
+                Some(&sampling),
+                None,
+                true,
+                Identity::ClaudeCode,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(

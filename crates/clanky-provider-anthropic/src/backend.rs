@@ -39,8 +39,87 @@ pub struct BackendError {
     pub status: Option<u16>,
     pub message: String,
     /// Server-provided retry hint in milliseconds (from a `Retry-After`
-    /// header). `None` when absent or unparseable.
+    /// header, delay-seconds or HTTP-date form). `None` when absent or
+    /// unparseable; only meaningful on rate-limit responses.
     pub retry_after_ms: Option<u64>,
+}
+
+/// Attach a retry hint parsed from a `Retry-After` header value
+/// (delay-seconds or HTTP-date; the date form is measured against
+/// `now_secs`, the current UNIX time).
+pub fn backend_error_with_retry_after(
+    mut err: BackendError,
+    value: Option<&str>,
+    now_secs: u64,
+) -> BackendError {
+    err.retry_after_ms = value
+        .and_then(|v| parse_retry_after(v, now_secs))
+        .map(|secs| secs.max(0) as u64 * 1000);
+    err
+}
+
+/// Parse a `Retry-After` header into delay seconds. Accepts the
+/// delay-seconds form (negative clamps to 0) and the HTTP-date form
+/// (RFC 9110 IMF-fixdate, measured against `now_secs`); anything else is
+/// `None`.
+fn parse_retry_after(value: &str, now_secs: u64) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let secs = value.parse::<i64>().ok();
+    if let Some(secs) = secs {
+        return Some(secs.max(0));
+    }
+    parse_http_date(value)?.checked_sub(i64::try_from(now_secs).unwrap_or(i64::MAX))
+}
+
+/// Parse an IMF-fixdate HTTP date (`Sun, 06 Nov 1994 08:49:37 GMT`) to
+/// UNIX seconds via the days-from-civil algorithm (Howard Hinnant), which
+/// is exact for the proleptic Gregorian calendar. The weekday name and the
+/// `GMT` zone suffix are validated leniently (any 3-letter weekday, any
+/// `GMT`/`UT`+offset spelling of zero). Returns `None` on anything else.
+fn parse_http_date(value: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let (weekday, rest) = value.split_once(',')?;
+    if weekday.len() != 3 || !weekday.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut parts = rest.trim_start().split_ascii_whitespace();
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month_str = parts.next()?;
+    let month = MONTHS
+        .iter()
+        .position(|m| month_str.eq_ignore_ascii_case(m))? as i64;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let zone = parts.next()?;
+    if !zone.eq_ignore_ascii_case("gmt") && !zone.eq_ignore_ascii_case("ut") {
+        return None;
+    }
+    let (hour, minute, second) = {
+        let mut t = time.split(':');
+        let h: i64 = t.next()?.parse().ok()?;
+        let m: i64 = t.next()?.parse().ok()?;
+        let s: i64 = t.next()?.parse().ok()?;
+        (h, m, s)
+    };
+    // days_from_civil: counts days since 1970-01-01 for a civil date.
+    // `month` is a 0-based index; Hinnant's formula wants the 1-based
+    // month folded into March-based years (Jan/Feb roll into the
+    // previous year as months 10/11).
+    let (y, m) = (
+        if month <= 1 { year - 1 } else { year },
+        if month <= 1 { month + 10 } else { month - 2 },
+    );
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * m + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 /// Cap error bodies so a chatty backend cannot flood the UI.
@@ -116,14 +195,11 @@ impl UreqBackend {
             Err(ureq::Error::Status(status, resp)) => {
                 let retry_after = resp.header("retry-after").map(str::to_owned);
                 let text = resp.into_string().unwrap_or_default();
-                let mut err = BackendError::new(Some(status), text);
-                if let Some(secs) = retry_after
-                    .as_deref()
-                    .and_then(|v| v.trim().parse::<i64>().ok())
-                {
-                    err.retry_after_ms = Some((secs.max(0) as u64) * 1000);
-                }
-                Err(err)
+                Err(backend_error_with_retry_after(
+                    BackendError::new(Some(status), text),
+                    retry_after.as_deref(),
+                    now_secs(),
+                ))
             }
             Err(err) => Err(BackendError::new(None, err.to_string())),
         }
@@ -134,6 +210,16 @@ impl Default for UreqBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Current UNIX time in seconds; used to resolve HTTP-date `Retry-After`
+/// values. A missing clock falls back to 0, which turns date-form hints
+/// into large delays rather than errors.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Backend for UreqBackend {
@@ -162,14 +248,11 @@ impl Backend for UreqBackend {
             Err(ureq::Error::Status(status, resp)) => {
                 let retry_after = resp.header("retry-after").map(str::to_owned);
                 let text = resp.into_string().unwrap_or_default();
-                let mut err = BackendError::new(Some(status), text);
-                if let Some(secs) = retry_after
-                    .as_deref()
-                    .and_then(|v| v.trim().parse::<i64>().ok())
-                {
-                    err.retry_after_ms = Some((secs.max(0) as u64) * 1000);
-                }
-                return Err(err);
+                return Err(backend_error_with_retry_after(
+                    BackendError::new(Some(status), text),
+                    retry_after.as_deref(),
+                    now_secs(),
+                ));
             }
             Err(err) => return Err(BackendError::new(None, err.to_string())),
         };
@@ -273,6 +356,54 @@ fn apply_auth(req: ureq::Request, auth: &AuthMode) -> ureq::Request {
         AuthMode::ApiKey(key) => req
             .set("x-api-key", key)
             .set("anthropic-version", "2023-06-01"),
+    }
+}
+
+/// `parse_retry_after` covers both header forms (the same coverage the
+/// DeepInfra/LiteLLM backends pin).
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+
+    #[test]
+    fn delay_seconds_parses_and_clamps() {
+        let now = 1_000_000;
+        assert_eq!(
+            backend_error_with_retry_after(BackendError::new(None, "x"), Some("3"), now)
+                .retry_after_ms,
+            Some(3_000)
+        );
+        assert_eq!(
+            backend_error_with_retry_after(BackendError::new(None, "x"), Some(" 0 "), now)
+                .retry_after_ms,
+            Some(0)
+        );
+        assert_eq!(
+            backend_error_with_retry_after(BackendError::new(None, "x"), Some("-5"), now)
+                .retry_after_ms,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn http_date_parses_relative_to_now() {
+        let now = 784_111_747; // 1994-11-06T08:49:07Z
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let err = backend_error_with_retry_after(BackendError::new(None, "x"), Some(date), now);
+        assert_eq!(err.retry_after_ms, Some(30_000));
+        // In the past: clamps to 0, never a negative delay.
+        let past =
+            backend_error_with_retry_after(BackendError::new(None, "x"), Some(date), now + 31);
+        assert_eq!(past.retry_after_ms, Some(0));
+    }
+
+    #[test]
+    fn absent_or_unparseable_values_leave_no_hint() {
+        let now = 1_000_000;
+        for value in [None, Some(""), Some("soon"), Some("Mon, 06 Nov 1994")] {
+            let err = backend_error_with_retry_after(BackendError::new(None, "x"), value, now);
+            assert_eq!(err.retry_after_ms, None, "value: {value:?}");
+        }
     }
 }
 

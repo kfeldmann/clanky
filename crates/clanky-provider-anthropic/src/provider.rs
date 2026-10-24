@@ -330,13 +330,16 @@ fn load_api_key() -> Option<String> {
         .filter(|k| !k.trim().is_empty())
 }
 
-/// Map an OAuth-flow failure to a protocol error. `invalid_grant` means the
-/// refresh token has expired or been rotated away: the actionable message.
+/// Map an OAuth-flow failure to a protocol error. Only the documented
+/// "refresh token expired/rotated" error code (`invalid_grant`) means
+/// re-login — matching on the substring "invalid" would send any other
+/// 400/401 (e.g. `invalid_client`, a disabled app) to a login that cannot
+/// fix it; those surface verbatim with the status for context.
 fn map_oauth_error(err: OAuthError) -> Error {
     match err {
         OAuthError::Http { status, body } if status == 400 || status == 401 => {
             let body_text = oauth::extract_error(&body);
-            if body_text.contains("invalid_grant") || body_text.contains("invalid") {
+            if body_text.contains("invalid_grant") {
                 login_expired_error()
             } else {
                 Error::Provider {
@@ -411,6 +414,7 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
             request.sampling.as_ref(),
             request.thinking,
             streaming,
+            adapter::Identity::from(&auth),
         )?;
         // The same `stream` decision that went into the body picks the
         // transport: a `stream = false` response is one JSON object, not
@@ -865,6 +869,51 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_turn_stream_surfaces_as_continuable() {
+        // Anthropic interrupted the turn server-side (`pause_turn`): the
+        // streamed text is real and stays, and the done reason is the
+        // protocol's Continuable — not a plain stop, which would silently
+        // truncate a long turn.
+        let mut provider = provider(payloads(include_str!(
+            "../tests/fixtures/stream-pause-turn.txt"
+        )));
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &request(
+                "claude-haiku-4-5-20251001",
+                vec![ChatMessage::user("list 5 numbers")],
+            ),
+        );
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "1,2,3,4,5");
+        let done = done.unwrap();
+        assert_eq!(done.finish_reason, FinishReason::Continuable);
+        // The partial round's usage is still reported (core decides what
+        // to bill for an unfinished turn).
+        assert_eq!(done.usage.as_ref().unwrap().completion_tokens, Some(13));
+    }
+
+    #[test]
+    fn a_pause_turn_body_on_the_non_streaming_path_is_continuable() {
+        let mut provider = non_streaming_provider(Ok(include_str!(
+            "../tests/fixtures/resp-pause-turn.json"
+        )
+        .into()));
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &non_streaming_request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        );
+        assert_eq!(done.unwrap().finish_reason, FinishReason::Continuable);
+        assert!(!chunks.is_empty(), "the partial text is kept");
+    }
+
+    #[test]
     fn a_user_sampling_stream_false_wins_over_the_provider_default() {
         // Invariant: the user's `stream = false` in sampling is authoritative
         // — the provider never flips it back on, and the wire body carries
@@ -1183,6 +1232,46 @@ mod tests {
                     message,
                     "not logged in — run `clanky-provider-anthropic login`, or set ANTHROPIC_API_KEY"
                 );
+            }
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    /// The documented re-login trigger is exactly `invalid_grant` (the
+    /// refresh token expired or was rotated away). Any other token-endpoint
+    /// 400/401 — including `invalid_client`, which a re-login cannot fix —
+    /// must surface verbatim instead of pointing at `login`.
+    #[test]
+    fn token_refresh_errors_map_by_oauth_error_code() {
+        let err = map_oauth_error(OAuthError::Http {
+            status: 400,
+            body: r#"{"error":"invalid_grant","error_description":"token expired"}"#.into(),
+        });
+        match err {
+            Error::Provider { code, message, .. } => {
+                assert_eq!(code, ErrorCode::Auth);
+                assert_eq!(
+                    message,
+                    "login expired — run `clanky-provider-anthropic login`"
+                );
+            }
+            other => panic!("unexpected: {other}"),
+        }
+
+        // `invalid_client` (bad/revoked client credentials): not fixable by
+        // re-login, and pre-fix the bare-"invalid" match sent it there.
+        let err = map_oauth_error(OAuthError::Http {
+            status: 401,
+            body: r#"{"error":"invalid_client","error_description":"unknown client"}"#.into(),
+        });
+        match err {
+            Error::Provider { code, message, .. } => {
+                assert_eq!(code, ErrorCode::Auth);
+                assert!(
+                    message.contains("invalid_client") && message.contains("401"),
+                    "{message}"
+                );
+                assert!(!message.contains("login"), "{message}");
             }
             other => panic!("unexpected: {other}"),
         }
