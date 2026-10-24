@@ -554,9 +554,12 @@ fn parse_model_info(body: &str) -> HashMap<String, ModelHints> {
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string),
-                // `max_input_tokens` is the prompt-context limit; some
-                // providers only populate `max_tokens`.
-                context_window: u64_of("max_input_tokens").or_else(|| u64_of("max_tokens")),
+                // `max_input_tokens` is the prompt-context limit. Do *not*
+                // fall back to `max_tokens`: in LiteLLM's `model_info` that
+                // is the *output*-token limit, which badly understates the
+                // window for models that only populate it — no hint beats a
+                // wrong one.
+                context_window: u64_of("max_input_tokens"),
                 input_price_per_mtok: f64_of("input_cost_per_token").map(|p| p * PER_MTOK),
                 output_price_per_mtok: f64_of("output_cost_per_token").map(|p| p * PER_MTOK),
                 cache_read_price_per_mtok: f64_of("cache_read_input_token_cost")
@@ -685,10 +688,29 @@ impl StreamState {
     }
 
     fn ingest_tool_call(&mut self, call: OpenAiStreamToolCall, sink: &mut dyn FnMut(ChunkPayload)) {
+        // A malformed index (e.g. `"index": 4294967295`) must not allocate a
+        // huge accumulator buffer (~4 bytes per missing slot ⇒ OOM on a
+        // single junk chunk). Real tool-call indices are tiny; anything
+        // beyond this bound is a broken stream and the delta is dropped.
+        if call.index > MAX_TOOL_CALL_INDEX {
+            return;
+        }
         while self.calls.len() <= call.index as usize {
             self.calls.push(CallAccumulator::default());
         }
         let acc = &mut self.calls[call.index as usize];
+        // Args may arrive before the id/name: some backends lead with an
+        // index-only placeholder and put the first args fragment on the
+        // same delta as (or even before) the id. Buffer the fragment into
+        // the accumulator regardless of `started` so it is never lost.
+        let args_fragment = call
+            .function
+            .arguments
+            .and_then(args_string)
+            .filter(|s| !s.is_empty());
+        if let Some(fragment) = &args_fragment {
+            acc.args.push_str(fragment);
+        }
         if !acc.started {
             // The id/name may still be on later deltas (some backends lead
             // with an index-only placeholder); wait until we have something
@@ -700,6 +722,8 @@ impl StreamState {
                 acc.name = name;
             }
             if acc.id.is_empty() && acc.name.is_empty() {
+                // Nothing to announce yet; buffered args stay in `acc.args`
+                // and are emitted once the call starts.
                 return;
             }
             if acc.id.is_empty() {
@@ -720,13 +744,7 @@ impl StreamState {
             // must stay stable for the client's `toolCallId` round trip.
             // (Name-only updates after the start are also ignored.)
         }
-        if let Some(fragment) = call
-            .function
-            .arguments
-            .and_then(args_string)
-            .filter(|s| !s.is_empty())
-        {
-            acc.args.push_str(&fragment);
+        if let Some(fragment) = args_fragment {
             sink(ChunkPayload::ToolCallArgs {
                 index: call.index,
                 args_chunk: fragment,
@@ -757,6 +775,12 @@ fn args_string(args: Value) -> Option<String> {
         other => Some(other.to_string()),
     }
 }
+
+/// Largest tool-call index we accept in a stream delta. Real backends emit
+/// single-digit indices; anything larger is a malformed chunk, and honoring
+/// it would allocate an accumulator per skipped slot (one `"index":
+/// 4294967295` chunk would otherwise allocate ~4 GB of accumulators).
+const MAX_TOOL_CALL_INDEX: u32 = 1024;
 
 fn map_finish_reason(reason: Option<&str>) -> FinishReason {
     match reason {
@@ -1106,6 +1130,96 @@ mod tests {
         let mut provider = provider(CATALOG, MODEL_INFO, sse);
         let (_, done) = run_chat(&mut provider, &request("claude-sonnet-4-6"));
         assert_eq!(done.unwrap().finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn args_before_id_are_buffered_not_dropped() {
+        // Regression: a delta carrying args but not yet id/name used to hit
+        // the early `return` and lose the fragment, truncating the assembled
+        // arguments. The fragment must be buffered until the call starts.
+        let sse = vec![
+            json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "function": {"arguments": "{\"command\": "}
+            }]}, "finish_reason": null}]})
+            .to_string(),
+            json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "bash", "arguments": "\"ls\"}"}
+            }]}, "finish_reason": "tool_calls"}]})
+            .to_string(),
+            "[DONE]".to_string(),
+        ];
+        let mut provider = provider(CATALOG, MODEL_INFO, sse);
+        let (chunks, done) = run_chat(&mut provider, &request("claude-sonnet-4-6"));
+        assert_eq!(
+            chunks,
+            vec![
+                ChunkPayload::ToolCallStart {
+                    index: 0,
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                },
+                ChunkPayload::ToolCallArgs {
+                    index: 0,
+                    args_chunk: "\"ls\"}".into(),
+                },
+            ]
+        );
+        assert_eq!(done.unwrap().finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn absurd_tool_call_index_is_rejected_without_allocating() {
+        // Regression: a malformed `"index": 4294967295` used to grow the
+        // accumulator vec by ~4B slots (~4 GB). Such a delta is a broken
+        // stream; it must be dropped, not honored.
+        let sse = vec![
+            json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 4294967295u32, "id": "call_x", "type": "function",
+                "function": {"name": "boom", "arguments": "{}"}
+            }]}, "finish_reason": null}]})
+            .to_string(),
+            json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }]}, "finish_reason": null}]})
+            .to_string(),
+            "[DONE]".to_string(),
+        ];
+        let mut provider = provider(CATALOG, MODEL_INFO, sse);
+        let (chunks, done) = run_chat(&mut provider, &request("claude-sonnet-4-6"));
+        assert_eq!(
+            chunks,
+            vec![
+                ChunkPayload::ToolCallStart {
+                    index: 0,
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                },
+                ChunkPayload::ToolCallArgs {
+                    index: 0,
+                    args_chunk: "{}".into(),
+                },
+            ]
+        );
+        assert_eq!(done.unwrap().finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn max_tokens_alone_does_not_become_the_context_window() {
+        // `max_tokens` in `model_info` is the *output*-token limit; falling
+        // back to it understated the context window for models that only
+        // populate it. No `max_input_tokens`, no hint.
+        let info = json!({
+            "data": [
+                {"model_name": "solo", "model_info": {"mode": "chat", "max_tokens": 4096}}
+            ]
+        })
+        .to_string();
+        let catalog = json!({"data": [{"id": "solo"}]}).to_string();
+        let mut provider = provider(&catalog, &info, Vec::new());
+        let models = provider.list_models().unwrap();
+        assert_eq!(models[0].context_window, None);
     }
 
     // --- request building ------------------------------------------------

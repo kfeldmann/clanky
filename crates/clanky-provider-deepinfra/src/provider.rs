@@ -515,10 +515,29 @@ impl StreamState {
     }
 
     fn ingest_tool_call(&mut self, call: OpenAiStreamToolCall, sink: &mut dyn FnMut(ChunkPayload)) {
+        // A malformed index (e.g. `"index": 4294967295`) must not allocate a
+        // huge accumulator buffer (~4 bytes per missing slot ⇒ OOM on a
+        // single junk chunk). Real tool-call indices are tiny; anything
+        // beyond this bound is a broken stream and the delta is dropped.
+        if call.index > MAX_TOOL_CALL_INDEX {
+            return;
+        }
         while self.calls.len() <= call.index as usize {
             self.calls.push(CallAccumulator::default());
         }
         let acc = &mut self.calls[call.index as usize];
+        // Args may arrive before the id/name: some backends lead with an
+        // index-only placeholder and put the first args fragment on the
+        // same delta as (or even before) the id. Buffer the fragment into
+        // the accumulator regardless of `started` so it is never lost.
+        let args_fragment = call
+            .function
+            .arguments
+            .and_then(args_string)
+            .filter(|s| !s.is_empty());
+        if let Some(fragment) = &args_fragment {
+            acc.args.push_str(fragment);
+        }
         if !acc.started {
             // The id/name may still be on later deltas (some backends lead
             // with an index-only placeholder); wait until we have something
@@ -530,6 +549,8 @@ impl StreamState {
                 acc.name = name;
             }
             if acc.id.is_empty() && acc.name.is_empty() {
+                // Nothing to announce yet; buffered args stay in `acc.args`
+                // and are emitted once the call starts.
                 return;
             }
             if acc.id.is_empty() {
@@ -550,13 +571,7 @@ impl StreamState {
             // must stay stable for the client's `toolCallId` round trip.
             // (Name-only updates after the start are also ignored.)
         }
-        if let Some(fragment) = call
-            .function
-            .arguments
-            .and_then(args_string)
-            .filter(|s| !s.is_empty())
-        {
-            acc.args.push_str(&fragment);
+        if let Some(fragment) = args_fragment {
             sink(ChunkPayload::ToolCallArgs {
                 index: call.index,
                 args_chunk: fragment,
@@ -588,9 +603,15 @@ fn args_string(args: Value) -> Option<String> {
     }
 }
 
+/// Largest tool-call index we accept in a stream delta. Real backends emit
+/// single-digit indices; anything larger is a malformed chunk, and honoring
+/// it would allocate an accumulator per skipped slot (one `"index":
+/// 4294967295` chunk would otherwise allocate ~4 GB of accumulators).
+const MAX_TOOL_CALL_INDEX: u32 = 1024;
+
 fn map_finish_reason(reason: Option<&str>) -> FinishReason {
     match reason {
-        Some("tool_calls") => FinishReason::ToolCalls,
+        Some("tool_calls" | "function_call") => FinishReason::ToolCalls,
         Some("length" | "max_tokens") => FinishReason::Length,
         Some("content_filter") => FinishReason::ContentFilter,
         // Unknown reasons are treated as a plain stop; `cancelled` is only
@@ -1060,6 +1081,107 @@ mod tests {
             ]
         );
         assert_eq!(done.unwrap().finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn args_before_id_are_buffered_not_dropped() {
+        // Regression: a delta carrying args but not yet id/name used to hit
+        // the early `return` and lose the fragment, truncating the assembled
+        // arguments. The fragment must be buffered until the call starts.
+        let lines = [
+            &serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "function": {"arguments": "{\"command\": "}
+                }]}, "finish_reason": null}]
+            })
+            .to_string(),
+            &serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "bash", "arguments": "\"ls\"}"}
+                }]}, "finish_reason": null}]
+            })
+            .to_string(),
+            &done_chunk("tool_calls"),
+        ];
+        let (chunks, done) = run_sse(&lines, &simple_request());
+        assert_eq!(
+            chunks,
+            vec![
+                ChunkPayload::ToolCallStart {
+                    index: 0,
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                },
+                ChunkPayload::ToolCallArgs {
+                    index: 0,
+                    args_chunk: "\"ls\"}".into(),
+                },
+            ]
+        );
+        assert_eq!(done.unwrap().finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn legacy_function_call_finish_reason_maps_to_tool_calls() {
+        // OpenAI's legacy `function_call` reason announces a tool call; the
+        // same wire format already maps this way in the LiteLLM plugin.
+        let lines = [
+            &serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]}, "finish_reason": null}]
+            })
+            .to_string(),
+            &serde_json::json!({
+                "choices": [{"delta": {}, "finish_reason": "function_call"}]
+            })
+            .to_string(),
+            "[DONE]",
+        ];
+        let (_, done) = run_sse(&lines, &simple_request());
+        assert_eq!(done.unwrap().finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[test]
+    fn absurd_tool_call_index_is_rejected_without_allocating() {
+        // Regression: a malformed `"index": 4294967295` used to grow the
+        // accumulator vec by ~4B slots (~4 GB). Such a delta is a broken
+        // stream; it must be dropped, not honored.
+        let lines = [
+            &serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 4294967295u32, "id": "call_x", "type": "function",
+                    "function": {"name": "boom", "arguments": "{}"}
+                }]}, "finish_reason": null}]
+            })
+            .to_string(),
+            &serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]}, "finish_reason": null}]
+            })
+            .to_string(),
+            &done_chunk("stop"),
+        ];
+        let (chunks, done) = run_sse(&lines, &simple_request());
+        assert_eq!(
+            chunks,
+            vec![
+                ChunkPayload::ToolCallStart {
+                    index: 0,
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                },
+                ChunkPayload::ToolCallArgs {
+                    index: 0,
+                    args_chunk: "{}".into(),
+                },
+            ]
+        );
+        assert_eq!(done.unwrap().finish_reason, FinishReason::Stop);
     }
 
     #[test]

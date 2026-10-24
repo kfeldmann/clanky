@@ -44,7 +44,11 @@ def on_hello(message):
 def on_list_models(message):
     emit({
         "type": "models",
-        "id": message["id"],
+        # `get`, not `[...]`: the "never die on junk" policy below applies to
+        # known message types with missing fields, too. A `KeyError` here
+        # would kill the plugin; a reply without an `id` is simply dropped
+        # by the client (protocol §4).
+        "id": message.get("id"),
         "models": [{
             "id": DEFAULT_MODEL,
             "displayName": "Hello World Tiny",
@@ -54,7 +58,7 @@ def on_list_models(message):
 
 
 def on_chat(message):
-    request_id = message["id"]
+    request_id = message.get("id")
     # Stream the answer in a couple of pieces, like a real backend would.
     for text in ["Hello from ", "a plugin!"]:
         emit({
