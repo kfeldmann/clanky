@@ -92,10 +92,10 @@ decisions made during implementation. Check them before redesigning something.
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `cargo test --workspace`
 - `unsafe` is forbidden workspace-wide; clippy warnings fail CI.
-- Run: `cargo run -p clanky -- [-p "prompt"]` (TUI without `-p`).
+- Run: `cargo run -p clanky -- [-p "prompt"]` (TUI without `-p`). Credentials are in your environment, so be very careful running clanky. Prompts will be sent to the LLM and the LLM may start editing code!
 - `./build-linux-musl` + `./build-runner` build the Dockerized release
   binary; `./run` executes it (requires `DEEPINFRA_TOKEN` or
-  `LITELLM_API_KEY`).
+  `LITELLM_API_KEY`) - These are for the user only. You are inside a docker container and cannot run docker
 
 ## Environment variables
 
