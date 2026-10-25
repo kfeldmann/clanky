@@ -372,6 +372,124 @@ fn first_request_messages(output: &std::process::Output) -> Vec<serde_json::Valu
         .clone()
 }
 
+/// A plugin that streams far more text than a pipe buffers (a few
+/// hundred KB, well past the 64 KB pipe capacity), so a consumer that
+/// stops reading (`| head -1`) is guaranteed to break the writer rather
+/// than being absorbed by the kernel's buffer.
+const VERBOSE_PLUGIN: &str = r#"#!/bin/sh
+PAD='................................................................'
+while IFS= read -r line; do
+  case "$line" in
+    *'"hello"'*)
+      printf '%s\n' '{"type":"hello","protocolVersion":2,"name":"hello-world","capabilities":{"listModels":false},"defaultModel":"hello-world/tiny"}'
+      ;;
+    *'"chat"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      i=0
+      while [ "$i" -lt 2000 ]; do
+        printf '{"type":"chunk","requestId":%s,"payload":{"kind":"text","text":"line %s of the answer %s\\n"}}\n' "$id" "$i" "$PAD"
+        i=$((i+1))
+      done
+      printf '{"type":"done","requestId":%s,"finishReason":"stop"}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+#[test]
+fn a_closed_stdout_aborts_the_turn_with_a_nonzero_exit() {
+    // Finding 18: `clanky -p … | head -1` closes the response channel
+    // after one line. The run used to stream into the void, keep calling
+    // the model, and exit 0. Now the failure abandons the turn and exits
+    // non-zero, naming the dead stream.
+    let dir = plugin_dir("hello-world", VERBOSE_PLUGIN);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_clanky"))
+        .args(["--provider", "hello-world", "-p", "talk a lot"])
+        .current_dir(&dir)
+        .env("HOME", &dir)
+        .env("PATH", path_with(&dir))
+        .env("CLANKY_PLUGIN_DEBUG", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run clanky");
+
+    // Read exactly one line of stdout, then drop the pipe: the writer
+    // gets EPIPE / a failed write on its next attempt.
+    {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout piped"));
+        stdout.read_line(&mut line).expect("first line");
+        assert!(!line.is_empty(), "the first answer line arrived: {line:?}");
+    }
+    let output = child.wait_with_output().expect("wait for clanky");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a dead response channel must not exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no longer writable"),
+        "the dead stream is the surfaced error; stderr: {stderr}"
+    );
+    // The session file's terminal record names the real reason, not the
+    // plugin-death symptom of the kill that stops the turn.
+    let records = session_records(&dir);
+    let last = records.last().expect("the turn's records were flushed");
+    assert_eq!(
+        last["type"], "error",
+        "the turn is recorded as failed: {last}"
+    );
+    assert!(
+        last["message"]
+            .as_str()
+            .unwrap()
+            .contains("no longer writable"),
+        "the recorded reason is the dead response channel: {last}"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn an_invalid_name_aborts_before_any_session_file_is_created() {
+    // Finding 19: `--name` is a user value. An invalid one must be a
+    // usage error, not a run that quietly records under a generated
+    // name — so nothing may be created, and the turn must not run.
+    let dir = plugin_dir("hello-world", PLUGIN);
+    let output = run_clanky(
+        &dir,
+        &[
+            "--provider",
+            "hello-world",
+            "--name",
+            "has space",
+            "-p",
+            "say hi",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "an invalid --name must fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid session name"),
+        "the error names the bad value; stderr: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("Hello from a plugin!"),
+        "the turn must not run"
+    );
+    let sessions = dir.join(".clanky/sessions");
+    assert!(
+        !sessions.exists() || std::fs::read_dir(&sessions).unwrap().next().is_none(),
+        "no session file may be created under a substituted name"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn print_mode_records_the_same_records_a_tui_run_would() {
     // The tool-call transcript (thinking, call, result, final answer,

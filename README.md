@@ -215,6 +215,14 @@ model never generates images).
 Sessions always live in the **project scope** (`./.clanky/sessions/`);
 there is no user-scope session store.
 
+A session file is created **owner-only** (`0600`) and the plugin log
+(`.clanky/logs/plugin-<name>.log`) likewise: both can carry the
+unredacted conversation — tool output from a command like `env`, plugin
+stderr — so they are not world-readable. The mode is set when the file is
+created, not afterwards, so there is no window where it is not. An
+*existing* file's permissions are left alone: tightening those is the
+owner's call.
+
 Sessions are recorded in **both** modes — the TUI and print mode (`-p`)
 autosave alike. `--no-session` (or `session = false` in settings.toml;
 the flag wins) turns recording off in every mode: no session file is
@@ -250,8 +258,10 @@ appended — from the resumed session's perspective the settings changed
 mid-session, in order.
 
 `--name NAME` starts a session under a fixed name instead of the generated
-timestamped one (same validation as `/name`, in both modes);
-`--name` together with `--resume` is a usage error — the resumed file
+timestamped one (same validation as `/name`, in both modes). An invalid
+name is a **usage error that aborts the run** — the name is never quietly
+replaced with a generated one, and no session file is created.
+`--name` together with `--resume` is a usage error too — the resumed file
 already has its name (`/name` can still rename it mid-session).
 
 Sessions autosave as the conversation happens. When a turn is cut short —
@@ -311,7 +321,8 @@ protocol over stdin/stdout (see `design-docs/provider-protocol.md`). This means:
   `DEEPINFRA_TOKEN` / `DEEPINFRA_URL`); Clanky never handles provider keys.
 - **Isolation.** Each plugin is a long-lived subprocess (one per session,
   spawned lazily on first use). Its stderr goes to
-  `./.clanky/logs/plugin-<name>.log`, never to the chat; a crash mid-turn
+  `./.clanky/logs/plugin-<name>.log` (created owner-only, `0600` — it can
+  carry secrets the plugin echoed), never to the chat; a crash mid-turn
   surfaces an error and the plugin is respawned on the next turn.
 
 The provider's default model (used when neither settings nor `--model` name
@@ -603,6 +614,10 @@ the agent's response goes to **stdout**, and activity — thinking, tool
 calls, tool results, retry notices — to **stderr**, so
 `clanky -p ... | grep` style pipes stay clean.
 
+The trailing prompt is taken verbatim, even when it starts with a dash
+(e.g. `clanky -p -q -- -dash leading prompt`); flags must still come
+before it.
+
 Every printed entry ends with exactly one blank line, so consecutive
 entries read as units:
 
@@ -630,6 +645,20 @@ agent's response and errors — no thinking, tool calls, or tool results:
 ```sh
 clanky -p -q "summarize this repo" > summary.txt
 ```
+
+`-q` without `-p` is a usage error when the TUI would launch
+(`--quiet is only available in print mode`); the redirected-stdin/stdout
+fallback still counts as print mode, so `clanky -q < prompt` is fine.
+
+If the **response** channel goes away mid-turn — `clanky -p … | head -1`
+closes stdout after the first line — the turn is abandoned instead of
+streaming into the void: the provider plugin is killed, so the in-flight
+request fails and no further round is attempted (a tool call already
+running in the current round finishes, but its result has nowhere to
+print). The session file still gets its partial flush, and clanky exits
+non-zero with `output stream is no longer writable …`. A lost **activity**
+stream (stderr, `2>&-`) is not fatal: the answer is still arriving on
+stdout, so the run continues and just stops writing activity.
 
 Like the TUI, a print-mode run records a session file under
 `.clanky/sessions/` — the same records a TUI run would leave, including

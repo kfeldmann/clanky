@@ -387,6 +387,11 @@ real tenant.
        was deleted. Print-mode events go through `PrintSink` in `main.rs` (testable against
        captured streams). `-q` in TUI mode is a usage error (`Error::QuietRequiresPrint`); in
        quiet mode retry notices are suppressed too (they're activity, not errors).
+       Note: the TUI rejection was documented here but not actually implemented until the
+       front-end choice was extracted into `select_front_end` (main.rs) — the flag was
+       accepted and silently ignored, leaving `QuietRequiresPrint` as dead code. The
+       redirected-stdin/stdout fallback counts as print mode, so `clanky -q < prompt`
+       remains valid without `-p`.
    - [x] Every print-mode entry gets exactly one blank line after it. Assistant
      text blocks previously ended with whatever trailing whitespace the stream
      happened to deliver (often none at all), so `clanky -p` printed a response
@@ -1124,3 +1129,49 @@ Later fixes (code review, post-M20):
   session transcript, a review quoting it) was classified as failed. It now
   checks only that the output's final line starts with `[exit status: ` and
   ends with `]` — the exact shape `BashTool::format` emits as the last line.
+- **Print mode: a dead response channel abandons the turn** (`crates/clanky/src/main.rs`).
+  Every `PrintSink` write used to be `writeln!(…).ok()`, so a closed stdout
+  (`clanky -p … | head -1`) kept the turn alive: the model and tools ran on with
+  output going nowhere, and the process exited 0. The sink now records the first
+  write failure and `run_pipe` kills the plugin through the same `CancelHandle`
+  ctrl+c uses (idempotent), so the in-flight request fails and the loop does not
+  start another round — a tool call already dispatched in the current round still
+  finishes (bounded work, nowhere to print). The sink's `finish()` closes the
+  open block and flushes stdout, and the failure is taken from the sink *after*
+  the turn — so a failure in the closing writes or in that final `flush()`
+  counts too (a closed pipe can first show up at the flush, with the data still
+  buffered). `run_pipe` then records the turn's final state under that real
+  reason (so the session file says "response channel gone", not the plugin-death
+  symptom) and returns `Error::PrintWriteFailed` — a non-zero exit naming the
+  dead stream. Session-file writes stay non-fatal, as before.
+  The sink keeps two failure slots: **response** (stdout) is fatal, **activity**
+  (stderr) is not — `clanky -p … 2>&-` still delivers the answer, it just stops
+  writing activity. Test: `a_closed_stdout_aborts_the_turn_with_a_nonzero_exit`
+  (a plugin streaming past the 64 KB pipe buffer, one line read, then dropped).
+- **`--name` is never silently replaced** (`main.rs`, `recorder.rs`, `tui/mod.rs`).
+  An invalid `--name` used to be reported to stderr and the run continued under a
+  generated name, contradicting both the recorder's doc comment and the
+  user-values invariant. `main::run` now validates the name before either front
+  end starts and aborts with the validation error; `Recorder::with_name` returns
+  a `Result` instead of reporting-and-ignoring, so a future caller cannot
+  reintroduce the substitution (the TUI reports it and records under no name,
+  which cannot happen through the CLI). Test:
+  `an_invalid_name_aborts_before_any_session_file_is_created` asserts a non-zero
+  exit, the message, no answer, and no session file.
+- **Session files, plugin logs and editor buffers are created owner-only**
+  (`session.rs`, `clanky-protocol/src/process.rs`, `tui/editor.rs`). These files
+  can carry the unredacted conversation (a model running `env`, plugin stderr),
+  so a *new* file asks for `0600` at creation via `OpenOptions::mode` +
+  `create_new`/`create` — not a `chmod` afterwards, which leaves the umask
+  default in place for the instant between `open` and `chmod`. An existing
+  file's mode is deliberately left alone (tightening it is the owner's call).
+  Tests: `a_fresh_session_file_is_owner_only`,
+  `a_reopened_session_file_keeps_its_own_mode`, `a_new_plugin_log_is_owner_only`,
+  `an_existing_plugin_log_keeps_its_mode`, `the_buffer_file_is_owner_only`.
+- **The editor buffer is created exclusively** (`tui/editor.rs`). The temp name
+  is only as unique as pid + clock, so a plain `write` could silently truncate a
+  file a concurrent session was editing. `write_buffer_file` now tries
+  `create_new` (`O_EXCL`) and moves to the next candidate name on a collision
+  (a stale file or a recycled pid is benign); it returns the path it actually
+  owns, removes a half-seeded file if the initial write fails, and reports
+  anything else. Tests: `the_buffer_file_is_created_exclusively`.

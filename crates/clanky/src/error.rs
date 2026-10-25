@@ -137,6 +137,17 @@ pub enum Error {
 
     #[error("editor failed: {0}")]
     EditorFailed(String),
+
+    #[error("output stream is no longer writable ({stream}); the turn was abandoned")]
+    PrintWriteFailed {
+        /// Which stream failed, described by its `ErrorKind`.
+        stream: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("cannot create the editor buffer file: {0}")]
+    EditorTempFile(std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

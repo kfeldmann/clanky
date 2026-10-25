@@ -181,7 +181,10 @@ fn run_pipe(
         clanky::recorder::Recorder::new(effective.clone()).recording(settings.record_sessions());
     let mut errors = clanky::recorder::StderrErrors;
     if let Some(name) = name {
-        recorder = recorder.with_name(name, &mut errors);
+        // Already validated in `run` (finding 19); the recorder checks
+        // again so an invalid name can never quietly become a generated
+        // one. Either way it is an error, not a substitution.
+        recorder.with_name(name)?;
     }
 
     // `--resume NAME`: load the session, rebuild the conversation the next
@@ -262,9 +265,13 @@ fn run_pipe(
     // The write-failure abort (finding 18): a closed response channel
     // (`clanky -p … | head -1`) kills the plugin so the in-flight request
     // fails and the turn unwinds, instead of streaming into the void and
-    // exiting 0. The same mechanism ctrl+c uses (kill is idempotent).
+    // exiting 0. The turn loop notices at its next `chat` — the plugin is
+    // dead — so no further round is attempted (a tool call already
+    // dispatched in the current round still finishes; it is bounded work
+    // and its result simply has nowhere to print). The same mechanism
+    // ctrl+c uses (kill is idempotent), so calling it once per event
+    // after the failure is safe.
     let sink_killer = provider_session.cancel_handle();
-    let write_failure = std::cell::RefCell::new(None);
     let result = {
         let mut out = stdout.lock();
         let mut err = stderr.lock();
@@ -282,40 +289,52 @@ fn run_pipe(
                 // completes it.
                 clanky::recorder::record_turn_event(&mut recorder, &mut errors, &event);
                 sink.event(event, &mut out, &mut err);
-                if let Some(fail) = sink.write_failed() {
-                    let failure = clanky::error::Error::PrintWriteFailed {
-                        stream: fail.kind().to_string(),
-                        source: std::io::Error::new(fail.kind(), fail.to_string()),
-                    };
-                    *write_failure.borrow_mut() = Some(failure);
+                if sink.write_failed().is_some() {
                     sink_killer.kill();
                 }
             },
         );
-        // A block that ran to the end of the turn (a thinking block, or
-        // the answer text) still needs its closing separator: the trim
-        // plus blank line were held back while it was open.
-        sink.close_blocks(&mut out, &mut err);
+        // Close the block that ran to the end of the turn (its trim plus
+        // blank line were held back while it was open) and flush the
+        // response stream: a consumer that went away can surface the
+        // failure at the flush, with the data still buffered, rather than
+        // on a write.
+        sink.finish(&mut out, &mut err);
         result
     };
 
-    // The turn ended (success, error, or the ctrl+c-induced plugin
-    // death): record its final state — partial flush plus the error
-    // record — before the process exits.
-    recorder.record_done(&mut errors, &result);
-
-    // The response text was streamed incrementally; its closing blank
-    // line was written by `close_blocks` above (on both success and
-    // error), so stdout just needs its final flush.
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    stdout.flush()?;
     // The write failure is the actionable error: the turn's own result is
-    // the plugin-death symptom of the kill above.
-    if let Some(failure) = write_failure.into_inner() {
-        return Err(failure);
+    // the plugin-death symptom of the kill above. The sink holds the
+    // first failure, including one from the closing writes above (which
+    // happen after the turn's last event). The turn's final state is
+    // recorded under that real reason, so the session file says why the
+    // turn stopped rather than repeating the symptom.
+    if let Some(fail) = sink.write_failed() {
+        recorder.record_done(&mut errors, &Err(write_failure(fail)));
+        return Err(write_failure(fail));
     }
+    recorder.record_done(&mut errors, &result);
     result.map(|_| ())
+}
+
+/// The one actionable error for a dead response channel: which stream
+/// failed (by `ErrorKind`) and why. The turn's own error is the
+/// plugin-death symptom of the kill, so this replaces it.
+fn write_failure(fail: &std::io::Error) -> clanky::error::Error {
+    clanky::error::Error::PrintWriteFailed {
+        stream: fail.kind().to_string(),
+        source: std::io::Error::new(fail.kind(), fail.to_string()),
+    }
+}
+
+/// Which of the sink's two streams a write targets: the answer (stdout)
+/// or the activity (stderr). They differ in what a failure means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    /// The response channel: the answer, on stdout.
+    Response,
+    /// The activity channel: thinking, tool calls, retries, on stderr.
+    Activity,
 }
 
 /// Print-mode event sink: response text to stdout, activity to stderr so
@@ -329,8 +348,8 @@ fn run_pipe(
 /// closes — the block then ends on a clean trim and the close adds two
 /// newlines: one to end the block's last line, one blank line after it.
 /// The discrete entries (tool calls, tool results, retry notices) are
-/// written with `writeln!`, so a single trailing `writeln!` produces the
-/// blank line.
+/// written with their own trailing newline plus one more, so they too
+/// end with a blank line.
 ///
 /// `event` writes into the callers' streams so tests can capture output;
 /// the real run passes the process stdout/stderr.
@@ -351,13 +370,19 @@ struct PrintSink {
     /// prefix (a paragraph just started: the block opened, or a newline
     /// was written or is pending in `pending_ws`).
     need_quote: bool,
-    /// The first write failure on the response channel (finding 18): a
-    /// closed stdout (`clanky -p … | head -1`) must stop the turn instead
-    /// of letting it keep calling the model with output going nowhere and
-    /// exiting 0. Session-file writes stay non-fatal (their failures are
-    /// the error sink's business — a logging problem, not a response
-    /// problem); only `out`/`err` failures are fatal.
-    write_error: Option<std::io::Error>,
+    /// The first write failure on the **response** channel (stdout,
+    /// finding 18): a closed stdout (`clanky -p … | head -1`) must stop
+    /// the turn instead of letting it keep calling the model with output
+    /// going nowhere and exiting 0. Session-file writes stay non-fatal
+    /// (their failures are the error sink's business — a logging
+    /// problem, not a response problem).
+    response_error: Option<std::io::Error>,
+    /// The first write failure on the **activity** channel (stderr).
+    /// Not fatal: the answer is still reaching stdout, and a run whose
+    /// stderr was closed (`2>&-`) is a run whose owner chose not to see
+    /// the activity — killing a healthy turn over it would be worse than
+    /// losing diagnostics. Recorded only to stop retrying every write.
+    activity_error: Option<std::io::Error>,
 }
 
 impl PrintSink {
@@ -368,14 +393,24 @@ impl PrintSink {
             in_thinking: false,
             pending_ws: String::new(),
             need_quote: false,
-            write_error: None,
+            response_error: None,
+            activity_error: None,
         }
     }
 
     /// Whether a write to the response channel has failed. Once set, the
-    /// turn should be abandoned: the consumer of the output is gone.
+    /// turn should be abandoned: the consumer of the answer is gone.
     pub fn write_failed(&self) -> Option<&std::io::Error> {
-        self.write_error.as_ref()
+        self.response_error.as_ref()
+    }
+
+    /// The failure slot for a stream: the response channel's failures
+    /// abort the turn, the activity channel's do not.
+    fn error_slot(&mut self, channel: Channel) -> &mut Option<std::io::Error> {
+        match channel {
+            Channel::Response => &mut self.response_error,
+            Channel::Activity => &mut self.activity_error,
+        }
     }
 
     /// Write to a response-channel stream, recording the first failure.
@@ -398,7 +433,7 @@ impl PrintSink {
                 // it is dropped so the close can trim cleanly. If more
                 // text arrives, the held whitespace is emitted first.
                 self.in_text = true;
-                self.hold_ws(out, delta, false);
+                self.hold_ws(out, delta, false, Channel::Response);
             }
             TurnEvent::Thinking { delta } => {
                 if self.quiet {
@@ -413,7 +448,7 @@ impl PrintSink {
                     self.need_quote = true;
                 }
                 self.in_thinking = true;
-                self.hold_ws(err, delta, true);
+                self.hold_ws(err, delta, true, Channel::Activity);
             }
             // Round summaries are for the session recorder (M4); pipe
             // mode has already streamed the text deltas.
@@ -438,9 +473,9 @@ impl PrintSink {
                         "INFO: ↻ {message} — retrying in {:.1}s ({attempt}/{max_retries})\n",
                         delay.as_secs_f64()
                     ),
-                    &mut self.write_error,
+                    &mut self.activity_error,
                 );
-                Self::out_write(err, "\n", &mut self.write_error);
+                Self::out_write(err, "\n", &mut self.activity_error);
             }
             // Activity entries end with a blank line so consecutive tool
             // rounds and the following answer text breathe, matching the
@@ -451,8 +486,12 @@ impl PrintSink {
                     return;
                 }
                 let preview = tools::truncate_call_arguments(&arguments, tools::CALL_PREVIEW_CHARS);
-                Self::out_write(err, &format!("● {name} {preview}\n"), &mut self.write_error);
-                Self::out_write(err, "\n", &mut self.write_error);
+                Self::out_write(
+                    err,
+                    &format!("● {name} {preview}\n"),
+                    &mut self.activity_error,
+                );
+                Self::out_write(err, "\n", &mut self.activity_error);
             }
             TurnEvent::ToolResult { name, output, .. } => {
                 self.close_blocks(out, err);
@@ -471,12 +510,12 @@ impl PrintSink {
                 Self::out_write(
                     err,
                     &format!("{marker}{name}: {head}\n"),
-                    &mut self.write_error,
+                    &mut self.activity_error,
                 );
                 for l in lines {
-                    Self::out_write(err, &format!("{indent}{l}\n"), &mut self.write_error);
+                    Self::out_write(err, &format!("{indent}{l}\n"), &mut self.activity_error);
                 }
-                Self::out_write(err, "\n", &mut self.write_error);
+                Self::out_write(err, "\n", &mut self.activity_error);
             }
         }
     }
@@ -486,40 +525,41 @@ impl PrintSink {
     /// written at the start of every paragraph: after the block opens and
     /// after each newline (including one held in `pending_ws`), before the
     /// next character that is not itself a newline.
-    fn hold_ws<W: Write>(&mut self, w: &mut W, delta: String, quote: bool) {
+    fn hold_ws<W: Write>(&mut self, w: &mut W, delta: String, quote: bool, channel: Channel) {
         let trimmed = delta.trim_end_matches(char::is_whitespace);
         let ws = &delta[trimmed.len()..];
         if !self.pending_ws.is_empty() && !trimmed.is_empty() {
-            self.write_quoted(w, &self.pending_ws.clone(), quote);
+            self.write_quoted(w, &self.pending_ws.clone(), quote, channel);
             // The held whitespace has now been emitted; drop it so it is
             // not re-emitted before every later delta.
             self.pending_ws.clear();
         }
-        self.write_quoted(w, trimmed, quote);
+        self.write_quoted(w, trimmed, quote, channel);
         self.pending_ws.push_str(ws);
-        if self.write_error.is_none()
+        let slot = self.error_slot(channel);
+        if slot.is_none()
             && let Err(err) = w.flush()
         {
-            self.write_error = Some(err);
+            *slot = Some(err);
         }
     }
 
     /// Write text, inserting the `> ` quote prefix after each newline
     /// (and before a leading paragraph character) when `quote` is set.
-    fn write_quoted<W: Write>(&mut self, w: &mut W, text: &str, quote: bool) {
+    fn write_quoted<W: Write>(&mut self, w: &mut W, text: &str, quote: bool, channel: Channel) {
         if !quote {
-            Self::out_write(w, text, &mut self.write_error);
+            Self::out_write(w, text, self.error_slot(channel));
             return;
         }
         for c in text.chars() {
             if self.need_quote && c != '\n' {
-                Self::out_write(w, "> ", &mut self.write_error);
+                Self::out_write(w, "> ", self.error_slot(channel));
                 self.need_quote = false;
             }
             if c == '\n' {
                 self.need_quote = true;
             }
-            Self::out_write(w, &c.to_string(), &mut self.write_error);
+            Self::out_write(w, &c.to_string(), self.error_slot(channel));
         }
     }
 
@@ -530,11 +570,11 @@ impl PrintSink {
         if self.in_text {
             self.in_text = false;
             self.pending_ws.clear();
-            Self::out_write(out, "\n\n", &mut self.write_error);
-            if self.write_error.is_none()
+            Self::out_write(out, "\n\n", &mut self.response_error);
+            if self.response_error.is_none()
                 && let Err(err) = out.flush()
             {
-                self.write_error = Some(err);
+                self.response_error = Some(err);
             }
         }
     }
@@ -544,7 +584,7 @@ impl PrintSink {
         if self.in_thinking {
             self.in_thinking = false;
             self.pending_ws.clear();
-            Self::out_write(err, "\n\n", &mut self.write_error);
+            Self::out_write(err, "\n\n", &mut self.activity_error);
         }
     }
 
@@ -555,6 +595,18 @@ impl PrintSink {
     fn close_blocks<O: Write, E: Write>(&mut self, out: &mut O, err: &mut E) {
         self.close_text(out);
         self.close_thinking(err);
+    }
+
+    /// End-of-turn cleanup: close any open block, then flush the response
+    /// stream so a consumer that went away is caught here instead of
+    /// silently at process exit.
+    fn finish<O: Write, E: Write>(&mut self, out: &mut O, err: &mut E) {
+        self.close_blocks(out, err);
+        if self.response_error.is_none()
+            && let Err(err) = out.flush()
+        {
+            self.response_error = Some(err);
+        }
     }
 }
 
@@ -570,7 +622,7 @@ mod tests {
             sink.event(event.clone(), &mut out, &mut err);
         }
         // Mirror the post-turn behavior of `run_pipe`.
-        sink.close_blocks(&mut out, &mut err);
+        sink.finish(&mut out, &mut err);
         (
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
@@ -858,8 +910,13 @@ mod tests {
         // reported to stderr and let the run continue under a generated
         // name — the user's value silently replaced. Now the run aborts
         // before any front end starts.
-        assert!(clanky::session::validate_name("-bad").is_err());
         assert!(clanky::session::validate_name("has space").is_err());
+        assert!(clanky::session::validate_name("with/slash").is_err());
+        assert!(clanky::session::validate_name("").is_err());
+        assert!(clanky::session::validate_name(".hidden").is_err());
+        // A leading dash is a legal session name (the shell's `--` is what
+        // keeps clap from reading it as a flag).
+        assert!(clanky::session::validate_name("-dash").is_ok());
         assert!(clanky::session::validate_name("ok-name_1").is_ok());
     }
 
@@ -913,10 +970,10 @@ mod tests {
     }
 
     #[test]
-    fn a_write_failure_on_stderr_is_recorded_too() {
-        // stderr carries activity, not the response, but it is still the
-        // response channel: a run whose stderr is gone cannot report the
-        // turn either.
+    fn a_write_failure_on_stderr_is_not_fatal() {
+        // stderr carries activity, not the answer: `clanky -p … 2>&-` must
+        // still deliver the response to stdout. The failure is recorded
+        // (so later writes are skipped) but never abandons the turn.
         let mut sink = PrintSink::new(false);
         let mut out = Vec::new();
         let mut err = DyingWriter::new(0);
@@ -928,7 +985,19 @@ mod tests {
             &mut out,
             &mut err,
         );
-        assert!(sink.write_failed().is_some(), "the failure is recorded");
+        assert!(
+            sink.write_failed().is_none(),
+            "a lost activity stream must not abandon the turn"
+        );
+        // The answer still arrives.
+        sink.event(
+            TurnEvent::Text {
+                delta: "answer".into(),
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "answer");
     }
 
     #[test]

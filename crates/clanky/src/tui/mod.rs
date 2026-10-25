@@ -88,6 +88,7 @@ use crate::export::{self, ExportOptions};
 use crate::prompts::{self, Template};
 use crate::provider::ProviderSession;
 use crate::recorder;
+use crate::recorder::ErrorSink as _;
 use crate::session::{self, SessionInfo};
 use crate::settings::{SamplingParams, SessionSettings, Settings};
 use crate::tools;
@@ -750,7 +751,13 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     let mut state = SessionState::new(launch.effective.clone()).recording(launch.recording);
     let mut transcript_errors = TranscriptErrors::default();
     if let Some(name) = launch.session_name.clone() {
-        state = state.with_name(&name, &mut transcript_errors);
+        // Validated in `main::run` (finding 19); a failure here would be
+        // a bug, not a user error, so it must not silently fall back to
+        // a generated name. Report it and keep recording under no name —
+        // the same visible outcome as a rejected `--name` in print mode.
+        if let Err(err) = state.with_name(&name) {
+            transcript_errors.report(err.to_string());
+        }
     }
     // Prefetch the provider's model catalog in the background: it prices
     // the session-cost display and makes `/model` instant. The fetch also

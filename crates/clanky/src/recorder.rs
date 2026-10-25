@@ -68,18 +68,21 @@ pub struct Recorder {
 
 impl Recorder {
     /// Name the session file before anything is recorded (`--name`).
-    /// Consuming-and-returning like the `recording` builder; on an invalid
-    /// name the recorder is dropped (the caller reports the validation
-    /// error and discards the recorder anyway).
-    pub fn with_name(mut self, name: &str, errors: &mut dyn ErrorSink) -> Self {
+    ///
+    /// An invalid name is an error, never a silent fallback to a
+    /// generated one (finding 19): `--name` is a user-provided value, so
+    /// replacing it would break the user-values invariant. The callers
+    /// validate it up front too (an invalid `--name` aborts the run
+    /// before either front end starts, with the same message this
+    /// returns); this is the second check that keeps a future caller from
+    /// reintroducing the substitution. A no-op with recording off — there
+    /// is no file to name.
+    pub fn with_name(&mut self, name: &str) -> Result<()> {
         if self.recording {
-            if let Err(err) = session::validate_name(name) {
-                errors.report(err.to_string());
-                return self;
-            }
+            session::validate_name(name)?;
             self.pending_name = Some(name.to_string());
         }
-        self
+        Ok(())
     }
 
     /// A recorder for a fresh session, starting from the merged
@@ -466,6 +469,46 @@ mod tests {
         let state =
             Recorder::with_dir(dir.clone(), "session", SessionSettings::default()).recording(false);
         (state, dir)
+    }
+
+    #[test]
+    fn an_invalid_name_is_an_error_not_a_generated_name() {
+        // Finding 19: the user's `--name` must never be silently replaced
+        // by a generated one. `with_name` refuses instead, and the
+        // recorder keeps no name at all.
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-bad-name-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = Recorder::with_dir(dir.clone(), "session", SessionSettings::default());
+        state.pending_name = None;
+        let err = state.with_name("has space").unwrap_err();
+        assert!(err.to_string().contains("invalid session name"), "{err}");
+        assert_eq!(state.current_name(), None, "no name was substituted");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_valid_name_is_taken() {
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-good-name-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = Recorder::with_dir(dir.clone(), "session", SessionSettings::default());
+        state.pending_name = None;
+        state.with_name("fix-123").unwrap();
+        assert_eq!(state.current_name().as_deref(), Some("fix-123"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

@@ -491,20 +491,21 @@ fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
     // Plugin stderr can carry secrets (a model's tool output echoed back,
-    // an env-dumping command) — finding 38: the log is created
-    // owner-only rather than umask-world-readable. An existing log's
-    // permissions are not touched.
+    // an env-dumping command) — finding 38: the log must not be born
+    // umask-world-readable. A *new* log asks for 0600 at creation rather
+    // than being `chmod`ed afterwards, which would leave the umask
+    // default in place for the instant between `open` and `chmod`. An
+    // existing log is opened as-is and its mode left alone: tightening it
+    // is the owner's call.
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
-    Ok(file)
+    options.open(path)
 }
 
 #[cfg(test)]
@@ -523,6 +524,57 @@ mod tests {
             dead: AtomicBool::new(false),
             log_path: None,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_new_plugin_log_is_owner_only() {
+        // Finding 38: plugin stderr can carry secrets, so a freshly
+        // created log must not be world-readable. The mode is requested
+        // at creation, so there is no window where it is not.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-plugin-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logs").join("plugin-test.log");
+        open_log(&path).expect("log opens");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "group/other must have no bits: {mode:o}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_existing_plugin_log_keeps_its_mode() {
+        // Appending to a log the owner already has must not fight them
+        // over its permissions.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-plugin-log-existing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plugin-test.log");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_log(&path).expect("log opens");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "the owner's mode is untouched: {mode:o}"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

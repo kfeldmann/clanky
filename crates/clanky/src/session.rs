@@ -227,6 +227,30 @@ enum Mode {
     Reopen,
 }
 
+/// Create a file that only its owner can read (0600 on unix).
+///
+/// Session files carry the unredacted conversation — tool output (a model
+/// running `env`), plugin stderr excerpts — so they must not be born
+/// world-readable (finding 38). The mode is requested at creation
+/// (`O_EXCL | O_CREAT` with a mode) rather than `chmod`ed afterwards: a
+/// later `chmod` would leave the umask's default mode in place for the
+/// instant between `open` and `chmod`, which is exactly the window a
+/// curious local user needs. `create_new` also keeps the file exclusive,
+/// so two sessions can never interleave their headers.
+///
+/// An *existing* file's permissions are left alone: tightening those is
+/// the owner's call, not ours.
+fn create_owner_only(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 impl SessionWriter {
     /// A writer for a new session file (not created until the first
     /// record is appended).
@@ -308,7 +332,7 @@ impl SessionWriter {
         if self.header.created == 0 {
             self.header.created = now_millis();
         }
-        let mut file = File::create_new(&self.path).map_err(|source| Error::WriteSession {
+        let mut file = create_owner_only(&self.path).map_err(|source| Error::WriteSession {
             path: self.path.clone(),
             source,
         })?;
@@ -732,6 +756,44 @@ mod tests {
             },
         );
         assert!(!path.exists(), "no file before the first record");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_fresh_session_file_is_owner_only() {
+        // Finding 38: a session file carries the unredacted conversation
+        // — tool output, possibly secrets — so it must not be created
+        // world-readable. (An existing file's mode is left alone.)
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("owner-only");
+        let path = write_session(&dir, "secret", &sample_records());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "group/other must have no bits: {mode:o}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_reopened_session_file_keeps_its_own_mode() {
+        // The append path must not fight the user over an existing
+        // file's permissions.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("reopen-mode");
+        let path = write_session(&dir, "pre-existing", &sample_records());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut writer = SessionWriter::reopen(path.clone());
+        writer
+            .append(&Record::User {
+                text: "again".into(),
+            })
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "the user's mode is untouched: {mode:o}"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
