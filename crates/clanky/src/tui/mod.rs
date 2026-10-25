@@ -572,13 +572,15 @@ fn picker_for(kind: &PickerKind) -> picker::Picker {
             "resume",
             infos
                 .iter()
-                .map(|info| picker::PickerItem {
-                    label: info.name.clone(),
-                    detail: format!(
-                        "{} · {} turns",
-                        session::format_datetime(info.modified),
-                        info.turns
-                    ),
+                .map(|info| {
+                    picker::PickerItem::new(
+                        info.name.clone(),
+                        format!(
+                            "{} · {} turns",
+                            session::format_datetime(info.modified),
+                            info.turns
+                        ),
+                    )
                 })
                 .collect(),
         ),
@@ -586,9 +588,19 @@ fn picker_for(kind: &PickerKind) -> picker::Picker {
             "model",
             models
                 .iter()
-                .map(|model| picker::PickerItem {
-                    label: model.id.clone(),
-                    detail: model_detail(model),
+                .map(|model| {
+                    // The row leads with the friendly name; the id is what a
+                    // turn actually sends to the provider, so it stays
+                    // reachable through the filter without being printed
+                    // beside a name that usually repeats it.
+                    picker::PickerItem::new(
+                        model
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| model.id.clone()),
+                        model_detail(model),
+                    )
+                    .with_search(model.id.clone())
                 })
                 .collect(),
         ),
@@ -596,14 +608,16 @@ fn picker_for(kind: &PickerKind) -> picker::Picker {
             "provider",
             crate::provider::available()
                 .iter()
-                .map(|name| picker::PickerItem {
-                    label: name.clone(),
-                    // The resolved command is cheap and needs no handshake;
-                    // the default model is only known after a handshake, so
-                    // it is not shown here.
-                    detail: crate::provider::command_for(name)
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_default(),
+                .map(|name| {
+                    picker::PickerItem::new(
+                        name.clone(),
+                        // The resolved command is cheap and needs no handshake;
+                        // the default model is only known after a handshake, so
+                        // it is not shown here.
+                        crate::provider::command_for(name)
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                    )
                 })
                 .collect(),
         ),
@@ -611,10 +625,7 @@ fn picker_for(kind: &PickerKind) -> picker::Picker {
             "thinking",
             THINKING_OPTIONS
                 .iter()
-                .map(|(value, detail)| picker::PickerItem {
-                    label: (*value).to_string(),
-                    detail: (*detail).to_string(),
-                })
+                .map(|(value, detail)| picker::PickerItem::new(*value, *detail))
                 .collect(),
         ),
         PickerKind::Palette(items) => (
@@ -622,14 +633,13 @@ fn picker_for(kind: &PickerKind) -> picker::Picker {
             items
                 .iter()
                 .map(|item| match item {
-                    PaletteItem::Builtin { text, hint } => picker::PickerItem {
-                        label: text.clone(),
-                        detail: hint.clone(),
-                    },
-                    PaletteItem::Template(template) => picker::PickerItem {
-                        label: format!("/{}", template.name),
-                        detail: first_line(&template.content),
-                    },
+                    PaletteItem::Builtin { text, hint } => {
+                        picker::PickerItem::new(text.clone(), hint.clone())
+                    }
+                    PaletteItem::Template(template) => picker::PickerItem::new(
+                        format!("/{}", template.name),
+                        first_line(&template.content),
+                    ),
                 })
                 .collect(),
         ),
@@ -1605,12 +1615,10 @@ fn format_price(price: f64) -> String {
     }
 }
 
-/// Detail line for a model in the `/model` picker.
+/// Detail line for a model in the `/model` picker. The label already shows
+/// the model's name, so this carries only the attributes.
 fn model_detail(model: &ModelInfo) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(name) = &model.display_name {
-        parts.push(name.clone());
-    }
     if let Some(window) = model.context_window {
         parts.push(format!("ctx {window}"));
     }
@@ -2052,6 +2060,56 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_shows_the_name_and_filters_by_the_id() {
+        let model = |id: &str, name: Option<&str>| ModelInfo {
+            id: id.into(),
+            display_name: name.map(str::to_string),
+            context_window: None,
+            supports_thinking: None,
+            supports_tools: None,
+            supports_text_generation: None,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            cache_read_price_per_mtok: None,
+        };
+        let kind = PickerKind::Models(vec![
+            model("meta-llama/Llama-3-70B", Some("Llama 3")),
+            model("Qwen/Qwen3-Coder", None),
+        ]);
+        let mut picker = picker_for(&kind);
+
+        // Labels: the display name, or the id when the catalog has none.
+        let rows = |picker: &picker::Picker| -> Vec<String> {
+            picker
+                .lines(10)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+                .collect()
+        };
+        let texts = rows(&picker);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("Llama 3") && !t.contains("meta-llama/Llama-3-70B")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Qwen/Qwen3-Coder")),
+            "{texts:?}"
+        );
+
+        // Typing part of the id still finds the model, though the id is
+        // not on screen.
+        for c in "meta-llama".chars() {
+            picker.push_char(c);
+        }
+        let texts = rows(&picker);
+        assert!(texts.iter().any(|t| t.contains("Llama 3")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Qwen")), "{texts:?}");
+        assert_eq!(picker.confirm(), Some(0));
+    }
+
+    #[test]
     fn picker_builders_for_m5_commands() {
         let models = PickerKind::Models(vec![ModelInfo {
             id: "meta/Llama-3-70B".into(),
@@ -2072,8 +2130,9 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
         let all = texts.join("\n");
-        assert!(all.contains("meta/Llama-3-70B"), "{all}");
+        // The row leads with the name; the id is filter-only, never printed.
         assert!(all.contains("Llama 3"), "{all}");
+        assert!(!all.contains("meta/Llama-3-70B"), "{all}");
         assert!(all.contains("ctx 8192"), "{all}");
         assert!(all.contains("thinking"), "{all}");
         assert!(all.contains("$0.40 · $1.20 /Mtok"), "{all}");
@@ -2236,7 +2295,7 @@ mod tests {
                 output_price_per_mtok: Some(0.18),
                 cache_read_price_per_mtok: None,
             }),
-            "Model · ctx 4096 · thinking · $0.09 · $0.18 /Mtok"
+            "ctx 4096 · thinking · $0.09 · $0.18 /Mtok"
         );
         // Exactly two decimals, except round numbers lose them entirely.
         assert_eq!(

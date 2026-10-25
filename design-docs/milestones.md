@@ -1175,3 +1175,16 @@ Later fixes (code review, post-M20):
   (a stale file or a recycled pid is benign); it returns the path it actually
   owns, removes a half-seeded file if the initial write fails, and reports
   anything else. Tests: `the_buffer_file_is_created_exclusively`.
+- **The `/model` picker shows a model once, not twice** (`tui/picker.rs`,
+  `tui/mod.rs`). The row used the id as its label and the display name as the
+  first detail field, so the two — which usually say the same thing
+  (`meta-llama/Llama-3.3-70B-Instruct` / `Llama-3.3-70B-Instruct`) — printed
+  side by side, and a 175-model DeepInfra catalog made for long rows. The
+  label is now the display name (the id when the provider names none) and the
+  detail carries only the attributes (context window, thinking, prices).
+  The id is what a turn actually sends, so it is not lost: `PickerItem` gained
+  a filter-only `search` field (`PickerItem::new(...).with_search(id)`), which
+  `refilter` matches alongside the label while the row never prints it.
+  Typing part of an id still narrows the list, and `confirm()` still returns
+  the index into the original model list, so the selection path is unchanged.
+  Test: `model_picker_shows_the_name_and_filters_by_the_id`.

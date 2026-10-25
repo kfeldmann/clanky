@@ -2807,10 +2807,10 @@ mod tests {
     fn picker_box_rounds_the_rows() {
         let picker = Picker::new(
             "resume",
-            vec![super::super::picker::PickerItem {
-                label: "session-a".into(),
-                detail: "3 turns".into(),
-            }],
+            vec![super::super::picker::PickerItem::new(
+                "session-a",
+                "3 turns",
+            )],
         );
         let rows = picker_box(&picker, 60, 20);
         assert_eq!(rows.len(), 4, "border, search, item, border");

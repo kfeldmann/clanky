@@ -542,6 +542,13 @@ post-quit history all work. Two details of that model are visible:
   everything. When cost/context data is unavailable the hints
   (`/ commands · ctrl+c quit`) take their place on the right and are
   the last element to go.
+- Pickers (`/model`, `/provider`, `/thinking`, `/resume`, `/` for the
+  palette) list one row per option: a bold label and a dim detail line.
+  The `/model` row leads with the model's display name (or its id when
+  the provider names none) and puts the attributes — context window,
+  thinking, prices — in the detail, so the id is not repeated beside a
+  name that usually says the same thing. The id is still what the picker
+  *filters* on, and what `/model <id>` and the `settings:` note take.
 
 ### `ctrl+t` — show/hide thinking
 

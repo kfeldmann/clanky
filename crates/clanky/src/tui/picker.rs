@@ -9,10 +9,35 @@ use ratatui::text::{Line, Span};
 pub struct PickerItem {
     pub label: String,
     pub detail: String,
+    /// Text the filter matches but the row never shows — the handle behind
+    /// a friendly label (e.g. a model's id when the label is its display
+    /// name).
+    search: String,
+}
+
+impl PickerItem {
+    pub fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            search: String::new(),
+        }
+    }
+
+    /// Also match `text` while filtering, without displaying it.
+    pub fn with_search(mut self, text: impl Into<String>) -> Self {
+        self.search = text.into();
+        self
+    }
+
+    /// `query` is already lowercased by the caller.
+    fn matches(&self, query: &str) -> bool {
+        self.label.to_lowercase().contains(query) || self.search.to_lowercase().contains(query)
+    }
 }
 
 /// An open picker. Filtering is a case-insensitive substring match on the
-/// label; the selection survives filter changes.
+/// label (and any search-only text); the selection survives filter changes.
 #[derive(Debug)]
 pub struct Picker {
     title: String,
@@ -82,7 +107,7 @@ impl Picker {
             .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.label.to_lowercase().contains(&query))
+            .filter(|(_, item)| item.matches(&query))
             .map(|(i, _)| i)
             .collect();
         self.selected = 0;
@@ -155,18 +180,9 @@ mod tests {
         Picker::new(
             "test",
             vec![
-                PickerItem {
-                    label: "alpha".into(),
-                    detail: "a".into(),
-                },
-                PickerItem {
-                    label: "beta".into(),
-                    detail: "b".into(),
-                },
-                PickerItem {
-                    label: "alphabet".into(),
-                    detail: "c".into(),
-                },
+                PickerItem::new("alpha", "a"),
+                PickerItem::new("beta", "b"),
+                PickerItem::new("alphabet", "c"),
             ],
         )
     }
@@ -212,6 +228,38 @@ mod tests {
     }
 
     #[test]
+    fn search_only_text_filters_but_is_never_printed() {
+        let mut picker = Picker::new(
+            "test",
+            vec![
+                PickerItem::new("Llama 3", "ctx 8192").with_search("meta-llama/Llama-3-70B"),
+                PickerItem::new("Qwen", "").with_search("Qwen/Qwen3-Coder"),
+            ],
+        );
+        for c in "meta-llama".chars() {
+            picker.push_char(c);
+        }
+        assert_eq!(picker.confirm(), Some(0));
+        // Row 0 is the query echo (which of course shows what was typed);
+        // the item rows never do.
+        let texts = line_texts(&picker.lines(10));
+        assert!(texts[1].contains("Llama 3"), "{texts:?}");
+        assert!(
+            !texts[1..].iter().any(|t| t.contains("meta-llama")),
+            "search text is not displayed: {texts:?}"
+        );
+
+        // The label still matches too, so the friendly name keeps working.
+        for _ in 0.."meta-llama".len() {
+            picker.pop_char();
+        }
+        for c in "qwen".chars() {
+            picker.push_char(c);
+        }
+        assert_eq!(picker.confirm(), Some(1));
+    }
+
+    #[test]
     fn no_matches_shows_hint_and_confirm_is_none() {
         let mut picker = picker();
         picker.push_char('z');
@@ -231,10 +279,7 @@ mod tests {
         let mut picker = Picker::new(
             "test",
             (0..30)
-                .map(|i| PickerItem {
-                    label: format!("item-{i:02}"),
-                    detail: String::new(),
-                })
+                .map(|i| PickerItem::new(format!("item-{i:02}"), ""))
                 .collect(),
         );
         for _ in 0..20 {
