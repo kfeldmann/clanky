@@ -15,6 +15,10 @@ case "$instr" in
   *fail*) exit 3 ;;
   *stderr*) echo "stub stderr" >&2 ;;
   *big*) head -c 2097152 /dev/zero | tr '\0' 'x' ;;
+  # A grandchild that daemonizes out of the job's process group (setsid)
+  # and holds the stdout pipe: no process-group kill can reach it, so only
+  # a *bounded* capture join keeps the job from running to its 60s.
+  *pipeholder*) setsid sh -c 'sleep 60' & echo "started"; wait ;;
 esac
 "#;
 
@@ -257,5 +261,51 @@ fn missing_clanky_reports_spawn_error_per_job() {
             .as_str()
             .unwrap()
             .starts_with("spawn:")
+    );
+}
+
+#[test]
+fn a_dash_leading_instruction_is_not_parsed_as_a_flag() {
+    // Finding 27: the instruction is a trailing positional, so an
+    // instruction that begins with `-` would be flag-parsed by clap
+    // (`--resume`, say). The runner pushes `--` before it, so the value
+    // reaches argv verbatim and the job still runs.
+    let bin = setup();
+    let out = run(&bin, r#"{"jobs":[{"id":"a","instruction":"--resume"}]}"#);
+    assert!(out.status.success());
+    let v = jobs_of(&out);
+    let j = &v["jobs"][0];
+    let stdout = j["stdout"].as_str().unwrap();
+    assert_eq!(j["exit"], serde_json::json!(0), "{stdout}");
+    // The argv the stub saw: `-pq`, then the `--` separator, then the
+    // instruction as one argument.
+    assert!(
+        stdout.contains("ARG -pq\nARG --\nARG --resume\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn timeout_is_not_extended_by_a_pipe_holding_grandchild() {
+    // Finding 28: if the process-group kill does not reach a pipe-holding
+    // grandchild, the capture-thread joins would block past `timeout_secs`
+    // forever. The joins are bounded on the timeout path, so the job
+    // returns within the timeout plus a short grace.
+    let bin = setup();
+    let input = r#"{"timeout_secs":1,"jobs":[
+        {"id":"a","instruction":"pipeholder job"}
+    ]}"#;
+    let start = std::time::Instant::now();
+    let out = run(&bin, input);
+    let elapsed = start.elapsed();
+    assert!(out.status.success());
+    let v = jobs_of(&out);
+    let j = &v["jobs"][0];
+    assert_eq!(j["error"].as_str().unwrap(), "timeout after 1s");
+    // 1s timeout + JOIN_GRACE (5s) + slack. The unbounded-join bug took the
+    // grandchild's full 60s, so this bound is what catches a regression.
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "job ran past its timeout: {elapsed:?}"
     );
 }

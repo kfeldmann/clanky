@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt as _;
@@ -148,20 +148,85 @@ fn capture_tail<R: Read>(mut reader: R) -> std::io::Result<String> {
     })
 }
 
-/// Kill a process group without the `libc` crate. Runs `kill -pgid -TERM`
-/// via /bin/sh; if that fails the direct-child kill below is the fallback.
-#[cfg(unix)]
-fn unsafe_killpg(pgid: i32) -> std::io::Result<()> {
-    let status = Command::new("kill")
-        .args(["-TERM", &format!("-{pgid}")])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "kill -TERM -{pgid} exited with {status:?}"
-        )))
+/// How long a timed-out job's capture threads may take to hit EOF before
+/// the run moves on (what arrived is kept; stragglers are detached).
+const JOIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Join capture threads, but never past `grace` *in total*: a pipe-holding
+/// grandchild that survived the group kill would otherwise wedge the job
+/// past `timeout_secs` forever. On grace expiry the unfinished threads are
+/// detached (their captured bytes are lost, the run carries on).
+/// `Duration::MAX` means "join unconditionally" (the no-timeout path, where
+/// a lingering writer is the job's own doing and still worth waiting for).
+fn join_captures_bounded(
+    handles: [thread::JoinHandle<std::io::Result<String>>; 2],
+    grace: Duration,
+) -> [(String, Option<String>); 2] {
+    // One deadline for both streams: a shared budget, so a grandchild
+    // holding *both* pipes costs one grace period, not two.
+    let deadline = (grace != Duration::MAX).then(|| Instant::now() + grace);
+    let mut out = Vec::with_capacity(2);
+    for (stream, handle) in ["stdout", "stderr"].into_iter().zip(handles) {
+        if let Some(deadline) = deadline {
+            while Instant::now() < deadline && !handle.is_finished() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if !handle.is_finished() {
+                // A straggler was detached: what it held is lost, and the
+                // job result says so rather than reporting an empty stream.
+                out.push((
+                    String::new(),
+                    Some(format!("capture {stream}: timed out waiting for EOF")),
+                ));
+                continue;
+            }
+        }
+        match handle.join() {
+            // The thread read to EOF: its bytes, no error.
+            Ok(Ok(s)) => out.push((s, None)),
+            // A read error or a panicked thread: say which stream failed
+            // (the other stream's bytes are still reported).
+            Ok(Err(e)) => out.push((String::new(), Some(format!("capture {stream}: {e}")))),
+            Err(_) => out.push((
+                String::new(),
+                Some(format!("capture {stream}: reader thread panicked")),
+            )),
+        }
     }
+    let mut it = out.into_iter();
+    [
+        it.next().expect("two streams"),
+        it.next().expect("two streams"),
+    ]
+}
+
+/// Kill a process group, guarding against pid recycling: probe the group
+/// with `kill(-pgid, 0)` (signal 0) first, so a group that has already been
+/// fully reaped is never signalled — a stray TERM at a recycled pid could
+/// otherwise kill an unrelated process group.
+///
+/// The syscall goes through `rustix` rather than shelling out to `kill(1)`:
+/// no external binary (Alpine ships only busybox's `kill`, which rejects
+/// `--`), no dependence on which `kill` a user has, and `unsafe` stays
+/// inside rustix where the workspace lint cannot see it.
+#[cfg(unix)]
+fn killpg_if_alive(pgid: u32) -> std::io::Result<()> {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+
+    // A pgid is a positive pid; `0` would mean "my own process group", which
+    // must never be signalled by accident.
+    let pgid = Pid::from_raw(pgid as i32)
+        .ok_or_else(|| std::io::Error::other(format!("refusing to signal process group {pgid}")))?;
+    match test_kill_process_group(pgid) {
+        // The group is gone: nothing to kill, and this is the common happy
+        // path once the direct child has been reaped.
+        Err(Errno::SRCH) => return Ok(()),
+        Ok(()) => {}
+        Err(e) => return Err(std::io::Error::from_raw_os_error(e.raw_os_error())),
+    }
+    kill_process_group(pgid, Signal::Term)
+        .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
 enum WaitOutcome {
@@ -173,6 +238,10 @@ enum WaitOutcome {
 fn run_job(job: &Job, defaults: &Options, timeout: Option<Duration>) -> JobResult {
     let mut args = vec!["-pq".to_string()];
     effective(&job.options, defaults).push_args(&mut args);
+    // `--` keeps the instruction positional even when it begins with a
+    // dash (e.g. a job literally named `--resume` as its instruction):
+    // without it clap would flag-parse the value.
+    args.push("--".to_string());
     args.push(job.instruction.clone());
 
     let mut command = Command::new("clanky");
@@ -233,37 +302,48 @@ fn run_job(job: &Job, defaults: &Options, timeout: Option<Duration>) -> JobResul
         };
     }
     let timed_out = matches!(wait_outcome, WaitOutcome::TimedOut);
+    let mut kill_note: Option<String> = None;
     if timed_out {
         // Kill before joining the capture threads: wait_timeout leaves the
         // child running, and its grandchildren inherit the pipes — the joins
         // would block until they exit. Killing the job's whole process
-        // group (set at spawn) makes everyone hit EOF.
+        // group (set at spawn) makes everyone hit EOF. A failure is not
+        // silently dropped: it surfaces in the result (and bounds the
+        // capture-thread joins below).
         #[cfg(unix)]
         {
-            let pgid = child.id() as i32;
-            let _ = unsafe_killpg(pgid);
+            let pgid = child.id();
+            if let Err(e) = killpg_if_alive(pgid) {
+                kill_note = Some(format!("process-group kill: {e}"));
+            }
         }
         let _ = child.kill();
         let _ = child.wait();
     }
-    let stdout = out_handle.join().unwrap_or_else(|_| Ok(String::new()));
-    let stderr = err_handle.join().unwrap_or_else(|_| Ok(String::new()));
-    let (stdout, stderr) = match (stdout, stderr) {
-        (Ok(o), Err(e)) => (o, format!("capture stderr: {e}")),
-        (Err(e), Ok(e2)) => (format!("capture stdout: {e}"), e2),
-        (Ok(o), Ok(e)) => (o, e),
-        (Err(a), Err(b)) => (
-            format!("capture stdout: {a}"),
-            format!("capture stderr: {b}"),
-        ),
-    };
+    // The joins are bounded even on the failure path: if the group kill
+    // did not reach a pipe-holding grandchild, an unbounded `join` would
+    // run this job past `timeout_secs` forever. Collect what arrived in
+    // the grace window and detach the stragglers.
+    let [(stdout, stdout_err), (stderr, stderr_err)] = join_captures_bounded(
+        [out_handle, err_handle],
+        if timed_out { JOIN_GRACE } else { Duration::MAX },
+    );
+    // Capture failures and a failed group kill are diagnostics, not data:
+    // they belong on stderr, after whatever the plugin itself wrote.
+    let mut stderr_note = stderr;
+    for note in [stdout_err, stderr_err, kill_note].into_iter().flatten() {
+        if !stderr_note.is_empty() && !stderr_note.ends_with('\n') {
+            stderr_note.push('\n');
+        }
+        stderr_note.push_str(&note);
+    }
 
     if timed_out {
         return JobResult {
             id: job.id.clone(),
             exit: None,
             stdout: Some(stdout),
-            stderr: Some(stderr),
+            stderr: Some(stderr_note),
             error: Some(format!(
                 "timeout after {}s",
                 timeout.map(|t| t.as_secs()).unwrap_or(0)
@@ -276,7 +356,7 @@ fn run_job(job: &Job, defaults: &Options, timeout: Option<Duration>) -> JobResul
         id: job.id.clone(),
         exit,
         stdout: Some(stdout),
-        stderr: Some(stderr),
+        stderr: Some(stderr_note),
         error: None,
     }
 }
@@ -353,5 +433,50 @@ fn read_input() -> std::io::Result<String> {
             std::io::stdin().read_to_string(&mut buf)?;
             Ok(buf)
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    #[test]
+    fn stale_process_group_is_never_signalled() {
+        // Finding 17/29: the cached pid is used as the pgid after the direct
+        // child was reaped, so a group that is already gone must not be
+        // signalled — the kernel may have recycled that pid into an
+        // unrelated process group. A reaped group leader probes as ESRCH and
+        // the call must succeed without signalling anything.
+        let mut child = Command::new("true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn `true` in its own group");
+        let stale_pgid = child.id();
+        child.wait().expect("reap the group leader");
+        assert!(
+            killpg_if_alive(stale_pgid).is_ok(),
+            "a gone group is a no-op, not an error"
+        );
+    }
+
+    #[test]
+    fn a_live_group_is_signalled() {
+        // The other half of the guard: a group that is still there does get
+        // the TERM, so the probe cannot have turned the kill into a no-op.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn `sleep` in its own group");
+        let pgid = child.id();
+        killpg_if_alive(pgid).expect("live group is signalled");
+        let status = child.wait().expect("wait for the signalled child");
+        assert_eq!(
+            status.signal(),
+            Some(15),
+            "the child died from SIGTERM: {status:?}"
+        );
     }
 }

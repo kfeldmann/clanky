@@ -72,7 +72,19 @@ fn run(cli: &cli::Cli) -> Result<()> {
         return Err(clanky::error::Error::NameWithResume);
     }
 
-    if cli.print || !tui::available() {
+    // `--name` is a user-provided value: an invalid one is a usage error,
+    // not a silent fallback to a generated name (finding 19). Validating
+    // here — before any front end starts — also honors the recorder's
+    // documented contract that the recorder is dropped when the name is
+    // invalid: there is no longer a run that continues under a different
+    // name.
+    if let Some(name) = cli.name.as_deref() {
+        clanky::session::validate_name(name)?;
+    }
+
+    let front_end = select_front_end(cli.print, tui::available(), cli.quiet)?;
+
+    if front_end == FrontEnd::Pipe {
         // No prompt on the command line and no piped stdin: nothing to do
         // in command-line mode, so show usage instead of a cryptic error.
         if cli.prompt.is_empty() && !cli.print && std::io::stdin().is_terminal() {
@@ -97,6 +109,32 @@ fn run(cli: &cli::Cli) -> Result<()> {
     launch.resume = cli.resume.clone();
     launch.session_name = cli.name.clone();
     tui::run(launch)
+}
+
+/// The front end a run uses, decided once up front so the choice can be
+/// tested without a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontEnd {
+    /// One non-interactive turn: prompt from argv or stdin.
+    Pipe,
+    /// The full-screen interactive UI.
+    Tui,
+}
+
+/// Pick the front end, rejecting flags that have no meaning in it.
+///
+/// `-p` forces pipe mode, and so does an unavailable TUI (stdin or stdout
+/// redirected) — that fallback *is* print mode, so `clanky -q < prompt`
+/// stays valid. `-q` is print-mode-only (M12): in the TUI there is nothing
+/// to suppress, so it is a usage error rather than a silently ignored flag.
+fn select_front_end(print: bool, tui_available: bool, quiet: bool) -> Result<FrontEnd> {
+    if print || !tui_available {
+        return Ok(FrontEnd::Pipe);
+    }
+    if quiet {
+        return Err(clanky::error::Error::QuietRequiresPrint);
+    }
+    Ok(FrontEnd::Tui)
 }
 
 /// Non-interactive single turn: prompt from argv or stdin, response to
@@ -221,6 +259,12 @@ fn run_pipe(
     let mut sink = PrintSink::new(quiet);
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
+    // The write-failure abort (finding 18): a closed response channel
+    // (`clanky -p … | head -1`) kills the plugin so the in-flight request
+    // fails and the turn unwinds, instead of streaming into the void and
+    // exiting 0. The same mechanism ctrl+c uses (kill is idempotent).
+    let sink_killer = provider_session.cancel_handle();
+    let write_failure = std::cell::RefCell::new(None);
     let result = {
         let mut out = stdout.lock();
         let mut err = stderr.lock();
@@ -232,9 +276,20 @@ fn run_pipe(
             &mut |event: TurnEvent| {
                 // Both consumers see the event in order: the recorder
                 // turns it into session records, the sink turns it into
-                // output.
+                // output. The recorder still sees every event that
+                // arrived before the failure, so the session file holds
+                // the prefix of the turn, and the partial flush below
+                // completes it.
                 clanky::recorder::record_turn_event(&mut recorder, &mut errors, &event);
                 sink.event(event, &mut out, &mut err);
+                if let Some(fail) = sink.write_failed() {
+                    let failure = clanky::error::Error::PrintWriteFailed {
+                        stream: fail.kind().to_string(),
+                        source: std::io::Error::new(fail.kind(), fail.to_string()),
+                    };
+                    *write_failure.borrow_mut() = Some(failure);
+                    sink_killer.kill();
+                }
             },
         );
         // A block that ran to the end of the turn (a thinking block, or
@@ -255,6 +310,11 @@ fn run_pipe(
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     stdout.flush()?;
+    // The write failure is the actionable error: the turn's own result is
+    // the plugin-death symptom of the kill above.
+    if let Some(failure) = write_failure.into_inner() {
+        return Err(failure);
+    }
     result.map(|_| ())
 }
 
@@ -291,6 +351,13 @@ struct PrintSink {
     /// prefix (a paragraph just started: the block opened, or a newline
     /// was written or is pending in `pending_ws`).
     need_quote: bool,
+    /// The first write failure on the response channel (finding 18): a
+    /// closed stdout (`clanky -p … | head -1`) must stop the turn instead
+    /// of letting it keep calling the model with output going nowhere and
+    /// exiting 0. Session-file writes stay non-fatal (their failures are
+    /// the error sink's business — a logging problem, not a response
+    /// problem); only `out`/`err` failures are fatal.
+    write_error: Option<std::io::Error>,
 }
 
 impl PrintSink {
@@ -301,6 +368,25 @@ impl PrintSink {
             in_thinking: false,
             pending_ws: String::new(),
             need_quote: false,
+            write_error: None,
+        }
+    }
+
+    /// Whether a write to the response channel has failed. Once set, the
+    /// turn should be abandoned: the consumer of the output is gone.
+    pub fn write_failed(&self) -> Option<&std::io::Error> {
+        self.write_error.as_ref()
+    }
+
+    /// Write to a response-channel stream, recording the first failure.
+    /// After a failure further writes are skipped (the error that gets
+    /// surfaced is the first one; later attempts would just add noise).
+    fn out_write<W: Write>(w: &mut W, text: &str, error: &mut Option<std::io::Error>) {
+        if error.is_some() {
+            return;
+        }
+        if let Err(err) = write!(w, "{text}") {
+            *error = Some(err);
         }
     }
 
@@ -346,13 +432,15 @@ impl PrintSink {
                 if self.quiet {
                     return;
                 }
-                writeln!(
+                Self::out_write(
                     err,
-                    "INFO: ↻ {message} — retrying in {:.1}s ({attempt}/{max_retries})",
-                    delay.as_secs_f64()
-                )
-                .ok();
-                writeln!(err).ok();
+                    &format!(
+                        "INFO: ↻ {message} — retrying in {:.1}s ({attempt}/{max_retries})\n",
+                        delay.as_secs_f64()
+                    ),
+                    &mut self.write_error,
+                );
+                Self::out_write(err, "\n", &mut self.write_error);
             }
             // Activity entries end with a blank line so consecutive tool
             // rounds and the following answer text breathe, matching the
@@ -363,8 +451,8 @@ impl PrintSink {
                     return;
                 }
                 let preview = tools::truncate_call_arguments(&arguments, tools::CALL_PREVIEW_CHARS);
-                writeln!(err, "● {name} {preview}").ok();
-                writeln!(err).ok();
+                Self::out_write(err, &format!("● {name} {preview}\n"), &mut self.write_error);
+                Self::out_write(err, "\n", &mut self.write_error);
             }
             TurnEvent::ToolResult { name, output, .. } => {
                 self.close_blocks(out, err);
@@ -380,11 +468,15 @@ impl PrintSink {
                 let mut lines = preview.lines();
                 let head = lines.next().unwrap_or("");
                 let indent = " ".repeat(marker.chars().count() + name.chars().count() + 2);
-                writeln!(err, "{marker}{name}: {head}").ok();
+                Self::out_write(
+                    err,
+                    &format!("{marker}{name}: {head}\n"),
+                    &mut self.write_error,
+                );
                 for l in lines {
-                    writeln!(err, "{indent}{l}").ok();
+                    Self::out_write(err, &format!("{indent}{l}\n"), &mut self.write_error);
                 }
-                writeln!(err).ok();
+                Self::out_write(err, "\n", &mut self.write_error);
             }
         }
     }
@@ -405,25 +497,29 @@ impl PrintSink {
         }
         self.write_quoted(w, trimmed, quote);
         self.pending_ws.push_str(ws);
-        w.flush().ok();
+        if self.write_error.is_none()
+            && let Err(err) = w.flush()
+        {
+            self.write_error = Some(err);
+        }
     }
 
     /// Write text, inserting the `> ` quote prefix after each newline
     /// (and before a leading paragraph character) when `quote` is set.
     fn write_quoted<W: Write>(&mut self, w: &mut W, text: &str, quote: bool) {
         if !quote {
-            write!(w, "{text}").ok();
+            Self::out_write(w, text, &mut self.write_error);
             return;
         }
         for c in text.chars() {
             if self.need_quote && c != '\n' {
-                write!(w, "> ").ok();
+                Self::out_write(w, "> ", &mut self.write_error);
                 self.need_quote = false;
             }
             if c == '\n' {
                 self.need_quote = true;
             }
-            write!(w, "{c}").ok();
+            Self::out_write(w, &c.to_string(), &mut self.write_error);
         }
     }
 
@@ -434,8 +530,12 @@ impl PrintSink {
         if self.in_text {
             self.in_text = false;
             self.pending_ws.clear();
-            write!(out, "\n\n").ok();
-            out.flush().ok();
+            Self::out_write(out, "\n\n", &mut self.write_error);
+            if self.write_error.is_none()
+                && let Err(err) = out.flush()
+            {
+                self.write_error = Some(err);
+            }
         }
     }
 
@@ -444,7 +544,7 @@ impl PrintSink {
         if self.in_thinking {
             self.in_thinking = false;
             self.pending_ws.clear();
-            write!(err, "\n\n").ok();
+            Self::out_write(err, "\n\n", &mut self.write_error);
         }
     }
 
@@ -721,5 +821,139 @@ mod tests {
         );
         assert_eq!(out, "answer\n\n");
         assert_eq!(err, "");
+    }
+
+    #[test]
+    fn quiet_is_rejected_in_tui_mode() {
+        // M12: `-q` is print-mode-only. With a usable TUI and no `-p`, the
+        // flag would otherwise be accepted and silently ignored.
+        let err = select_front_end(false, true, true).unwrap_err();
+        assert!(matches!(err, clanky::error::Error::QuietRequiresPrint));
+    }
+
+    #[test]
+    fn quiet_is_accepted_in_print_mode() {
+        // `-p -q` is the documented invocation.
+        assert_eq!(select_front_end(true, true, true).unwrap(), FrontEnd::Pipe);
+    }
+
+    #[test]
+    fn quiet_is_accepted_when_the_tui_is_unavailable() {
+        // Redirected stdin/stdout falls back to print mode, so
+        // `clanky -q < prompt` must keep working without `-p`.
+        assert_eq!(
+            select_front_end(false, false, true).unwrap(),
+            FrontEnd::Pipe
+        );
+    }
+
+    #[test]
+    fn plain_invocation_launches_the_tui() {
+        assert_eq!(select_front_end(false, true, false).unwrap(), FrontEnd::Tui);
+    }
+
+    #[test]
+    fn an_invalid_session_name_is_rejected_up_front() {
+        // Finding 19: `--name` was validated by the recorder, which only
+        // reported to stderr and let the run continue under a generated
+        // name — the user's value silently replaced. Now the run aborts
+        // before any front end starts.
+        assert!(clanky::session::validate_name("-bad").is_err());
+        assert!(clanky::session::validate_name("has space").is_err());
+        assert!(clanky::session::validate_name("ok-name_1").is_ok());
+    }
+
+    /// A writer that fails after the first `capacity` bytes: the stand-in
+    /// for a consumer that went away (`clanky -p … | head -1`).
+    struct DyingWriter {
+        capacity: usize,
+        written: usize,
+        buf: Vec<u8>,
+    }
+
+    impl DyingWriter {
+        fn new(capacity: usize) -> Self {
+            Self {
+                capacity,
+                written: 0,
+                buf: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Write for DyingWriter {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            if self.written + chunk.len() > self.capacity {
+                return Err(std::io::Error::other("writer went away"));
+            }
+            self.written += chunk.len();
+            self.buf.extend_from_slice(chunk);
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_write_failure_is_recorded_not_swallowed() {
+        // Finding 18: `writeln!(…).ok()` turned a closed stdout into
+        // silence; the sink must remember the first failure instead.
+        let mut sink = PrintSink::new(false);
+        let mut out = DyingWriter::new(0);
+        let mut err = Vec::new();
+        sink.event(
+            TurnEvent::Text {
+                delta: "answer".into(),
+            },
+            &mut out,
+            &mut err,
+        );
+        assert!(sink.write_failed().is_some(), "the failure is recorded");
+    }
+
+    #[test]
+    fn a_write_failure_on_stderr_is_recorded_too() {
+        // stderr carries activity, not the response, but it is still the
+        // response channel: a run whose stderr is gone cannot report the
+        // turn either.
+        let mut sink = PrintSink::new(false);
+        let mut out = Vec::new();
+        let mut err = DyingWriter::new(0);
+        sink.event(
+            TurnEvent::ToolCall {
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
+            &mut out,
+            &mut err,
+        );
+        assert!(sink.write_failed().is_some(), "the failure is recorded");
+    }
+
+    #[test]
+    fn writes_stop_after_the_first_failure() {
+        // After the first failure later events write nothing more (and
+        // the first error stays the recorded one).
+        let mut sink = PrintSink::new(false);
+        let mut out = DyingWriter::new(4); // fits "answ", fails on "er"
+        let mut err = Vec::new();
+        sink.event(
+            TurnEvent::Text {
+                delta: "answer".into(),
+            },
+            &mut out,
+            &mut err,
+        );
+        assert!(sink.write_failed().is_some(), "the failure is recorded");
+        let before = out.buf.clone();
+        sink.event(
+            TurnEvent::Text {
+                delta: "more".into(),
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(out.buf, before, "no further writes after the failure");
     }
 }

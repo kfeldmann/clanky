@@ -45,6 +45,10 @@ pub const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 /// before killing it.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long [`ProcessTransport`]'s `Drop` waits for the stderr drain thread
+/// to finish after shutting the plugin down, before detaching it.
+const STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Environment variable that routes plugin stderr to Clanky's own stderr
 /// instead of the plugin log. Useful when developing a plugin.
 pub const DEBUG_ENV: &str = "CLANKY_PLUGIN_DEBUG";
@@ -110,11 +114,16 @@ impl Shared {
     }
 
     fn request_cancel(&self, request_id: u64) -> Result<(), Error> {
+        // Write first, arm second: a failed write means the plugin never saw
+        // the cancel, so no kill clock may be started. Arming first would
+        // leave a stale deadline behind that a later, innocent request's
+        // iterator would honour — killing a healthy process (finding 30).
+        self.write(&Message::Cancel { request_id })?;
         *self
             .cancel_deadline
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + CANCEL_TIMEOUT);
-        self.write(&Message::Cancel { request_id })
+        Ok(())
     }
 
     fn cancel_deadline(&self) -> Option<Instant> {
@@ -367,11 +376,21 @@ impl ProcessTransport {
 impl Drop for ProcessTransport {
     fn drop(&mut self) {
         self.shared.shutdown();
-        // The stderr thread is detached rather than joined: a plugin that
-        // leaked children holding the stderr pipe could otherwise block
-        // teardown indefinitely. Lines are flushed as they are read, so
-        // detaching loses nothing but a final partial line.
-        let _ = self.stderr_thread.take();
+        // The stderr thread is joined, but only briefly: after `shutdown`
+        // the plugin's stderr pipe normally reaches EOF at once, so the
+        // final (possibly newline-less) line lands in the log before the
+        // transport goes away. A plugin that leaked children holding the
+        // pipe must still not block teardown, so the wait is bounded and
+        // the thread detached if it overruns.
+        if let Some(handle) = self.stderr_thread.take() {
+            let deadline = Instant::now() + STDERR_JOIN_TIMEOUT;
+            while Instant::now() < deadline && !handle.is_finished() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -430,8 +449,14 @@ impl Iterator for ProcessResponses<'_> {
 
 /// Read plugin stderr to EOF and write it to the log file (or our stderr in
 /// debug mode). stderr is never protocol, so this can never affect the chat.
+///
+/// Reads are chunked into lines by hand rather than via `BufRead::lines()`
+/// so a final line without a trailing newline — exactly what a plugin
+/// killed mid-write leaves behind — is still flushed to the log instead of
+/// being dropped (finding 37: crash forensics is when that last partial
+/// line matters most).
 fn drain_stderr(stderr: std::process::ChildStderr, log_path: Option<PathBuf>) {
-    let reader = BufReader::new(stderr);
+    let mut reader = BufReader::new(stderr);
     let mut sink: Box<dyn Write + Send> = match log_path {
         Some(path) => match open_log(&path) {
             Ok(file) => Box::new(file),
@@ -442,9 +467,22 @@ fn drain_stderr(stderr: std::process::ChildStderr, log_path: Option<PathBuf>) {
         },
         None => Box::new(std::io::stderr()),
     };
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        let _ = writeln!(sink, "{line}");
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            // EOF: flush whatever partial line arrived, then stop.
+            Ok(0) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim_end_matches(['\n', '\r']);
+                let _ = writeln!(sink, "{text}");
+            }
+            Err(err) => {
+                eprintln!("clanky: reading plugin stderr failed: {err}");
+                break;
+            }
+        }
     }
     let _ = sink.flush();
 }
@@ -453,8 +491,79 @@ fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(path)?;
+    // Plugin stderr can carry secrets (a model's tool output echoed back,
+    // an env-dumping command) — finding 38: the log is created
+    // owner-only rather than umask-world-readable. An existing log's
+    // permissions are not touched.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Shared` whose plugin stdin is closed: every write fails, exactly
+    /// like a plugin that died.
+    fn shared_with_closed_stdin() -> Shared {
+        let child = Command::new("true").spawn().expect("spawn `true`");
+        Shared {
+            command: "fake".into(),
+            child: Mutex::new(child),
+            stdin: Mutex::new(None),
+            cancel_deadline: Mutex::new(None),
+            dead: AtomicBool::new(false),
+            log_path: None,
+        }
+    }
+
+    #[test]
+    fn failed_cancel_leaves_no_deadline() {
+        // Finding 30: the deadline must be armed only after the cancel
+        // actually reached the plugin. A failed write must leave none
+        // behind — otherwise the next (innocent) request's iterator would
+        // honour the stale deadline and kill a healthy process.
+        let shared = shared_with_closed_stdin();
+        assert!(shared.request_cancel(1).is_err(), "write must fail");
+        assert_eq!(
+            shared.cancel_deadline(),
+            None,
+            "a failed cancel must not arm the kill clock"
+        );
+    }
+
+    #[test]
+    fn a_delivered_cancel_arms_the_deadline() {
+        // The positive half: when the write succeeds, the kill clock is
+        // armed so an ignored cancel still ends the request (spec §7).
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("cat > /dev/null")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn `cat`");
+        let stdin = child.stdin.take().expect("stdin piped");
+        let shared = Shared {
+            command: "fake".into(),
+            child: Mutex::new(child),
+            stdin: Mutex::new(Some(stdin)),
+            cancel_deadline: Mutex::new(None),
+            dead: AtomicBool::new(false),
+            log_path: None,
+        };
+        shared.request_cancel(1).expect("cancel is written");
+        assert!(
+            shared.cancel_deadline().is_some(),
+            "a delivered cancel arms the kill clock"
+        );
+        shared.kill();
+    }
 }

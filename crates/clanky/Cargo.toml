@@ -20,6 +20,13 @@ toml = { version = "0.9", default-features = false, features = ["parse", "serde"
 unicode-width = "0.2.0"
 wait-timeout = "0.2"
 
+# Process-group signalling without `unsafe` and without shelling out to
+# `kill(1)`: rustix wraps the raw `kill(-pgid, sig)` syscall, keeping the
+# `unsafe` inside its own crate (workspace lints forbid it here). Already in
+# the tree via crossterm -> rustix; `process` is the only extra feature.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "0.38", default-features = false, features = ["std", "process"] }
+
 [lints]
 workspace = true
 

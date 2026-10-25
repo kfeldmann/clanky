@@ -260,11 +260,12 @@ impl BashTool {
                         // child's group was set at spawn.
                         #[cfg(unix)]
                         {
-                            let _ = kill_process_group(child.id(), "TERM");
+                            use rustix::process::Signal;
+                            let _ = kill_process_group(child.id(), Signal::Term);
                             // A short grace: processes that catch TERM get
                             // a chance to exit before the hard kill.
                             let _ = child.wait_timeout(Duration::from_millis(500));
-                            let _ = kill_process_group(child.id(), "KILL");
+                            let _ = kill_process_group(child.id(), Signal::Kill);
                         }
                         let _ = child.kill();
                         let _ = child.wait();
@@ -652,9 +653,10 @@ fn join_with_deadline(
             // last polling pass below instead of being discarded.
             #[cfg(unix)]
             {
-                let _ = kill_process_group(pgid, "TERM");
+                use rustix::process::Signal;
+                let _ = kill_process_group(pgid, Signal::Term);
                 std::thread::sleep(Duration::from_millis(100));
-                let _ = kill_process_group(pgid, "KILL");
+                let _ = kill_process_group(pgid, Signal::Kill);
             }
             let flush = Instant::now() + KILL_FLUSH;
             while Instant::now() < flush {
@@ -690,22 +692,34 @@ fn collect_finished(
     }
 }
 
-/// Signal a command's whole process group by running `kill -<SIG> -PGID`
-/// (no `libc` dependency; the same technique as `clanky-subagents`). The
-/// group is a real group leader because it was spawned with
+/// Signal a command's whole process group, guarding against pid recycling.
+///
+/// The group is probed with `kill(-pgid, 0)` first, so a group that has
+/// already been fully reaped is never signalled: the cached pid is used as
+/// the pgid for up to [`JOIN_GRACE`] after `child.wait()` reaped the direct
+/// child, and on pid recycle a stray signal would hit an unrelated group.
+///
+/// The syscall goes through `rustix` rather than shelling out to `kill(1)`:
+/// no external binary to depend on (Alpine ships only busybox's `kill`),
+/// and `unsafe` stays inside rustix, where the workspace lint cannot see it.
+/// The group is a real group leader because it was spawned with
 /// `process_group(0)`.
 #[cfg(unix)]
-fn kill_process_group(pgid: u32, signal: &str) -> std::io::Result<()> {
-    let status = Command::new("kill")
-        .args([format!("-{signal}"), format!("-{pgid}")])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "kill -{signal} -{pgid} exited with {status:?}"
-        )))
+fn kill_process_group(pgid: u32, signal: rustix::process::Signal) -> std::io::Result<()> {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, kill_process_group as kill_pg, test_kill_process_group};
+
+    // A pgid is a positive pid; `0` would mean "my own process group".
+    let pid = Pid::from_raw(pgid as i32)
+        .ok_or_else(|| std::io::Error::other(format!("refusing to signal process group {pgid}")))?;
+    match test_kill_process_group(pid) {
+        // Gone (the direct child was reaped and no member is left): there is
+        // nothing to signal, and signalling would risk a recycled pid.
+        Err(Errno::SRCH) => return Ok(()),
+        Ok(()) => {}
+        Err(e) => return Err(std::io::Error::from_raw_os_error(e.raw_os_error())),
     }
+    kill_pg(pid, signal).map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
 fn pipe_error(stream: &str) -> ToolError {
@@ -1026,6 +1040,31 @@ mod tests {
         let tool = BashTool::new(Duration::from_millis(300), 20_000);
         let err = tool.execute(&json!({"command": "sleep 30"})).unwrap_err();
         assert!(err.to_string().contains("timeout"), "{err}");
+    }
+
+    #[test]
+    fn stale_process_group_is_never_signalled() {
+        // The pid-recycle guard (finding 17): the cached pid is used as the
+        // pgid after `child.wait()` reaped the direct child, so a group that
+        // is already gone must not be signalled — the kernel may have
+        // recycled that pid into an unrelated process group. A reaped
+        // group-leader probes as ESRCH, and `kill_process_group` must then
+        // report success without ever calling `kill(2)`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let mut child = Command::new("true")
+                .process_group(0)
+                .spawn()
+                .expect("spawn `true` in its own group");
+            let stale_pgid = child.id();
+            child.wait().expect("reap the group leader");
+            // The group is empty now (the leader was its only member).
+            assert!(
+                kill_process_group(stale_pgid, rustix::process::Signal::Term).is_ok(),
+                "a gone group is a no-op, not an error"
+            );
+        }
     }
 
     #[test]

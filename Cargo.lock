@@ -110,6 +110,7 @@ dependencies = [
  "clap",
  "dirs",
  "ratatui",
+ "rustix",
  "serde",
  "serde_json",
  "signal-hook",
@@ -167,6 +168,7 @@ dependencies = [
 name = "clanky-subagents"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde",
  "serde_json",
  "wait-timeout",

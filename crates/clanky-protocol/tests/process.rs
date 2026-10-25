@@ -368,3 +368,83 @@ fn a_missing_command_is_an_io_error() {
         .unwrap_err();
     assert!(matches!(err, Error::Io(_)), "{err:?}");
 }
+
+#[test]
+fn stderr_partial_final_line_reaches_the_log() {
+    // Finding 37: a plugin killed mid-write leaves stderr without a
+    // trailing newline. That last partial line is exactly the crash
+    // forensic worth keeping, so the drain must flush it at EOF instead of
+    // dropping it (which `BufRead::lines()` does).
+    let log = std::env::temp_dir().join(format!(
+        "clanky-plugin-stderr-partial-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    let path = fake_plugin(
+        "stderr-partial",
+        &format!(
+            r#"
+on_chat() {{
+  printf 'complete line\n' >&2
+  printf 'trailing partial without newline' >&2
+  printf '{{"type":"done","requestId":%s,"finishReason":"stop"}}\n' "$1"
+}}
+on_cancel() {{ :; }}
+{LOOP}
+"#
+        ),
+    );
+    let options = ProcessOptions::new(path.to_str().unwrap()).with_log(&log);
+    let mut transport = ProcessTransport::spawn(options).expect("spawn plugin");
+
+    let mut sink = |_: ChunkPayload| {};
+    let _: Vec<Message> = transport
+        .send(chat(1), &mut sink)
+        .unwrap()
+        .map(|m| m.unwrap())
+        .collect();
+    // Dropping the transport shuts the plugin down and joins the stderr
+    // drain, so the log is complete when this returns.
+    drop(transport);
+
+    let logged = std::fs::read_to_string(&log).expect("plugin log exists");
+    assert!(logged.contains("complete line"), "{logged}");
+    assert!(
+        logged.contains("trailing partial without newline"),
+        "the final newline-less line is kept: {logged}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn a_failed_cancel_write_does_not_arm_a_kill_clock() {
+    // Finding 30: arming the deadline before writing the cancel meant a
+    // failed write left a stale deadline behind, which a later request's
+    // iterator would honour — killing a healthy plugin. The write comes
+    // first now, so a cancel that cannot be delivered reports the error and
+    // arms nothing. (The no-deadline state itself is asserted in the unit
+    // test `failed_cancel_leaves_no_deadline` in src/process.rs, where the
+    // private `Shared` state is visible.)
+    let mut transport = spawn(
+        "cancel-fail",
+        &format!(
+            r#"
+on_chat() {{
+  printf '{{"type":"done","requestId":%s,"finishReason":"stop"}}\n' "$1"
+}}
+on_cancel() {{ :; }}
+{LOOP}
+"#
+        ),
+    );
+    let mut sink = |_: ChunkPayload| {};
+    let _ = transport.send(hello(), &mut sink).unwrap().next();
+    let cancel = transport.cancel_handle();
+    // Shutting the transport down closes the plugin's stdin, so the cancel
+    // write can no longer be delivered.
+    drop(transport);
+    assert!(cancel.cancel(1).is_err(), "cancel on a dead pipe fails");
+}

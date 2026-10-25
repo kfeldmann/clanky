@@ -220,10 +220,14 @@ Architectural decisions already made:
   (then KILL after a short grace). Killing only the direct `bash -c`
   child left grandchildren alive — they inherit the output pipes, so the
   tool's reader joins blocked forever (a `cargo test … | tail` run wedged
-  for 90+ minutes). The reader joins are also deadline-aware (2 s grace
-  past the deadline, then TERM+KILL and return what was captured): a
-  grandchild that daemonized out of the group (`setsid`) survives the
-  group kill and would otherwise wedge the join forever. A command
+  for 90+ minutes). The group is signalled through `rustix`
+  (`kill(-pgid, sig)`; `unsafe` stays inside that crate, and there is no
+  external `kill(1)` to depend on), probing with signal 0 first so a
+  reaped group is never signalled at a recycled pid. The reader joins are
+  also deadline-aware (2 s grace past the deadline, then TERM+KILL and
+  return what was captured): a grandchild that daemonized out of the
+  group (`setsid`) survives the group kill and would otherwise wedge the
+  join forever. A command
   without a timeout stays in Clanky's process group, so terminal ctrl+c
   keeps reaching it (the group technique is the same as the subagents
   launcher, M12).
@@ -502,8 +506,12 @@ real tenant.
    - As built: `wait_timeout` + a per-job process group (`process_group(0)`)
      so a timeout kill reaches clanky's own children, which otherwise inherit
      the pipes and wedge the capture threads open — the kill happens *before*
-     joining the capture threads. Process-group kill shells out to `kill -TERM
-     -pgid` (no libc dep). Tests stub `clanky` on `PATH`
+     joining the capture threads. Process-group kill goes through `rustix`
+     (`kill(-pgid, sig)`, `unsafe` confined to that crate; no external
+     `kill(1)` to depend on), probing the group with signal 0 first so a
+     reaped group is never signalled at a recycled pid. The capture-thread
+     joins are bounded by a shared grace so a grandchild that escaped the
+     group cannot run a job past `timeout_secs`. Tests stub `clanky` on `PATH`
      (`crates/clanky-subagents/tests/subagents.rs`); design in
      `parallel-subagents-plan.md`; user docs in README ("Parallel
      subagents"). Shipped with `contrib/skills/parallel-subagents/SKILL.md`,

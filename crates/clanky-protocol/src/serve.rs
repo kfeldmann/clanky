@@ -136,6 +136,11 @@ pub fn serve(
     // Remember the cancelled ids so the flag can be restored for that chat.
     let cancelled_ids = Arc::new(Mutex::new(HashSet::new()));
     let reader_ids = Arc::clone(&cancelled_ids);
+    // The id of the chat the dispatch loop is currently running, shared with
+    // the reader so a cancel for an already-finished request is ignored
+    // instead of flipping the flag with nothing left to reset it.
+    let current: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let reader_current = Arc::clone(&current);
     let reader_thread = thread::Builder::new()
         .name("clanky-plugin-reader".into())
         .spawn(move || {
@@ -148,8 +153,17 @@ pub fn serve(
                     // Cancel is advisory and out of band: flip the flag
                     // immediately, no queueing.
                     Ok(Some(Message::Cancel { request_id })) => {
-                        reader_cancel.cancel();
-                        reader_ids.lock().unwrap().insert(request_id);
+                        // Only a cancel for a request that is still pending
+                        // matters. Recording one for a request that already
+                        // finished would flip the shared flag with no chat
+                        // left to restore it (finding 31); the dispatch loop
+                        // keeps exactly one chat in flight (spec §6), so a
+                        // request that is not the current one is stale.
+                        let current = *reader_current.lock().unwrap();
+                        if current == Some(request_id) {
+                            reader_cancel.cancel();
+                            reader_ids.lock().unwrap().insert(request_id);
+                        }
                     }
                     Ok(Some(msg)) => {
                         if tx.send(msg).is_err() {
@@ -165,7 +179,7 @@ pub fn serve(
             // Dropping `tx` closes the channel, ending the dispatch loop.
         })?;
 
-    let outcome = dispatch_loop(handler, &cancel, &cancelled_ids, &rx, writer);
+    let outcome = dispatch_loop(handler, &cancel, &cancelled_ids, &current, &rx, writer);
     // The reader thread ends when stdin reaches EOF. If we stopped early
     // (fatal error) it may still be blocked reading; detach rather than
     // join so `serve` returns promptly. `Drop` for the process handles it.
@@ -177,6 +191,7 @@ fn dispatch_loop(
     handler: &mut dyn Handler,
     cancel: &CancelFlag,
     cancelled_ids: &Mutex<HashSet<u64>>,
+    current: &Mutex<Option<u64>>,
     rx: &mpsc::Receiver<Message>,
     writer: &mut dyn Write,
 ) -> Result<(), Error> {
@@ -222,6 +237,10 @@ fn dispatch_loop(
                 sampling,
                 thinking,
             } => {
+                // Publish the in-flight id *before* resetting: the reader
+                // only records cancels for this id, so from here on a cancel
+                // for this chat is the only one that can flip the flag.
+                *current.lock().unwrap() = Some(id);
                 cancel.reset();
                 // Restore a cancel that raced ahead of this chat's dispatch
                 // (see `cancelled_ids` in `serve`).
@@ -247,6 +266,9 @@ fn dispatch_loop(
                     );
                 };
                 let outcome = handler.chat(&request, &mut sink);
+                // The chat is finished: a cancel that arrives from now on is
+                // for a completed request and must not flip the flag.
+                *current.lock().unwrap() = None;
                 let response = chat_response(id, outcome);
                 write_message(writer, &response)?;
             }
@@ -561,6 +583,102 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_cancel_for_a_finished_request_does_not_cancel_the_next_chat() {
+        // Finding 31: a cancel that arrives after its own request finished
+        // used to flip the shared flag with no matching restore. The next
+        // chat's `reset()` masked it — but only if the stale cancel landed
+        // *between* chats. If it landed while the next chat was already in
+        // flight, that innocent chat was cancelled. The stale cancel must
+        // be ignored outright.
+        struct LateStale {
+            cancel: CancelFlag,
+            /// Set (and signalled) once chat 2 is running, so the test can
+            /// deliver the stale cancel for chat 1 at exactly that moment.
+            started: Arc<(Mutex<bool>, std::sync::Condvar)>,
+            /// What chat 2 observed: did the stale cancel reach it?
+            chat2_saw_cancel: Arc<Mutex<Option<bool>>>,
+        }
+        impl Handler for LateStale {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "late-stale".into(),
+                    capabilities: Capabilities::default(),
+                    default_model: None,
+                }
+            }
+            fn list_models(&mut self) -> Result<Vec<ModelInfo>, Error> {
+                Ok(vec![])
+            }
+            fn chat(
+                &mut self,
+                request: &ChatRequest,
+                _sink: &mut dyn FnMut(ChunkPayload),
+            ) -> Result<ChatDone, Error> {
+                if request.model == "second" {
+                    // Announce that chat 2 is in flight, then wait long
+                    // enough for the stale cancel to be read.
+                    *self.started.0.lock().unwrap() = true;
+                    self.started.1.notify_all();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    *self.chat2_saw_cancel.lock().unwrap() = Some(self.cancel.is_cancelled());
+                }
+                Ok(ChatDone {
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                })
+            }
+            fn set_cancel_flag(&mut self, flag: CancelFlag) {
+                self.cancel = flag;
+            }
+        }
+
+        // A live stdin, so the stale cancel can be written *while* chat 2
+        // runs (a `Cursor` would be consumed up front by the reader).
+        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        let started = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let chat2_saw_cancel = Arc::new(Mutex::new(None));
+        let mut handler = LateStale {
+            cancel: CancelFlag::default(),
+            started: Arc::clone(&started),
+            chat2_saw_cancel: Arc::clone(&chat2_saw_cancel),
+        };
+
+        let serve_started = Arc::clone(&started);
+        let serving = std::thread::spawn(move || {
+            let mut out: Vec<u8> = Vec::new();
+            serve(&mut handler, std::io::BufReader::new(reader), &mut out).unwrap();
+            out
+        });
+
+        writer
+            .write_all(b"{\"type\":\"chat\",\"id\":1,\"model\":\"first\",\"messages\":[]}\n")
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"chat\",\"id\":2,\"model\":\"second\",\"messages\":[]}\n")
+            .unwrap();
+        // Wait until chat 2 is running, then deliver the *stale* cancel for
+        // the already-finished chat 1.
+        {
+            let (lock, cvar) = &*serve_started;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = cvar.wait(ready).unwrap();
+            }
+        }
+        writer
+            .write_all(b"{\"type\":\"cancel\",\"requestId\":1}\n")
+            .unwrap();
+        drop(writer); // EOF: `serve` returns after the queued chats
+        serving.join().unwrap();
+
+        assert_eq!(
+            *chat2_saw_cancel.lock().unwrap(),
+            Some(false),
+            "a cancel for a finished request must not cancel the next chat"
+        );
     }
 
     #[test]
