@@ -438,6 +438,13 @@ fn render_table(
         if sum_min >= avail {
             // Even at per-word floors the table overflows; scale
             // proportionally from the floors, accepting char-wrapping.
+            // Scaling alone can still overshoot: `floor` is applied per
+            // column and `.max(1)` gives every column at least one, so
+            // with many narrow columns the total lands above `avail` and
+            // the row is one or more columns wider than the terminal.
+            // Hand the overshoot back one column at a time, widest first
+            // (narrowing a wide column costs the least wrapping), never
+            // below one column.
             for (i, w) in col_w.iter_mut().enumerate() {
                 let mw = max_word_w[i];
                 *w = if sum_min == 0 {
@@ -445,6 +452,19 @@ fn render_table(
                 } else {
                     (((mw as f64) * (avail as f64) / (sum_min as f64)).floor() as usize).max(1)
                 };
+            }
+            while col_w.iter().sum::<usize>() > avail {
+                let widest = col_w
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, w)| **w > 1)
+                    .max_by_key(|(_, w)| **w)
+                    .map(|(i, _)| i);
+                // Every column is already at one, so no further shrink is
+                // possible: the table cannot fit this narrow a viewport
+                // and the renderer's truncation takes over.
+                let Some(widest) = widest else { break };
+                col_w[widest] -= 1;
             }
         } else {
             // Give every column its per-word floor first, then distribute
@@ -973,6 +993,63 @@ mod tests {
         for line in &lines {
             let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
             assert!(w <= 20, "row of width {w}: {line:?}");
+        }
+    }
+
+    /// `cap_lines` never emits a row wider than its `width`: content is
+    /// cut to `width - note_width` before the note is appended, so the
+    /// note row is at most `width`. (The review suspected otherwise;
+    /// sweeping widths and content shapes finds no overflow.)
+    #[test]
+    fn cap_lines_rows_never_exceed_the_width() {
+        let samples = [
+            "x".repeat(200),
+            "中".repeat(100),
+            "ab ".repeat(80),
+            "  indented ".repeat(30),
+            "a中b中".repeat(40),
+        ];
+        for width in 4u16..=40 {
+            for sample in &samples {
+                for max_lines in 1..=3 {
+                    let lines = vec![Line::raw(sample.clone())];
+                    let capped = wrap_capped(&lines, width, max_lines, Style::new());
+                    for line in &capped {
+                        let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
+                        assert!(
+                            w <= width as usize,
+                            "width={width} max_lines={max_lines}: row of {w} columns: {:?}",
+                            span_text(&line.spans)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// When even the per-word floors cannot fit (`sum_min >= avail`), the
+    /// proportional scaling floored per column and gave every column at
+    /// least one, so the row came out wider than the viewport — the
+    /// borders then ran past the last column and the renderer truncated
+    /// them (finding 36). Every row must fit.
+    #[test]
+    fn table_over_floor_scaling_still_fits_the_viewport() {
+        // One long word plus two 1-char columns: at these widths the
+        // floors alone exceed the budget.
+        // A 3-column table needs at least `1 + 3*3 + 3 = 13` columns
+        // (borders, padding, and one column per cell); below that no
+        // layout can fit and the renderer's truncation takes over (see
+        // `table_degenerate_width_does_not_panic`).
+        let md = "| aaaaaaaaaa | b | c |\n|---|---|---|\n| x | y | z |";
+        for width in 13u16..=40 {
+            for line in &render(md, Style::new(), width) {
+                let w: usize = line.spans.iter().map(|s| s.content.width()).sum();
+                assert!(
+                    w <= width as usize,
+                    "width={width}: row of {w} columns: {:?}",
+                    span_text(&line.spans)
+                );
+            }
         }
     }
 

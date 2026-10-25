@@ -198,10 +198,19 @@ impl<W: Write> Screen<W> {
         let mut tail: Vec<Line<'static>> = Vec::new();
         if sealed < app.entries.len() {
             let lines = app.entry_lines(sealed, width);
+            // The tail must fit on screen: the next redraw reaches its top
+            // row with a relative `MoveUp(tail_height - 1)`, which a
+            // terminal clamps at the top row — a taller tail would start
+            // every redraw above its own top row and scroll one row per
+            // frame (duplicate status lines, the whole tail crawling into
+            // scrollback). The footer can fill the screen on its own (a
+            // popup plus a multi-line input on a short terminal), in which
+            // case the entry keeps no tail rows at all and everything
+            // commits — `.max(1)` here let `entry_tail_rows + footer`
+            // exceed the height by exactly one row.
             let keep = (height as usize)
                 .saturating_sub(footer.lines.len())
-                .saturating_sub(1)
-                .max(1);
+                .saturating_sub(1);
             let committed = app.printed(sealed);
             let overflow_end = lines.len().saturating_sub(keep);
             if committed < overflow_end {
@@ -256,9 +265,15 @@ impl<W: Write> Screen<W> {
         let new_rows = commit.len() + tail.len();
         let shrink = new_rows < self.tail_height;
         if self.tail_height == 0 {
-            let top = (self.height as usize)
-                .saturating_sub(new_rows)
-                .min(self.height as usize - 1);
+            // The block's top row, so that its *last* row lands on the
+            // bottom row. The tail is capped to the screen height above,
+            // so `new_rows <= height` and the block fits exactly; should
+            // it ever be taller anyway, `saturating_sub` yields row 0 and
+            // the block scrolls by the overflow — the smallest scroll
+            // that can show its end. (An earlier `.min(height - 1)` turned
+            // that case into "start at the bottom row" instead, scrolling
+            // the whole block, and underflowed on a zero-height terminal.)
+            let top = (self.height as usize).saturating_sub(new_rows);
             execute!(self.out, MoveTo(0, top as u16))?;
             execute!(self.out, Clear(ClearType::FromCursorDown))?;
             self.cursor_top = 0;
@@ -959,18 +974,38 @@ fn input_window(
     }
 
     // Keep the caret visible with a little slack on the right.
-    let start_col = caret_col.saturating_sub(view_width.saturating_sub(1));
+    let mut start_col = caret_col.saturating_sub(view_width.saturating_sub(1));
+    // Snap the start down to a character boundary. The ideal start can
+    // land in the middle of a two-column character (the caret directly
+    // after one), and a window beginning there emits that character's
+    // tail: the row came out one column wider than `view_width`, the
+    // renderer truncated the character away, and the caret column was
+    // still computed from it — one cell off (finding 33).
+    if let Some(&(boundary, _)) = cols.iter().rev().find(|&&(c, _)| c <= start_col) {
+        start_col = boundary;
+    }
     let mut window_text = String::new();
+    let mut width = 0usize;
     for &(char_col, c) in &cols {
         if char_col < start_col {
             continue;
         }
-        if char_col - start_col >= view_width {
+        // Budget the character's *whole* width: one that starts inside
+        // the window but ends past it does not fit either.
+        let cw = c.width().unwrap_or(0);
+        if width + cw > view_width {
             break;
         }
+        width += cw;
         window_text.push(c);
     }
-    (vec![Span::raw(window_text)], caret_col - start_col)
+    // A caret whose own characters did not fit (a wide character in a
+    // viewport narrower than it is wide) parks at the end of the visible
+    // row: past it would be outside the row the renderer painted.
+    (
+        vec![Span::raw(window_text)],
+        (caret_col - start_col).min(width),
+    )
 }
 
 /// The picker, drawn as a bordered box that sits above the status line in
@@ -2089,6 +2124,98 @@ mod tests {
         assert!(rows[5].contains("❯"), "input on the bottom row: {rows:?}");
     }
 
+    /// The redrawable tail always fits the screen, whatever the footer
+    /// grows to (popups, modals, multi-line input): the relative redraw
+    /// math depends on it.
+    #[test]
+    fn the_tail_never_exceeds_the_screen_height() {
+        for height in 4u16..=12 {
+            for input_rows in 0..=8usize {
+                let mut app = App::new(None);
+                app.busy = true;
+                app.input = (0..input_rows).map(|i| format!("row-{i}\n")).collect();
+                app.cursor = app.input.len();
+                app.on_turn_event(TurnEvent::Text {
+                    delta: "stream-a\nstream-b\nstream-c\n".into(),
+                });
+                let mut s = screen(Buf::default(), 20, height);
+                s.render(&mut app, &status(), None, None, None).unwrap();
+                assert!(
+                    s.tail_height <= height as usize,
+                    "height={height} input_rows={input_rows}: tail_height={}",
+                    s.tail_height
+                );
+                s.render(&mut app, &status(), None, None, None).unwrap();
+                assert!(
+                    s.tail_height <= height as usize,
+                    "height={height} input_rows={input_rows}: tail_height={} on redraw",
+                    s.tail_height
+                );
+            }
+        }
+    }
+
+    /// The tail must never be taller than the screen. A footer that fills
+    /// the screen on its own (a multi-line input on a short terminal) used
+    /// to keep one entry row in the tail on top of it, so `tail_height`
+    /// exceeded `height`: the next redraw's `MoveUp(tail_height - 1)` was
+    /// clamped at the top row, started one row above the tail's own top,
+    /// and scrolled the screen by one row *per frame* — the tail crawled
+    /// into scrollback even when nothing had changed. Found by the review
+    /// as "the tail is written one row too low and the off-by-one
+    /// persists"; the trigger is a full-screen footer, not the fresh-anchor
+    /// clamp.
+    #[test]
+    fn a_tail_taller_than_the_screen_does_not_crawl() {
+        let mut app = App::new(None);
+        app.busy = true;
+        // Five input rows plus the status line = the whole 6-row screen.
+        app.input = "i0\ni1\ni2\ni3\ni4\n".into();
+        app.cursor = app.input.len();
+        app.on_turn_event(TurnEvent::Text {
+            delta: "streaming\n".into(),
+        });
+        let mut s = screen(Buf::default(), 20, 6);
+        let mut stream = Buf::default();
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        stream.0.extend(s.take_out().0);
+        assert!(
+            s.tail_height <= 6,
+            "the tail fits the screen: {} rows",
+            s.tail_height
+        );
+        // Idle redraws (the render loop runs on every event and timer
+        // tick) must not scroll: nothing changed, so nothing may move.
+        // The first frame legitimately commits the streaming row (the
+        // footer leaves no room for it), so measure the scrollback from
+        // there.
+        let settled = stream.emulated(20, 6).1.len();
+        for _ in 0..3 {
+            s.render(&mut app, &status(), None, None, None).unwrap();
+            stream.0.extend(s.take_out().0);
+        }
+        let (rows, history) = stream.emulated(20, 6);
+        assert_eq!(
+            history.len(),
+            settled,
+            "idle redraws pushed rows into scrollback: {history:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("mock/model")).count(),
+            1,
+            "one status line: {rows:?}"
+        );
+        // The input region keeps its rows in order on the bottom rows and
+        // trims from the top to fit (the caret's own row is last).
+        assert!(rows[1].contains("i1"), "input rows stay in order: {rows:?}");
+        assert!(rows[4].contains("i4"), "input rows stay in order: {rows:?}");
+        assert_eq!(
+            rows[5].trim(),
+            "",
+            "the caret's empty row is the bottom row: {rows:?}"
+        );
+    }
+
     /// Steady-state redraws keep working while the tail *grows* across
     /// the bottom row (the streaming entry gets longer than the budget
     /// and its oldest rows commit, scrolling the screen between renders):
@@ -2735,6 +2862,63 @@ mod tests {
         let modal = Modal::new("export markdown", "file name", "");
         assert!(modal_box(&modal, 20, 20).0.is_empty());
         assert!(modal_box(&modal, 60, 6).0.is_empty());
+    }
+
+    /// The caret of a CJK input row lands on a painted cell and the row
+    /// stays inside the layout width: type wide characters until the line
+    /// must scroll, then check the parked cursor against the emitted row.
+    #[test]
+    fn a_wide_character_input_row_keeps_the_caret_inside() {
+        let mut app = App::new(None);
+        app.input = "中".repeat(12);
+        app.cursor = app.input.len();
+        let mut s = screen(Buf::default(), 12, 6);
+        s.render(&mut app, &status(), None, None, None).unwrap();
+        let rows = s.take_out().emulated_screen(12, 6);
+        let input_row = rows
+            .iter()
+            .find(|r| r.contains('中'))
+            .unwrap_or_else(|| panic!("no input row: {rows:?}"));
+        // The layout width is 11 (the last terminal column is reserved),
+        // so the row — prompt plus windowed text — fits in 11 columns.
+        assert!(
+            input_row.trim_end().width() <= 11,
+            "input row overflows the layout width: {input_row:?}"
+        );
+        // Nothing was painted into the reserved last column.
+        assert!(
+            input_row.chars().nth(11) == Some(' '),
+            "reserved column painted: {input_row:?}"
+        );
+    }
+
+    /// The window never hands back more than `view_width` columns. A
+    /// two-column character whose *starting* column still fit used to be
+    /// included, making the row one column too wide: the renderer then
+    /// truncated the character away while the caret column was computed
+    /// from it, parking the caret one cell off (finding 33).
+    #[test]
+    fn input_window_never_exceeds_its_width_with_wide_characters() {
+        let line = "中".repeat(10);
+        // Byte offsets that are not char boundaries mean "no caret on this
+        // line" to `input_window`, so only walk real boundaries.
+        let boundaries: Vec<usize> = (0..=line.len())
+            .filter(|i| line.is_char_boundary(*i))
+            .collect();
+        for view_width in 1..=12usize {
+            for &caret in &boundaries {
+                let (spans, caret_col) = input_window(&line, Some(caret), view_width);
+                let width: usize = spans.iter().map(|s| s.width()).sum();
+                assert!(
+                    width <= view_width,
+                    "view_width={view_width} caret={caret}: row is {width} wide"
+                );
+                assert!(
+                    caret_col <= width,
+                    "view_width={view_width} caret={caret}: caret at {caret_col} past a {width}-wide row"
+                );
+            }
+        }
     }
 
     #[test]
