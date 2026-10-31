@@ -114,6 +114,77 @@ fn connection_fatal(err: Error) -> Message {
     }
 }
 
+/// Cancel bookkeeping shared by the reader thread and the dispatch loop
+/// (spec §7: `cancel` is handled out of band).
+///
+/// The two threads race by design, and a cancel can be read at any of three
+/// moments relative to the chat it names:
+///
+/// 1. **Queued, not started** — the reader has the `chat` line but the
+///    dispatch loop has not reached it (it may still be running an earlier
+///    chat). The cancel must be remembered and applied when that chat
+///    starts, and it must *not* touch the flag now: the flag is shared, so
+///    flipping it here would abort whichever chat is currently running.
+/// 2. **Running** — the flag must be flipped immediately, since the handler
+///    is polling it right now. It is also remembered, because the dispatch
+///    loop may be between its `reset` and the handler's first poll.
+/// 3. **Finished** — the cancel is stale. It must be ignored outright, not
+///    recorded: a flag flipped with no chat left to reset it would leak into
+///    the next chat (finding 31).
+///
+/// Hence: `seen` (received, not yet answered) decides whether the cancel is
+/// live at all, `current` decides whether it is case 1 or 2, and `pending`
+/// carries case-1 cancels to the dispatch loop. All three are updated under
+/// one mutex so the check and the record cannot interleave with the loop
+/// moving to the next chat.
+#[derive(Default)]
+struct CancelState {
+    /// Ids received from the client whose terminal message is not yet out.
+    seen: HashSet<u64>,
+    /// The chat the dispatch loop is running, if any.
+    current: Option<u64>,
+    /// Cancels recorded for chats that have not started yet.
+    pending: HashSet<u64>,
+}
+
+impl CancelState {
+    /// A `chat` line was read: from now on a cancel for `id` is live.
+    fn register(&mut self, id: u64) {
+        self.seen.insert(id);
+    }
+
+    /// A `cancel` arrived for `id`. Returns whether the caller must flip the
+    /// flag *now* (case 2); a `false` return either means the cancel is stale
+    /// and was dropped, or that it was recorded in `pending` for a chat that
+    /// has not started yet.
+    fn cancel(&mut self, id: u64) -> bool {
+        if !self.seen.contains(&id) {
+            // Never seen (a cancel for a request we were not sent) or
+            // already answered (finding 31): drop it.
+            return false;
+        }
+        self.pending.insert(id);
+        self.current == Some(id)
+    }
+
+    /// The dispatch loop is starting the chat for `id`: publish it as the
+    /// current one and return whether a cancel is already pending for it.
+    ///
+    /// The caller must have reset the flag first; this returns `true` when
+    /// the flag has to be set again for this chat.
+    fn start(&mut self, id: u64) -> bool {
+        self.current = Some(id);
+        self.pending.remove(&id)
+    }
+
+    /// The chat for `id` is over: a cancel from now on is stale.
+    fn finish(&mut self, id: u64) {
+        self.current = None;
+        self.seen.remove(&id);
+        self.pending.remove(&id);
+    }
+}
+
 /// Serve one plugin connection: read requests from `reader` until EOF,
 /// dispatch them to `handler`, write responses to `writer`.
 ///
@@ -130,17 +201,8 @@ pub fn serve(
 
     let (tx, rx) = mpsc::channel::<Message>();
     let reader_cancel = cancel.clone();
-    // `cancel` may be observed and reset out of order against the dispatch
-    // loop: the reader can flip the flag for a request the dispatch loop has
-    // not started yet, and `reset` (before each chat) would then wipe it.
-    // Remember the cancelled ids so the flag can be restored for that chat.
-    let cancelled_ids = Arc::new(Mutex::new(HashSet::new()));
-    let reader_ids = Arc::clone(&cancelled_ids);
-    // The id of the chat the dispatch loop is currently running, shared with
-    // the reader so a cancel for an already-finished request is ignored
-    // instead of flipping the flag with nothing left to reset it.
-    let current: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-    let reader_current = Arc::clone(&current);
+    let state: Arc<Mutex<CancelState>> = Arc::new(Mutex::new(CancelState::default()));
+    let reader_state = Arc::clone(&state);
     let reader_thread = thread::Builder::new()
         .name("clanky-plugin-reader".into())
         .spawn(move || {
@@ -150,22 +212,25 @@ pub fn serve(
                     continue;
                 }
                 match crate::messages::parse_message(&line) {
-                    // Cancel is advisory and out of band: flip the flag
-                    // immediately, no queueing.
+                    // Cancel is advisory and out of band: it never goes
+                    // through the queue, it is applied to the flag directly.
                     Ok(Some(Message::Cancel { request_id })) => {
-                        // Only a cancel for a request that is still pending
-                        // matters. Recording one for a request that already
-                        // finished would flip the shared flag with no chat
-                        // left to restore it (finding 31); the dispatch loop
-                        // keeps exactly one chat in flight (spec §6), so a
-                        // request that is not the current one is stale.
-                        let current = *reader_current.lock().unwrap();
-                        if current == Some(request_id) {
+                        // Flip the flag only if that chat is the one the
+                        // handler is polling right now; otherwise record the
+                        // cancel for when it starts (see `CancelState`).
+                        let flip_now = reader_state.lock().unwrap().cancel(request_id);
+                        if flip_now {
                             reader_cancel.cancel();
-                            reader_ids.lock().unwrap().insert(request_id);
                         }
                     }
                     Ok(Some(msg)) => {
+                        // Register the id before queueing: from the client's
+                        // point of view the chat is live as soon as it has
+                        // been sent, so a cancel racing the dispatch loop
+                        // must be honoured rather than dropped as unknown.
+                        if let Message::Chat { id, .. } = &msg {
+                            reader_state.lock().unwrap().register(*id);
+                        }
                         if tx.send(msg).is_err() {
                             break;
                         }
@@ -179,7 +244,7 @@ pub fn serve(
             // Dropping `tx` closes the channel, ending the dispatch loop.
         })?;
 
-    let outcome = dispatch_loop(handler, &cancel, &cancelled_ids, &current, &rx, writer);
+    let outcome = dispatch_loop(handler, &cancel, &state, &rx, writer);
     // The reader thread ends when stdin reaches EOF. If we stopped early
     // (fatal error) it may still be blocked reading; detach rather than
     // join so `serve` returns promptly. `Drop` for the process handles it.
@@ -190,8 +255,7 @@ pub fn serve(
 fn dispatch_loop(
     handler: &mut dyn Handler,
     cancel: &CancelFlag,
-    cancelled_ids: &Mutex<HashSet<u64>>,
-    current: &Mutex<Option<u64>>,
+    state: &Mutex<CancelState>,
     rx: &mpsc::Receiver<Message>,
     writer: &mut dyn Write,
 ) -> Result<(), Error> {
@@ -237,14 +301,13 @@ fn dispatch_loop(
                 sampling,
                 thinking,
             } => {
-                // Publish the in-flight id *before* resetting: the reader
-                // only records cancels for this id, so from here on a cancel
-                // for this chat is the only one that can flip the flag.
-                *current.lock().unwrap() = Some(id);
+                // Publish the in-flight id and reset the flag under one
+                // lock: a cancel read from here on either sees this id as
+                // current (and flips the flag) or is recorded as pending and
+                // restored below.
                 cancel.reset();
-                // Restore a cancel that raced ahead of this chat's dispatch
-                // (see `cancelled_ids` in `serve`).
-                if cancelled_ids.lock().unwrap().remove(&id) {
+                if state.lock().unwrap().start(id) {
+                    // A cancel raced ahead of this chat's dispatch.
                     cancel.cancel();
                 }
                 let request = ChatRequest {
@@ -268,7 +331,7 @@ fn dispatch_loop(
                 let outcome = handler.chat(&request, &mut sink);
                 // The chat is finished: a cancel that arrives from now on is
                 // for a completed request and must not flip the flag.
-                *current.lock().unwrap() = None;
+                state.lock().unwrap().finish(id);
                 let response = chat_response(id, outcome);
                 write_message(writer, &response)?;
             }
@@ -583,6 +646,117 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_cancel_for_a_queued_chat_cancels_that_chat_and_not_the_running_one() {
+        // Regression: the reader used to act only on a cancel whose id was
+        // the *currently running* chat, so a cancel for a chat still sitting
+        // in the dispatch queue was dropped and that chat ran to completion
+        // anyway. The other half of the same bug is worse: recording the id
+        // and flipping the shared flag immediately would abort the chat that
+        // happens to be running. A cancel for a queued chat must be held
+        // until that chat starts.
+        struct TwoChats {
+            cancel: CancelFlag,
+            /// Signalled once chat 1 is inside `chat`, so the test can send a
+            /// cancel for the *queued* chat 2 at that moment.
+            running: Arc<(Mutex<bool>, std::sync::Condvar)>,
+            /// `is_cancelled` as seen by chat 1 (must be false) and by chat 2
+            /// (must be true).
+            chat1_cancelled: Arc<Mutex<Option<bool>>>,
+            chat2_cancelled: Arc<Mutex<Option<bool>>>,
+        }
+        impl Handler for TwoChats {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "two-chats".into(),
+                    capabilities: Capabilities::default(),
+                    default_model: None,
+                }
+            }
+            fn list_models(&mut self) -> Result<Vec<ModelInfo>, Error> {
+                Ok(vec![])
+            }
+            fn chat(
+                &mut self,
+                request: &ChatRequest,
+                _sink: &mut dyn FnMut(ChunkPayload),
+            ) -> Result<ChatDone, Error> {
+                match request.model.as_str() {
+                    "first" => {
+                        *self.running.0.lock().unwrap() = true;
+                        self.running.1.notify_all();
+                        // Long enough for the cancel for chat 2 to be read.
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        *self.chat1_cancelled.lock().unwrap() = Some(self.cancel.is_cancelled());
+                    }
+                    "second" => {
+                        // Give a wrongly-recorded flag time to be wiped by the
+                        // reset if the implementation restores it too early.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        *self.chat2_cancelled.lock().unwrap() = Some(self.cancel.is_cancelled());
+                    }
+                    _ => {}
+                }
+                Ok(ChatDone {
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                })
+            }
+            fn set_cancel_flag(&mut self, flag: CancelFlag) {
+                self.cancel = flag;
+            }
+        }
+
+        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        let running = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let chat1_cancelled = Arc::new(Mutex::new(None));
+        let chat2_cancelled = Arc::new(Mutex::new(None));
+        let mut handler = TwoChats {
+            cancel: CancelFlag::default(),
+            running: Arc::clone(&running),
+            chat1_cancelled: Arc::clone(&chat1_cancelled),
+            chat2_cancelled: Arc::clone(&chat2_cancelled),
+        };
+
+        let serve_running = Arc::clone(&running);
+        let serving = std::thread::spawn(move || {
+            let mut out: Vec<u8> = Vec::new();
+            serve(&mut handler, std::io::BufReader::new(reader), &mut out).unwrap();
+            out
+        });
+
+        writer
+            .write_all(b"{\"type\":\"chat\",\"id\":1,\"model\":\"first\",\"messages\":[]}\n")
+            .unwrap();
+        writer
+            .write_all(b"{\"type\":\"chat\",\"id\":2,\"model\":\"second\",\"messages\":[]}\n")
+            .unwrap();
+        // Chat 1 is running; chat 2 is queued behind it. Cancel chat 2.
+        {
+            let (lock, cvar) = &*serve_running;
+            let mut ready = lock.lock().unwrap();
+            while !*ready {
+                ready = cvar.wait(ready).unwrap();
+            }
+        }
+        writer
+            .write_all(b"{\"type\":\"cancel\",\"requestId\":2}\n")
+            .unwrap();
+        drop(writer);
+        serving.join().unwrap();
+
+        assert_eq!(
+            *chat1_cancelled.lock().unwrap(),
+            Some(false),
+            "a cancel for a queued chat must not abort the running chat"
+        );
+        assert_eq!(
+            *chat2_cancelled.lock().unwrap(),
+            Some(true),
+            "a cancel for a queued chat must apply when that chat starts"
+        );
     }
 
     #[test]

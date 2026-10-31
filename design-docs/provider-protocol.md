@@ -247,6 +247,16 @@ Client → plugin:
   client kills the process (restart per §8). This is always safe because every
   event carries `requestId`.
 - After `done`/`error`, the connection is free for the next `chat`.
+- **A cancel names a request, not "the current one".** Because the plugin
+  reads stdin on a separate thread, a `cancel` can arrive at any point
+  relative to the chat it names, and the plugin must honour all of them:
+  - *Before that chat starts* (it is queued behind an earlier one, spec §6):
+    the cancel is remembered and applied when the chat starts. It must not
+    cancel the chat that is running at that moment.
+  - *While that chat runs*: applied immediately.
+  - *After that chat's `done`/`error`*: ignored. A stale cancel must never
+    cancel a later chat.
+  A cancel for a `requestId` the plugin was never sent is ignored.
 
 ## 8. Errors and crash handling
 
