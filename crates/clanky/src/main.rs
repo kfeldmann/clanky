@@ -172,6 +172,11 @@ fn run_pipe(
     // on stderr (stdout stays the response/quiet channel). Unset fields
     // are elided.
     eprintln!("INFO: settings: {}", effective.describe());
+    // The override list is the one part of the configuration whose effect
+    // is *absence*, so say it out loud when it is in play.
+    if let Some(note) = clanky::config::override_note(&settings.overrides()) {
+        eprintln!("INFO: {note}");
+    }
 
     // Same session behavior as the TUI (M14): records by default, the
     // user prompt first, everything the turn produces appended as it
@@ -191,7 +196,7 @@ fn run_pipe(
     // turn continues (system context fresh, records' history appended), and
     // reopen the same file so the turn's records append to it. The note
     // goes to stderr, keeping stdout a clean stream of the answer.
-    let mut messages = context::system_messages();
+    let mut messages = context::system_messages(&settings.overrides());
     if let Some(name) = resume {
         let path = session::find_by_name(name)?;
         let data = session::load(&path)?;

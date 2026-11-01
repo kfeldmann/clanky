@@ -13,6 +13,11 @@
 //! project scope shadows the user scope (same precedence as settings:
 //! user < project). Results are sorted by name so context assembly is
 //! deterministic.
+//!
+//! `override = ["skills"]` in settings.toml drops the user scope's
+//! directory entirely (see [`crate::config::Override`]): the project's
+//! skills are then the only ones, and no project skill is needed to
+//! remove a user one.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,9 +36,10 @@ pub struct Skill {
     pub content: String,
 }
 
-/// Discover skills from the real locations (cwd as project root).
-pub fn skills() -> Vec<Skill> {
-    skills_in(&config::scopes())
+/// Discover skills from the real locations (cwd as project root), with
+/// the merged settings' `overrides` applied.
+pub fn skills(overrides: &[config::Override]) -> Vec<Skill> {
+    skills_in(&config::scopes_for(overrides, config::Override::Skills))
 }
 
 /// Pure form of [`skills`] for testing: read the `skills/` directory under
@@ -219,6 +225,42 @@ mod tests {
         assert_eq!(names, vec!["aaa", "style"], "sorted by name");
         let style = skills.iter().find(|s| s.name == "style").unwrap();
         assert_eq!(style.content, "project style");
+        fs::remove_dir_all(user).ok();
+        fs::remove_dir_all(project).ok();
+    }
+
+    #[test]
+    fn overridden_user_skills_are_not_read() {
+        // `override = ["skills"]` means the user directory does not exist
+        // as far as discovery is concerned: the project's skills are the
+        // only ones, and nothing has to shadow a user skill to remove it.
+        // `config::scopes_for` is what turns the override into the scope
+        // list; discovery just reads what it is given.
+        let user = temp_dir("override-user");
+        let project = temp_dir("override-project");
+        fs::create_dir_all(user.join(config::SKILLS_DIR)).unwrap();
+        fs::write(user.join(config::SKILLS_DIR).join("user-only.md"), "user").unwrap();
+        fs::create_dir_all(project.join(config::SKILLS_DIR)).unwrap();
+        fs::write(
+            project.join(config::SKILLS_DIR).join("project.md"),
+            "project",
+        )
+        .unwrap();
+
+        let layered = skills_in(&[user.clone(), project.clone()]);
+        let names: Vec<&str> = layered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["project", "user-only"]);
+
+        // What an overridden discovery scans: the project scope alone.
+        let overridden = skills_in(std::slice::from_ref(&project));
+        let names: Vec<&str> = overridden.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["project"]);
+        assert_eq!(
+            config::scopes_for(&[config::Override::Skills], config::Override::Skills),
+            vec![config::project_dir()],
+            "the override leaves the project scope only"
+        );
+
         fs::remove_dir_all(user).ok();
         fs::remove_dir_all(project).ok();
     }

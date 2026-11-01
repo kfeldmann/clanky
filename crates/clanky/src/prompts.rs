@@ -23,6 +23,7 @@ pub struct Template {
 }
 
 /// Discover templates from the real locations (cwd as project root).
+/// Prompt templates have no `override` kind: they are always layered.
 pub fn templates() -> Vec<Template> {
     templates_in(&config::scopes())
 }

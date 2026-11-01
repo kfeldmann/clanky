@@ -8,13 +8,21 @@
 //! Layering is per-field: a scope only overrides fields it actually sets.
 //! The `sampling` map merges per key: a higher layer wins key-by-key and
 //! keys it does not set are kept from lower layers.
+//!
+//! The layering is additive *unless a scope says otherwise*: the
+//! `override` array in either file names the resources that scope takes
+//! over from the user scope instead of adding to it (see
+//! [`crate::config::Override`]). Loading therefore happens in two passes —
+//! the `override` lists first, then the merged settings with those
+//! overrides applied — because a project's `override` decides whether its
+//! own user-scope file is read at all.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config;
+use crate::config::{self, Override};
 use crate::error::{Error, Result};
 
 /// Sampling parameters as `key -> value` pairs, e.g. `"temperature" ->
@@ -57,27 +65,117 @@ pub struct Settings {
     /// does not pass its own `timeout_seconds`. Unset (default) means
     /// unbounded — unchanged behavior.
     pub timeout_seconds: Option<u64>,
+    /// Resources this scope takes over from the user scope instead of
+    /// adding to it: `["settings", "system", "skills"]`. Written as the
+    /// plain strings in the file and validated into [`Override`]s here;
+    /// an unknown name is an error, never a silently ignored entry.
+    /// Override lists union across scopes — see [`Settings::overrides`].
+    /// Deserialized through `deserialize_overrides` (which rejects
+    /// unknown names); serialized as the plain names.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_overrides",
+        serialize_with = "serialize_overrides"
+    )]
+    pub r#override: Option<Vec<Override>>,
+}
+
+/// Deserialize `override = ["system", "skills"]`, rejecting unknown names
+/// with an error naming the accepted values. Kept out of the `serde`
+/// derive because [`Override`]'s spelling in the file is not its variant
+/// name and the failure has to be actionable.
+fn deserialize_overrides<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<Override>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Vec<String>>::deserialize(deserializer)?;
+    raw.map(|names| {
+        names
+            .into_iter()
+            .map(|name| {
+                Override::parse(&name).ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "unknown override `{name}`; expected any of `settings`, `system`, `skills`"
+                    ))
+                })
+            })
+            .collect()
+    })
+    .transpose()
+}
+
+/// Serialize the override list back to its settings.toml spelling.
+fn serialize_overrides<S>(
+    overrides: &Option<Vec<Override>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match overrides {
+        Some(overrides) => serializer.serialize_some(
+            &overrides
+                .iter()
+                .map(|over| over.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        None => serializer.serialize_none(),
+    }
 }
 
 impl Settings {
-    /// Load user- and project-scope settings and merge them.
+    /// Load user- and project-scope settings and merge them, honoring the
+    /// `override` lists found in either file.
+    ///
+    /// Two passes, because an `override` list decides which files count:
+    /// the lists are collected first (from both files, always — a file
+    /// that is itself overridden still gets a say in what is overridden),
+    /// then the files are layered with the user scope left out for every
+    /// overridden resource. `override = ["settings"]` in the project file
+    /// therefore drops the user file, and the same line in the user file
+    /// drops it for every project.
     pub fn load_layered() -> Result<Settings> {
-        let paths: Vec<PathBuf> = config::scopes()
-            .into_iter()
-            .map(|scope| scope.join(config::SETTINGS_FILE))
-            .collect();
-        Self::load_from_paths(&paths)
+        let user = config::user_dir().map(|dir| dir.join(config::SETTINGS_FILE));
+        let project = config::project_dir().join(config::SETTINGS_FILE);
+        Self::load_scopes(user.as_deref(), &project)
     }
 
-    /// Load settings from a sequence of paths, each later path overlaying
-    /// the previous. Missing files are skipped silently.
-    pub fn load_from_paths(paths: &[PathBuf]) -> Result<Settings> {
-        let mut merged = Settings::default();
-        for path in paths {
-            if let Some(scope) = Self::load_file(path)? {
-                merged.overlay(scope);
-            }
+    /// Pure form of [`Settings::load_layered`] for testing: layer the
+    /// `user` settings file (if any) under the `project` one, applying the
+    /// override lists found in either.
+    pub fn load_scopes(user: Option<&Path>, project: &Path) -> Result<Settings> {
+        let user = match user {
+            Some(path) => Self::load_file(path)?,
+            None => None,
+        };
+        let project = Self::load_file(project)?;
+
+        // The override lists come from every file that exists — including
+        // a file that is itself about to be dropped: it still gets a say
+        // in what is overridden.
+        let mut overrides = Vec::new();
+        for settings in [&user, &project].into_iter().flatten() {
+            overrides.extend(settings.overrides());
         }
+        overrides.sort();
+        overrides.dedup();
+
+        // The values, from the files that still count. Only
+        // `override = ["settings"]` matters here — the other kinds govern
+        // other resources, not which settings files are read.
+        let mut merged = Settings::default();
+        if let Some(user) = user.filter(|_| !overrides.contains(&Override::Settings)) {
+            merged.overlay(user);
+        }
+        if let Some(project) = project {
+            merged.overlay(project);
+        }
+        // The result carries the union of every file's list (a dropped
+        // file's list included), so the override in effect is reported
+        // whole.
+        merged.r#override = (!overrides.is_empty()).then_some(overrides);
         Ok(merged)
     }
 
@@ -138,6 +236,32 @@ impl Settings {
         if over.timeout_seconds.is_some() {
             self.timeout_seconds = over.timeout_seconds;
         }
+        if let Some(over_overrides) = over.r#override {
+            // Override lists union: a scope that overrides `skills` cannot
+            // un-override a `system` its other scope took over — the
+            // resources are independent, and dropping one silently is
+            // exactly what this feature exists to avoid.
+            match &mut self.r#override {
+                Some(base) => {
+                    for over in over_overrides {
+                        if !base.contains(&over) {
+                            base.push(over);
+                        }
+                    }
+                    base.sort();
+                }
+                None => self.r#override = Some(over_overrides),
+            }
+        }
+    }
+
+    /// The override resources in effect, sorted and deduplicated. Empty
+    /// when no scope overrides anything.
+    pub fn overrides(&self) -> Vec<Override> {
+        let mut overrides = self.r#override.clone().unwrap_or_default();
+        overrides.sort();
+        overrides.dedup();
+        overrides
     }
 
     /// Whether conversations are recorded into session files. Sessions
@@ -289,12 +413,19 @@ pub fn describe_sampling(params: &SamplingParams) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn sampling(pairs: &[(&str, &str)]) -> SamplingParams {
         pairs
             .iter()
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect()
+    }
+
+    /// Layer two settings files (user then project), the way the binary
+    /// does, from the path pair the older tests already build.
+    fn layer(user: &Path, project: &Path) -> Settings {
+        Settings::load_scopes(Some(user), project).unwrap()
     }
 
     fn write_temp_settings(dir: &Path, text: &str) -> PathBuf {
@@ -314,11 +445,10 @@ mod tests {
 
     #[test]
     fn missing_files_yield_defaults() {
-        let merged = Settings::load_from_paths(&[
-            PathBuf::from("/nonexistent-user/settings.toml"),
-            PathBuf::from("/nonexistent-project/settings.toml"),
-        ])
-        .unwrap();
+        let merged = layer(
+            Path::new("/nonexistent-user/settings.toml"),
+            Path::new("/nonexistent-project/settings.toml"),
+        );
         assert_eq!(merged, Settings::default());
     }
 
@@ -352,7 +482,7 @@ mod tests {
             &tmp.join("clanky-test-project"),
             "model = \"project-model\"\n[sampling]\ntemperature = \"0.7\"\n",
         );
-        let merged = Settings::load_from_paths(&[user.clone(), project.clone()]).unwrap();
+        let merged = layer(&user, &project);
 
         assert_eq!(merged.provider.as_deref(), Some("deepinfra"));
         assert_eq!(merged.model.as_deref(), Some("project-model"));
@@ -377,15 +507,14 @@ mod tests {
             &tmp.join("clanky-test-project-project"),
             "project = \"project-proj\"\n",
         );
-        let merged = Settings::load_from_paths(&[user.clone(), project.clone()]).unwrap();
+        let merged = layer(&user, &project);
         assert_eq!(merged.project.as_deref(), Some("project-proj"));
 
         // A layer that does not set it keeps the lower layer's value.
-        let merged = Settings::load_from_paths(&[
-            user,
-            PathBuf::from("/nonexistent-clanky-project/settings.toml"),
-        ])
-        .unwrap();
+        let merged = layer(
+            &user,
+            Path::new("/nonexistent-clanky-project/settings.toml"),
+        );
         assert_eq!(merged.project.as_deref(), Some("user-proj"));
 
         std::fs::remove_file(project).unwrap();
@@ -462,7 +591,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("clanky-test-badkey");
         std::fs::create_dir_all(&tmp).unwrap();
         let path = write_temp_settings(&tmp, "provieder = \"oops\"\n");
-        let err = Settings::load_from_paths(std::slice::from_ref(&path)).unwrap_err();
+        let err = Settings::load_scopes(None, &path).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("settings.toml"),
@@ -505,7 +634,7 @@ mod tests {
             &tmp.join("clanky-test-sampling-merge-project"),
             "[sampling]\ntop_p = \"0.9\"\nseed = 7\n",
         );
-        let merged = Settings::load_from_paths(&[user.clone(), project.clone()]).unwrap();
+        let merged = layer(&user, &project);
         let sampling = merged.sampling.as_ref().unwrap();
 
         assert_eq!(sampling["temperature"], serde_json::json!("0.7"));
@@ -538,7 +667,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("clanky-test-session-field");
         std::fs::create_dir_all(&tmp).unwrap();
         let path = write_temp_settings(&tmp, "session = false\n");
-        let merged = Settings::load_from_paths(std::slice::from_ref(&path)).unwrap();
+        let merged = Settings::load_scopes(None, &path).unwrap();
         assert!(!merged.record_sessions(), "`session = false` must disable");
 
         std::fs::remove_file(path).unwrap();
@@ -563,6 +692,134 @@ mod tests {
     }
 
     #[test]
+    fn override_settings_is_positional_first_file_is_the_user_scope() {
+        // The user settings file is the first of the pair, so the drop is
+        // decided by position, exactly as `config::scopes` orders them.
+        let tmp = std::env::temp_dir().join("clanky-test-override-positional");
+        let user = write_temp_settings(
+            &tmp.join("user"),
+            "override = [\"settings\"]\nprovider = \"user-provider\"\n",
+        );
+        let project = write_temp_settings(&tmp.join("project"), "model = \"project-model\"\n");
+        let merged = layer(&user, &project);
+        assert_eq!(merged.provider, None, "the user file is the dropped one");
+        assert_eq!(merged.model.as_deref(), Some("project-model"));
+
+        // With no user scope configured at all (`$HOME` unknown), the
+        // single file is never treated as a droppable user scope.
+        let merged = Settings::load_scopes(None, &user).unwrap();
+        assert_eq!(merged.provider.as_deref(), Some("user-provider"));
+
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
+    fn override_parses_known_names_and_merges_across_scopes() {
+        let tmp = std::env::temp_dir().join("clanky-test-override-merge");
+        let user = write_temp_settings(
+            &tmp.join("user"),
+            "override = [\"system\"]\nmodel = \"user-model\"\n",
+        );
+        let project = write_temp_settings(&tmp.join("project"), "override = [\"skills\"]\n");
+        let merged = Settings::load_scopes(Some(&user), &project).unwrap();
+        assert_eq!(
+            merged.overrides(),
+            vec![Override::System, Override::Skills],
+            "lists union and sort; user settings still layered (not overridden)"
+        );
+        assert_eq!(merged.model.as_deref(), Some("user-model"));
+
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
+    fn an_unknown_override_is_an_error_naming_the_file() {
+        let tmp = std::env::temp_dir().join("clanky-test-override-unknown");
+        let project = write_temp_settings(&tmp, "override = [\"prompts\"]\n");
+        let err = Settings::load_scopes(None, &project).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("settings.toml"), "{msg}");
+        assert!(msg.contains("unknown override `prompts`"), "{msg}");
+        assert!(
+            msg.contains("`settings`, `system`, `skills`"),
+            "the error lists the accepted values: {msg}"
+        );
+
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
+    fn override_settings_drops_the_user_file() {
+        let tmp = std::env::temp_dir().join("clanky-test-override-settings");
+        let user = write_temp_settings(
+            &tmp.join("user"),
+            "provider = \"user-provider\"\nmodel = \"user-model\"\n\
+             [sampling]\ntemperature = 0.7\n",
+        );
+        let project = write_temp_settings(
+            &tmp.join("project"),
+            "override = [\"settings\"]\nmodel = \"project-model\"\n",
+        );
+        let merged = Settings::load_scopes(Some(&user), &project).unwrap();
+        assert_eq!(
+            merged.provider, None,
+            "the user file is not read at all: nothing is left to layer"
+        );
+        assert_eq!(merged.model.as_deref(), Some("project-model"));
+        assert_eq!(merged.sampling, None, "the user [sampling] is gone too");
+        assert_eq!(merged.overrides(), vec![Override::Settings]);
+
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
+    fn override_in_the_user_file_drops_it_for_every_project() {
+        // Pointless but consistent: `override` is accepted in either file,
+        // and in the user file it nullifies the user scope everywhere.
+        let tmp = std::env::temp_dir().join("clanky-test-override-user-self");
+        let user = write_temp_settings(
+            &tmp.join("user"),
+            "override = [\"settings\"]\nprovider = \"user-provider\"\n",
+        );
+        let project = write_temp_settings(&tmp.join("project"), "model = \"project-model\"\n");
+        let merged = Settings::load_scopes(Some(&user), &project).unwrap();
+        assert_eq!(merged.provider, None);
+        assert_eq!(merged.model.as_deref(), Some("project-model"));
+
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
+    fn override_of_another_resource_keeps_the_user_settings() {
+        // `override = ["system"]` governs the system prompt only; the user
+        // settings file is still layered.
+        let tmp = std::env::temp_dir().join("clanky-test-override-other");
+        let user = write_temp_settings(&tmp.join("user"), "provider = \"user-provider\"\n");
+        let project = write_temp_settings(&tmp.join("project"), "override = [\"system\"]\n");
+        let merged = Settings::load_scopes(Some(&user), &project).unwrap();
+        assert_eq!(merged.provider.as_deref(), Some("user-provider"));
+
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
+    fn override_serializes_to_its_settings_spelling() {
+        // The write side is only used for diagnostics today, but it must
+        // not invent variant names (`System`) in a settings file.
+        let settings = Settings {
+            r#override: Some(vec![Override::System, Override::Skills]),
+            ..Settings::default()
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["override"], serde_json::json!(["system", "skills"]));
+        assert_eq!(
+            Settings::default().r#override,
+            None,
+            "an unset list serializes as null, never as an empty one"
+        );
+    }
+
+    #[test]
     fn sampling_values_of_any_toml_type_load() {
         // Numbers, booleans, arrays, tables: whatever the user writes in
         // `[sampling]` is accepted as-is — validation is the backend's job.
@@ -575,7 +832,7 @@ mod tests {
              stop = [\"\\n\\n\"]\n\
              repetition_penalty = 1.1\n",
         );
-        let merged = Settings::load_from_paths(std::slice::from_ref(&path)).unwrap();
+        let merged = Settings::load_scopes(None, &path).unwrap();
         let sampling = merged.sampling.as_ref().unwrap();
         assert_eq!(sampling["temperature"], serde_json::json!(0.7));
         assert_eq!(sampling["seed"], serde_json::json!(42));

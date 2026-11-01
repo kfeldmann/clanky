@@ -19,47 +19,92 @@
 //!
 //! Everything is best-effort: missing, empty, or unreadable files are
 //! skipped silently.
+//!
+//! `override = ["system", "skills"]` in settings.toml (see
+//! [`crate::config::Override`]) drops the user scope from the parts it
+//! names: `system` removes the user `SYSTEM.md`, `skills` the user
+//! `skills/` directory. The user `AGENTS.md` is not covered by either —
+//! it is agent instructions, not the system prompt — so the user scope is
+//! still read for it, and only the parts for overridden resources are
+//! left out. With both overridden the context is the project scope's
+//! alone (plus the project-root `AGENTS.md`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use clanky_protocol::ChatMessage;
 
 use crate::config;
 use crate::skills::{self, Skill};
 
-/// Assemble system messages from the real locations (cwd as project root).
-pub fn system_messages() -> Vec<ChatMessage> {
-    system_messages_in(&config::scopes(), Path::new("."))
+/// Assemble system messages from the real locations (cwd as project root),
+/// applying the `overrides` from the merged settings.
+pub fn system_messages(overrides: &[config::Override]) -> Vec<ChatMessage> {
+    system_messages_in(
+        config::user_dir().as_deref(),
+        &config::project_dir(),
+        Path::new("."),
+        overrides,
+    )
 }
 
 /// Assemble the system prompt with one labelled part per source, for
 /// `/system` display: `(source label, content)` pairs in send order.
-pub fn system_parts() -> Vec<(String, String)> {
-    system_parts_in(&config::scopes(), Path::new("."))
+pub fn system_parts(overrides: &[config::Override]) -> Vec<(String, String)> {
+    system_parts_in(
+        config::user_dir().as_deref(),
+        &config::project_dir(),
+        Path::new("."),
+        overrides,
+    )
 }
 
-/// Pure form of [`system_parts`] for testing.
-pub fn system_parts_in(scopes: &[PathBuf], project_root: &Path) -> Vec<(String, String)> {
+/// Pure form of [`system_parts`] for testing: `user` and `project` are the
+/// scope directories (user `None` when `$HOME` is unknown), `project_root`
+/// carries the ecosystem `AGENTS.md`, and `overrides` are the merged
+/// settings' overridden resources.
+pub fn system_parts_in(
+    user: Option<&Path>,
+    project: &Path,
+    project_root: &Path,
+    overrides: &[config::Override],
+) -> Vec<(String, String)> {
     let mut parts = Vec::new();
-    for scope in scopes {
-        push_part(&mut parts, scope, config::SYSTEM_FILE);
-        push_part(&mut parts, scope, config::AGENTS_FILE);
+    // The user scope's `SYSTEM.md` is the system prompt, so the `system`
+    // override removes it; its `AGENTS.md` is agent instructions and is
+    // always layered.
+    if let Some(user) = user {
+        if !overrides.contains(&config::Override::System) {
+            push_part(&mut parts, user, config::SYSTEM_FILE);
+        }
+        push_part(&mut parts, user, config::AGENTS_FILE);
     }
+    push_part(&mut parts, project, config::SYSTEM_FILE);
+    push_part(&mut parts, project, config::AGENTS_FILE);
     // Ecosystem convention from M1: a project-root AGENTS.md still counts.
     push_part(&mut parts, project_root, config::AGENTS_FILE);
 
-    let found = skills::skills_in(scopes);
+    // Skills layer user-then-project unless the user directory is
+    // overridden, in which case only the project scope is scanned.
+    let mut scopes = Vec::new();
+    if let Some(user) = user.filter(|_| !overrides.contains(&config::Override::Skills)) {
+        scopes.push(user.to_path_buf());
+    }
+    scopes.push(project.to_path_buf());
+    let found = skills::skills_in(&scopes);
     if !found.is_empty() {
         parts.push(("skills".to_string(), skill_list(&found)));
     }
     parts
 }
 
-/// Pure form of [`system_messages`] for testing: scan explicit scope
-/// directories (layering order: user first, project last) and a project
-/// root for the `AGENTS.md` convention file.
-pub fn system_messages_in(scopes: &[PathBuf], project_root: &Path) -> Vec<ChatMessage> {
-    system_parts_in(scopes, project_root)
+/// Pure form of [`system_messages`] for testing; see [`system_parts_in`].
+pub fn system_messages_in(
+    user: Option<&Path>,
+    project: &Path,
+    project_root: &Path,
+    overrides: &[config::Override],
+) -> Vec<ChatMessage> {
+    system_parts_in(user, project, project_root, overrides)
         .into_iter()
         .map(|(_, content)| ChatMessage::system(content))
         .collect()
@@ -122,20 +167,29 @@ mod tests {
         dir
     }
 
+    /// A fake scope directory (a `scope` inside `base`, which stands in
+    /// for `$HOME` or the cwd).
     fn scope_dir(base: &Path, kind: &str) -> PathBuf {
         let dir = base.join(kind).join(config::project_dir());
         fs::create_dir_all(&dir).unwrap();
         dir
     }
 
+    /// The usual pair: (user scope, project scope) directories.
+    fn two_scopes(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let project = temp_dir(&format!("{name}-project"));
+        let user = temp_dir(&format!("{name}-user"));
+        let user_scope = scope_dir(&user, "u");
+        let project_scope = scope_dir(&project, "p");
+        (project, user, user_scope, project_scope)
+    }
+
     #[test]
     fn system_parts_label_every_source() {
-        let project = temp_dir("parts-project");
-        let user = temp_dir("parts-user");
-        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
-        fs::write(scopes[0].join(config::SYSTEM_FILE), "user system").unwrap();
-        fs::write(scopes[1].join(config::AGENTS_FILE), "Be terse.\n").unwrap();
-        let skills = scopes[1].join(config::SKILLS_DIR);
+        let (project, user, user_scope, project_scope) = two_scopes("parts");
+        fs::write(user_scope.join(config::SYSTEM_FILE), "user system").unwrap();
+        fs::write(project_scope.join(config::AGENTS_FILE), "Be terse.\n").unwrap();
+        let skills = project_scope.join(config::SKILLS_DIR);
         fs::create_dir_all(&skills).unwrap();
         fs::write(
             skills.join("style.md"),
@@ -143,7 +197,7 @@ mod tests {
         )
         .unwrap();
 
-        let parts = system_parts_in(&scopes, Path::new("."));
+        let parts = system_parts_in(Some(&user_scope), &project_scope, Path::new("."), &[]);
         let labels: Vec<&str> = parts.iter().map(|(label, _)| label.as_str()).collect();
         assert!(
             labels[0].contains(".clanky") && labels[0].ends_with("SYSTEM.md"),
@@ -169,25 +223,26 @@ mod tests {
 
     #[test]
     fn missing_files_yield_no_context() {
-        let project = temp_dir("empty-project");
-        let user = temp_dir("empty-user");
-        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
-        assert!(system_messages_in(&scopes, Path::new(".")).is_empty());
+        let (project, user, user_scope, project_scope) = two_scopes("empty");
+        assert!(
+            system_messages_in(Some(&user_scope), &project_scope, Path::new("."), &[]).is_empty()
+        );
         fs::remove_dir_all(project).ok();
         fs::remove_dir_all(user).ok();
     }
 
     #[test]
     fn project_agents_md_becomes_system_message() {
-        let project = temp_dir("with-agents");
-        let user = temp_dir("with-agents-user");
-        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
-        fs::write(scopes[1].join(config::AGENTS_FILE), "Be terse.\n").unwrap();
-        let msgs = system_messages_in(&scopes, Path::new("."));
+        let (project, user, user_scope, project_scope) = two_scopes("with-agents");
+        fs::write(project_scope.join(config::AGENTS_FILE), "Be terse.\n").unwrap();
+        let msgs = system_messages_in(Some(&user_scope), &project_scope, Path::new("."), &[]);
         assert_eq!(msgs.len(), 1);
         assert_eq!(
             msgs[0].content(),
-            format!("# Context — {}/AGENTS.md\n\nBe terse.", scopes[1].display())
+            format!(
+                "# Context — {}/AGENTS.md\n\nBe terse.",
+                project_scope.display()
+            )
         );
 
         fs::remove_dir_all(project).ok();
@@ -196,19 +251,17 @@ mod tests {
 
     #[test]
     fn project_overrides_user_by_order() {
-        let project = temp_dir("order-project");
-        let user = temp_dir("order-user");
-        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
-        fs::write(scopes[0].join(config::SYSTEM_FILE), "user system").unwrap();
-        fs::write(scopes[0].join(config::AGENTS_FILE), "user agents").unwrap();
-        fs::write(scopes[1].join(config::SYSTEM_FILE), "project system").unwrap();
-        fs::write(scopes[1].join(config::AGENTS_FILE), "project agents").unwrap();
+        let (project, user, user_scope, project_scope) = two_scopes("order");
+        fs::write(user_scope.join(config::SYSTEM_FILE), "user system").unwrap();
+        fs::write(user_scope.join(config::AGENTS_FILE), "user agents").unwrap();
+        fs::write(project_scope.join(config::SYSTEM_FILE), "project system").unwrap();
+        fs::write(project_scope.join(config::AGENTS_FILE), "project agents").unwrap();
 
-        let msgs = system_messages_in(&scopes, Path::new("."));
+        let msgs = system_messages_in(Some(&user_scope), &project_scope, Path::new("."), &[]);
         let contents: Vec<String> = msgs
             .iter()
             .zip(["SYSTEM.md", "AGENTS.md", "SYSTEM.md", "AGENTS.md"])
-            .zip([&scopes[0], &scopes[0], &scopes[1], &scopes[1]])
+            .zip([&user_scope, &user_scope, &project_scope, &project_scope])
             .map(|((_, name), scope)| format!("# Context — {}/{}\n\n", scope.display(), name))
             .zip(msgs.iter().map(|m| m.content()))
             .map(|(head, content)| {
@@ -235,18 +288,18 @@ mod tests {
     #[test]
     fn whitespace_only_files_are_skipped() {
         let project = temp_dir("blank-file");
-        let scopes = vec![scope_dir(&project, "p")];
-        fs::write(scopes[0].join(config::AGENTS_FILE), "   \n\t\n").unwrap();
-        assert!(system_messages_in(&scopes, Path::new(".")).is_empty());
+        let project_scope = scope_dir(&project, "p");
+        fs::write(project_scope.join(config::AGENTS_FILE), "   \n\t\n").unwrap();
+        assert!(system_messages_in(None, &project_scope, Path::new("."), &[]).is_empty());
         fs::remove_dir_all(project).ok();
     }
 
     #[test]
     fn project_root_agents_md_still_counts() {
         let project = temp_dir("root-agents");
-        let scopes = vec![scope_dir(&project, "p")];
+        let project_scope = scope_dir(&project, "p");
         fs::write(project.join(config::AGENTS_FILE), "root convention").unwrap();
-        let msgs = system_messages_in(&scopes, &project);
+        let msgs = system_messages_in(None, &project_scope, &project, &[]);
         assert_eq!(msgs.len(), 1);
         assert_eq!(
             msgs[0].content(),
@@ -260,10 +313,8 @@ mod tests {
 
     #[test]
     fn skills_load_from_both_scopes_with_project_shadowing() {
-        let project = temp_dir("skills-project");
-        let user = temp_dir("skills-user");
-        let scopes = vec![scope_dir(&user, "u"), scope_dir(&project, "p")];
-        for scope in &scopes {
+        let (project, user, user_scope, project_scope) = two_scopes("skills");
+        for scope in [&user_scope, &project_scope] {
             let skills = scope.join(config::SKILLS_DIR);
             fs::create_dir_all(&skills).unwrap();
             fs::write(
@@ -272,16 +323,10 @@ mod tests {
             )
             .unwrap();
         }
-        // Project scope wins the shadowing: overwrite the project copy.
-        fs::write(
-            scopes[1].join(config::SKILLS_DIR).join("style.md"),
-            "---\ndescription: project style\n---\n\nuser style",
-        )
-        .unwrap();
-        let user_skills = scopes[0].join(config::SKILLS_DIR);
+        let user_skills = user_scope.join(config::SKILLS_DIR);
         fs::create_dir_all(&user_skills).unwrap();
         fs::write(user_skills.join("shared-user-only.md"), "only in user").unwrap();
-        let project_skills = scopes[1].join(config::SKILLS_DIR);
+        let project_skills = project_scope.join(config::SKILLS_DIR);
         fs::create_dir_all(project_skills.join("dirskill")).unwrap();
         fs::write(
             project_skills.join("dirskill/SKILL.md"),
@@ -289,7 +334,7 @@ mod tests {
         )
         .unwrap();
 
-        let msgs = system_messages_in(&scopes, Path::new("."));
+        let msgs = system_messages_in(Some(&user_scope), &project_scope, Path::new("."), &[]);
         let contents: Vec<&str> = msgs.iter().map(|m| m.content()).collect();
         assert_eq!(
             contents,
@@ -297,16 +342,122 @@ mod tests {
                 "## Skills\n\n{SKILL_HINT}\n\n- dirskill: {} ({})\n- shared-user-only ({})\n- style: project style ({})\n",
                 "directory skill description",
                 project_skills.join("dirskill/SKILL.md").display(),
-                scopes[0]
-                    .join(config::SKILLS_DIR)
-                    .join("shared-user-only.md")
-                    .display(),
-                scopes[1]
-                    .join(config::SKILLS_DIR)
-                    .join("style.md")
-                    .display(),
+                user_skills.join("shared-user-only.md").display(),
+                project_skills.join("style.md").display(),
             )],
             "one listing part; project scope shadows user; sorted by name"
+        );
+
+        fs::remove_dir_all(project).ok();
+        fs::remove_dir_all(user).ok();
+    }
+
+    /// A user scope with all three resources, and a project scope with
+    /// only `AGENTS.md` — the setup every override test starts from.
+    fn layered_scopes(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let (project, user, user_scope, project_scope) = two_scopes(name);
+        fs::write(user_scope.join(config::SYSTEM_FILE), "user system").unwrap();
+        fs::write(user_scope.join(config::AGENTS_FILE), "user agents").unwrap();
+        let user_skills = user_scope.join(config::SKILLS_DIR);
+        fs::create_dir_all(&user_skills).unwrap();
+        fs::write(user_skills.join("user-skill.md"), "user skill").unwrap();
+        fs::write(project_scope.join(config::AGENTS_FILE), "project agents").unwrap();
+        (project, user, user_scope, project_scope)
+    }
+
+    /// The bodies of the parts, in send order.
+    fn bodies(parts: &[(String, String)]) -> Vec<String> {
+        parts.iter().map(|(_, body)| body.clone()).collect()
+    }
+
+    #[test]
+    fn system_override_drops_only_the_user_system_md() {
+        let (project, user, user_scope, project_scope) = layered_scopes("override-system");
+        let parts = system_parts_in(
+            Some(&user_scope),
+            &project_scope,
+            Path::new("."),
+            &[config::Override::System],
+        );
+        let bodies = bodies(&parts);
+        assert!(
+            !bodies.iter().any(|body| body.contains("user system")),
+            "the user SYSTEM.md is gone: {bodies:?}"
+        );
+        // Everything else the user scope contributes stays: `system` is
+        // the system prompt, not the whole user scope.
+        assert!(
+            bodies.iter().any(|body| body.contains("user agents")),
+            "the user AGENTS.md is still layered: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("user-skill")),
+            "user skills are still layered: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("project agents")),
+            "{bodies:?}"
+        );
+
+        fs::remove_dir_all(project).ok();
+        fs::remove_dir_all(user).ok();
+    }
+
+    #[test]
+    fn skills_override_drops_the_whole_user_skills_directory() {
+        let (project, user, user_scope, project_scope) = layered_scopes("override-skills");
+        let parts = system_parts_in(
+            Some(&user_scope),
+            &project_scope,
+            Path::new("."),
+            &[config::Override::Skills],
+        );
+        let bodies = bodies(&parts);
+        assert!(
+            !bodies.iter().any(|body| body.contains("user-skill")),
+            "no user skill is listed: {bodies:?}"
+        );
+        assert!(
+            !bodies.iter().any(|body| body.starts_with("## Skills")),
+            "with no project skills either, there is no skills part at all: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("user system")),
+            "`skills` does not touch SYSTEM.md: {bodies:?}"
+        );
+
+        fs::remove_dir_all(project).ok();
+        fs::remove_dir_all(user).ok();
+    }
+
+    #[test]
+    fn both_overrides_leave_only_the_project_context() {
+        let (project, user, user_scope, project_scope) = layered_scopes("override-both");
+        fs::write(project_scope.join(config::SYSTEM_FILE), "project system").unwrap();
+        let skills = project_scope.join(config::SKILLS_DIR);
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(skills.join("project-skill.md"), "project skill").unwrap();
+
+        let parts = system_parts_in(
+            Some(&user_scope),
+            &project_scope,
+            Path::new("."),
+            &[config::Override::System, config::Override::Skills],
+        );
+        let labels: Vec<&str> = parts.iter().map(|(label, _)| label.as_str()).collect();
+        // The one user-scope part left is `AGENTS.md`, which neither
+        // override covers.
+        let user_dir = user_scope.display().to_string();
+        let from_user: Vec<&&str> = labels.iter().filter(|l| l.contains(&user_dir)).collect();
+        assert_eq!(from_user.len(), 1, "only AGENTS.md: {labels:?}");
+        assert!(from_user[0].ends_with("AGENTS.md"), "{labels:?}");
+        let bodies = bodies(&parts);
+        assert!(bodies.iter().any(|body| body.contains("project system")));
+        assert!(bodies.iter().any(|body| body.contains("project agents")));
+        assert!(bodies.iter().any(|body| body.contains("project-skill")));
+        assert!(
+            bodies.iter().any(|body| body.contains("user agents")),
+            "AGENTS.md is not covered by an override and stays layered: {bodies:?}"
         );
 
         fs::remove_dir_all(project).ok();

@@ -107,6 +107,8 @@ impl Cli {
             session: self.no_session.then_some(false),
             project: self.project.clone(),
             timeout_seconds: self.timeout_seconds,
+            // `override` is a settings-file declaration, not a CLI knob.
+            r#override: None,
         }
     }
 }

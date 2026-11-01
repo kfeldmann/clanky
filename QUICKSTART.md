@@ -72,6 +72,14 @@ There is no default system prompt. The system prompt is assembled from the follo
 
 Skills are "lazy-loaded". Only the name, description, and filepath are appended to the system prompt.
 
+If a project must not inherit your personal configuration at all, list what to drop in the project's `.clanky/settings.toml`:
+
+```toml
+override = ["system", "skills"]   # or "settings", or all three
+```
+
+`system` drops your `~/.clanky/SYSTEM.md`, `skills` your `~/.clanky/skills/`, and `settings` your `~/.clanky/settings.toml`; only the project's own files (and built-in defaults) then apply. See README.md for details.
+
 ### Editing
 
 You have rudimentary `readline` navigation keys available: ctl+a, ctl+e, and home/end, as well as the arrow keys. You can clear the entry using ctl+u. You can input a newline by pressing ctl+j. If the cursor is at the end of the input, ctl+e will launch the editor specified in your EDITOR environment variable (falling through to `vi` if nothing is set). The external editor is recommended for long or multi-line inputs. You can paste multi-line text into the input area, but beware that if you are running `screen`, there is a limitation in `screen` which will cause the pasted text to be split on newlines, sending only the first line of your prompt to the LLM - very annoying.

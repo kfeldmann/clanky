@@ -1188,3 +1188,76 @@ Later fixes (code review, post-M20):
   Typing part of an id still narrows the list, and `confirm()` still returns
   the index into the original model list, so the selection path is unchanged.
   Test: `model_picker_shows_the_name_and_filters_by_the_id`.
+
+## ✔ M21 — Project overrides: opt out of the user scope
+Layering is additive everywhere: the project scope extends the user scope. A
+project that must not inherit a machine's personal configuration — a shared
+repo whose system prompt, skills, or settings have to be exactly the
+project's — has no way to say so. Add one declarative escape hatch, in
+`settings.toml`:
+
+```toml
+override = ["system", "skills"]
+```
+
+- `settings` — the user `settings.toml` is not read (no per-field overlay,
+  no `[sampling]` merge, nothing); only the project file and its built-in
+  defaults apply.
+- `system` — the user `SYSTEM.md` is not read. `AGENTS.md` is *not* covered
+  (agent instructions, not the system prompt) and stays layered; so do
+  prompt templates (no override kind).
+- `skills` — the user `skills/` directory is not read; only project skills
+  exist.
+- An unknown value is a parse error naming the accepted ones.
+- Accepted in either file for consistency; in the user file it nullifies
+  the user scope for every project. Lists union across scopes.
+- When in play, say so once at startup (both front ends) and in `/system`:
+  the effect is absence, which reads as a bug otherwise.
+
+Design constraints:
+1. **One place turns an override into behavior.** `config::Override` plus
+   `config::scopes_for(overrides, resource)` — the user scope is dropped from
+   the list, and the existing readers (settings files, context parts, skills)
+   are unchanged. No per-reader override logic to drift.
+2. **Two-pass settings load.** The override lists are read from both files
+   first (a file that is itself dropped still gets a say in what is dropped),
+   then the values are layered with the user file left out when `settings` is
+   overridden. `Settings::load_scopes(user, project)` is the pure form.
+3. **The override is not a setting.** No CLI flag, not in the effective
+   settings dump or session `settings` records (those are values a turn runs
+   with; the override is a file-reading declaration), and it unions rather
+   than overlays. Serialization still round-trips through the file spelling.
+4. **Absent project copy means none.** With `override = ["system"]` and no
+   project `SYSTEM.md`, there is no system prompt part at all — that is the
+   point of the feature, not a fallback case.
+
+Done when: a project with `override = ["system", "skills"]` sends only its
+own context (the user scope's files are not read), an unknown value aborts
+with an actionable error, `override = ["settings"]` leaves the user
+settings file unread, and the README documents it.
+
+As built: `config::Override { Settings, System, Skills }` (parse/print, plus
+`user_resource()` for messages) and `config::scopes_for(overrides, resource)`
+are the whole mechanism; `config::scopes()` is unchanged for readers with no
+override kind (prompt templates, session/log directories).
+`Settings` gained a `r#override` field with a hand-written deserializer
+(unknown names → a parse error naming `settings`, `system`, `skills`) and
+serializer (the file spelling, never the variant names), and
+`Settings::load_scopes` does the two-pass load; `load_from_paths` stays the
+raw per-file overlay it always was. `SessionSettings` deliberately did **not**
+gain the field — the dump describes what a turn runs with, and an override
+is a declaration about which files were read — so no session record or
+golden changed. `context::system_parts_in` now takes explicit scope
+directories (`user: Option<&Path>`, `project: &Path`) instead of a scope
+list, which makes the per-part decision testable without touching `$HOME`:
+the user `SYSTEM.md` is skipped under `system`, the user `skills/` directory
+is not scanned under `skills`, and the user `AGENTS.md` is untouched by both.
+`skills::skills()` became `skills::skills(overrides)`. Both front ends print
+`config::override_note` (`INFO: override: not reading the user scope's
+SYSTEM.md, skills/ (project settings.toml)`) at startup and `/system`
+repeats it. Tests: unit coverage in `config`, `settings`, `skills` and
+`context` (each override kind, the union, the two-pass drop, the unknown-name
+error, serialization), a `Launch` test, and five end-to-end runs in
+`tests/plugin_pipe.rs` against a real user scope and project scope
+(`override` absent, `system`, `system`+`skills`, `settings`, and an unknown
+value).

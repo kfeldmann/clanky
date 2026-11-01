@@ -284,10 +284,16 @@ fn plugin_dir(plugin: &str, script: &str) -> PathBuf {
 /// merged settings (the leading `settings` record) are deterministic —
 /// no machine's own `~/.clanky/settings.toml` leaks into the assertions.
 fn run_clanky(dir: &Path, args: &[&str]) -> std::process::Output {
+    run_clanky_in(dir, dir, args)
+}
+
+/// Like [`run_clanky`], with the user scope's home chosen separately from
+/// the cwd — for tests that lay out both scopes and need them distinct.
+fn run_clanky_in(dir: &Path, home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_clanky"))
         .args(args)
         .current_dir(dir)
-        .env("HOME", dir)
+        .env("HOME", home)
         .env("PATH", path_with(dir))
         .env("CLANKY_PLUGIN_DEBUG", "1")
         .stdin(std::process::Stdio::null())
@@ -688,14 +694,18 @@ fn resume_in_pipe_mode_sends_the_full_prior_context() {
     // can be checked: a resumed turn must carry the prior conversation.
     let dir = plugin_dir("hello-world", TOOL_PLUGIN);
     write_session(&dir, "saved");
-    // Pin one system part in the test's own project scope, so the
-    // assertion below holds on machines whose user scope has no
-    // SYSTEM.md/AGENTS.md (the context is best-effort and would
-    // otherwise be empty here).
+    // Pin the whole configuration the run sees: `HOME` is a scratch dir
+    // of its own (`run_clanky` sets it) and one system part goes in the
+    // test's own project scope. Without that, this test would read the
+    // machine's real `~/.clanky`, whose SYSTEM.md, AGENTS.md and skills
+    // would change the request it inspects.
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(dir.join(".clanky")).unwrap();
     std::fs::write(dir.join(".clanky/SYSTEM.md"), "test system context.\n").unwrap();
-    let output = run_clanky(
+    let output = run_clanky_in(
         &dir,
+        &home,
         &[
             "--provider",
             "hello-world",
@@ -711,17 +721,24 @@ fn resume_in_pipe_mode_sends_the_full_prior_context() {
         String::from_utf8_lossy(&output.stderr)
     );
     let messages = first_request_messages(&output);
-    // The system context is rebuilt fresh, so it leads the request; how
-    // many parts it has depends on the machine's user-scope files, so
-    // only its placement is pinned — everything before the history must
-    // be system messages.
+    // The system context is rebuilt fresh, so it leads the request;
+    // everything before the history must be system messages, and the
+    // empty scratch `HOME` plus the project `SYSTEM.md` make it exactly
+    // one.
     let history_start = messages
         .iter()
         .position(|m| m["role"] != "system")
         .unwrap_or(messages.len());
-    assert!(
-        history_start >= 1,
+    assert_eq!(
+        history_start, 1,
         "the fresh system context is sent first: {messages:?}"
+    );
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("test system context."),
+        "{messages:?}"
     );
     let roles: Vec<&str> = messages[history_start..]
         .iter()
@@ -758,5 +775,166 @@ fn resume_with_a_missing_session_fails_the_same_way_in_both_modes() {
             "one shared message expected; stderr: {stderr}"
         );
     }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// The system messages of a run's first chat request, as their text.
+fn system_contents(output: &std::process::Output) -> Vec<String> {
+    first_request_messages(output)
+        .into_iter()
+        .filter(|m| m["role"] == "system")
+        .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Lay out a user scope and a project scope in `dir`, the way a machine
+/// with personal configuration plus a project looks:
+///
+/// - user scope (`$HOME/.clanky`, `HOME` is `dir`): `SYSTEM.md`,
+///   `AGENTS.md`, `skills/user-skill.md`, `settings.toml` with a `project`
+///   label;
+/// - project scope (`dir/.clanky`): `SYSTEM.md`, `AGENTS.md`,
+///   `skills/project-skill.md` and, when `override` is given, a
+///   `settings.toml` carrying that `override` list.
+fn lay_out_scopes(dir: &Path, override_list: Option<&str>) {
+    // `HOME` is pinned to `dir/home` and the cwd to `dir/project`, so the
+    // two scopes are different directories (`HOME/.clanky` and
+    // `./.clanky`).
+    let home = dir.join("home");
+    let project_dir = dir.join("project");
+    std::fs::create_dir_all(home.join(".clanky/skills")).unwrap();
+    std::fs::create_dir_all(project_dir.join(".clanky/skills")).unwrap();
+    std::fs::write(home.join(".clanky/SYSTEM.md"), "user system").unwrap();
+    std::fs::write(home.join(".clanky/AGENTS.md"), "user agents").unwrap();
+    std::fs::write(home.join(".clanky/skills/user-skill.md"), "user skill").unwrap();
+    std::fs::write(
+        home.join(".clanky/settings.toml"),
+        "project = \"user-label\"\n",
+    )
+    .unwrap();
+    std::fs::write(project_dir.join(".clanky/SYSTEM.md"), "project system").unwrap();
+    std::fs::write(project_dir.join(".clanky/AGENTS.md"), "project agents").unwrap();
+    std::fs::write(
+        project_dir.join(".clanky/skills/project-skill.md"),
+        "project skill",
+    )
+    .unwrap();
+    let settings = match override_list {
+        Some(list) => format!("override = [{list}]\n"),
+        None => String::new(),
+    };
+    std::fs::write(project_dir.join(".clanky/settings.toml"), settings).unwrap();
+}
+
+/// One print-mode run in `dir/project` with `HOME=dir/home`.
+fn run_in_scopes(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_clanky"))
+        .args(args)
+        .current_dir(dir.join("project"))
+        .env("HOME", dir.join("home"))
+        .env("PATH", path_with(dir))
+        .env("CLANKY_PLUGIN_DEBUG", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run clanky")
+}
+
+#[test]
+fn without_an_override_the_user_and_project_context_are_layered() {
+    let dir = plugin_dir("hello-world", TOOL_PLUGIN);
+    lay_out_scopes(&dir, None);
+    let output = run_in_scopes(&dir, &["--provider", "hello-world", "-p", "hi"]);
+    assert!(output.status.success(), "clanky failed: {output:?}");
+    let system = system_contents(&output);
+    let joined = system.join("\n");
+    for expected in [
+        "user system",
+        "user agents",
+        "project system",
+        "project agents",
+        "user-skill",
+        "project-skill",
+    ] {
+        assert!(joined.contains(expected), "missing {expected}: {joined}");
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn override_system_drops_only_the_user_system_md() {
+    let dir = plugin_dir("hello-world", TOOL_PLUGIN);
+    lay_out_scopes(&dir, Some("\"system\""));
+    let output = run_in_scopes(&dir, &["--provider", "hello-world", "-p", "hi"]);
+    assert!(output.status.success(), "clanky failed: {output:?}");
+    let joined = system_contents(&output).join("\n");
+    assert!(!joined.contains("user system"), "{joined}");
+    assert!(joined.contains("project system"), "{joined}");
+    assert!(
+        joined.contains("user agents"),
+        "AGENTS.md is not covered by the `system` override: {joined}"
+    );
+    assert!(joined.contains("user-skill"), "{joined}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn override_system_and_skills_drops_the_user_scope_from_context() {
+    let dir = plugin_dir("hello-world", TOOL_PLUGIN);
+    lay_out_scopes(&dir, Some("\"system\", \"skills\""));
+    let output = run_in_scopes(&dir, &["--provider", "hello-world", "-p", "hi"]);
+    assert!(output.status.success(), "clanky failed: {output:?}");
+    let joined = system_contents(&output).join("\n");
+    assert!(!joined.contains("user system"), "{joined}");
+    assert!(!joined.contains("user-skill"), "{joined}");
+    assert!(joined.contains("project system"), "{joined}");
+    assert!(joined.contains("project-skill"), "{joined}");
+    assert!(
+        joined.contains("user agents"),
+        "AGENTS.md is still layered: {joined}"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn override_settings_drops_the_user_settings_file() {
+    let dir = plugin_dir("hello-world", TOOL_PLUGIN);
+    lay_out_scopes(&dir, Some("\"settings\""));
+    let output = run_in_scopes(&dir, &["--provider", "hello-world", "-p", "hi"]);
+    assert!(output.status.success(), "clanky failed: {output:?}");
+    // The startup dump and the leading settings record both come from the
+    // merged settings: the user file's `project` label must be gone.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("INFO: settings:"), "{stderr}");
+    assert!(
+        !stderr.contains("user-label"),
+        "the user settings file is not read: {stderr}"
+    );
+    let records = session_records(&dir.join("project"));
+    let leading = &records[0];
+    assert_eq!(leading["type"], "settings");
+    assert!(
+        leading["settings"].get("project").is_none(),
+        "no project label from the user file: {leading}"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn an_unknown_override_aborts_the_run_with_an_actionable_error() {
+    let dir = plugin_dir("hello-world", PLUGIN);
+    lay_out_scopes(&dir, Some("\"prompts\""));
+    let output = run_in_scopes(&dir, &["--provider", "hello-world", "-p", "hi"]);
+    assert!(!output.status.success(), "an unknown override is an error");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown override `prompts`"), "{stderr}");
+    assert!(
+        stderr.contains("`settings`, `system`, `skills`"),
+        "the accepted values are listed: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no turn runs: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     std::fs::remove_dir_all(dir).ok();
 }

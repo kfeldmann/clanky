@@ -58,12 +58,48 @@ resource:
 A project-root `AGENTS.md` (the ecosystem convention) is honored in
 addition to `./.clanky/AGENTS.md`, and comes after both scopes.
 
+#### Taking over the user scope: `override`
+
+Layering is *additive* by default: the project extends what the user scope
+provides. Some projects want the opposite — none of your personal system
+prompt, skills or settings, only the project's. Say so with `override` in
+`settings.toml`:
+
+```toml
+override = ["system", "skills"]
+```
+
+| Value      | User scope resource it stops reading               |
+| ---------- | ------------------------------------------------- |
+| `settings` | `~/.clanky/settings.toml` — every setting comes from the project file (or its built-in default) |
+| `system`   | `~/.clanky/SYSTEM.md` — the system prompt is the project's alone |
+| `skills`   | `~/.clanky/skills/` — only project skills exist    |
+
+- The listed resource is **not read at all** from the user scope. An
+  absent project copy then means *none*, not "whatever the user had".
+- The override covers only the resource it names. `system` does not touch
+  `AGENTS.md` (that is agent instructions, not the system prompt), so the
+  user `AGENTS.md` is still layered; `skills` does not touch `SYSTEM.md`.
+  Prompt templates have no override and are always layered.
+- `override` is accepted in either file for consistency. In the user file
+  it is equivalent to dropping your own configuration for every project.
+- Lists from both scopes union: a project that overrides `skills` cannot
+  un-override a `system` its user file took over.
+- An unknown value is a parse error naming the accepted ones — never a
+  silently ignored entry.
+- When an override is in play, both front ends say so once at startup
+  (`INFO: override: not reading the user scope's SYSTEM.md, skills/ …` on
+  stderr, or the same line in the TUI transcript), and `/system` repeats
+  it — the effect of an override is *absence*, which is otherwise easy to
+  mistake for a bug.
+
 ### `settings.toml`
 
 All fields are optional; unknown keys are rejected with a parse error.
 
 | Field      | Type             | Meaning                                            |
 | ---------- | ---------------- | -------------------------------------------------- |
+| `override` | array of strings | User-scope resources to stop reading (`settings`, `system`, `skills`); see [above](#taking-over-the-user-scope-override) |
 | `provider` | string           | Provider name (e.g. `deepinfra`)                   |
 | `model`    | string           | Model identifier as known to the provider          |
 | `thinking` | string           | Thinking budget in tokens (`1024`) or `off`        |
@@ -90,6 +126,11 @@ repetition_penalty = 1.1
 
 Notes:
 
+- `override` is a declaration about *which files are read*, not a setting:
+  it has no CLI flag, is not part of the effective-settings dump or the
+  session's `settings` records, and lists from the two scopes union rather
+  than being overlaid. Its effect is visible where it happens — the
+  context (and `/system`) and the startup note.
 - `thinking = "off"` really turns thinking off: it is sent to the provider
   as an explicit zero budget, which each provider maps onto its backend's
   "disable reasoning" knob (DeepInfra and LiteLLM send

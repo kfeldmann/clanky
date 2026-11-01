@@ -146,6 +146,11 @@ pub struct Launch {
     /// (`/model` &c.) go to the fields above *and* to this struct, and
     /// the recorder observes the difference.
     pub effective: SessionSettings,
+    /// Resources the project took over from the user scope
+    /// (`override = [...]` in settings.toml). Not live-editable — it
+    /// comes from the files — but carried here so the system context is
+    /// assembled (and `/system` reports it) exactly as the settings say.
+    pub overrides: Vec<crate::config::Override>,
 }
 
 impl Launch {
@@ -177,6 +182,7 @@ impl Launch {
             project: settings.project.clone(),
             timeout_seconds: settings.timeout_seconds,
             session_name: None,
+            overrides: settings.overrides(),
         }
     }
 }
@@ -723,10 +729,11 @@ fn load_session(
     name: &str,
     app: &mut app::App,
     state: &mut SessionState,
+    overrides: &[crate::config::Override],
 ) -> Result<()> {
     let data = session::load(path)?;
     let conversation = app.restore(&data.records);
-    app.history = crate::context::system_messages();
+    app.history = crate::context::system_messages(overrides);
     app.history.extend(conversation);
     // Fold the session's settings records in order (M18) — the state as
     // of the end of that session — and reopen. The records never set
@@ -751,13 +758,18 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     let mut app = app::App::new(launch.project.clone());
     // Fresh session: seed the system context so the first turn sends it
     // (resumed sessions rebuild it inside `load_session`).
-    app.history = crate::context::system_messages();
+    app.history = crate::context::system_messages(&launch.overrides);
     // Startup INFO dump (M18): model, provider, and the merged settings
     // — as a transcript entry in the TUI (stderr is the terminal here).
     app.entries.push(app::Entry::Info(format!(
         "settings: {}",
         launch.effective.describe()
     )));
+    // An override's effect is absence, so it gets said out loud when it is
+    // in play (print mode prints the same line on stderr).
+    if let Some(note) = crate::config::override_note(&launch.overrides) {
+        app.entries.push(app::Entry::Info(note));
+    }
     let mut state = SessionState::new(launch.effective.clone()).recording(launch.recording);
     let mut transcript_errors = TranscriptErrors::default();
     if let Some(name) = launch.session_name.clone() {
@@ -794,7 +806,7 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
         }
         Some(name) => {
             let path = session::find_by_name(name)?;
-            load_session(&path, name, &mut app, &mut state)?;
+            load_session(&path, name, &mut app, &mut state, &launch.overrides)?;
         }
         None => {}
     }
@@ -1187,7 +1199,8 @@ fn apply_picker_selection(
     match kind {
         PickerKind::Resume(infos) => {
             if let Some(info) = infos.get(index)
-                && let Err(err) = load_session(&info.path, &info.name, app, state)
+                && let Err(err) =
+                    load_session(&info.path, &info.name, app, state, &launch.overrides)
             {
                 app.entries.push(app::Entry::Error(err.to_string()));
             }
@@ -1419,7 +1432,10 @@ fn handle_command(
             Action::None
         }
         Command::System => {
-            push_system_report(app, &crate::context::system_parts());
+            push_system_report(app, &crate::context::system_parts(&launch.overrides));
+            if let Some(note) = crate::config::override_note(&launch.overrides) {
+                app.entries.push(app::Entry::Info(note));
+            }
             Action::None
         }
         Command::Export { options, path } => {
@@ -2825,6 +2841,25 @@ mod tests {
             panic!("expected a SystemPart, got {:?}", app.entries[2]);
         };
         assert_eq!(content, "be helpful");
+    }
+
+    #[test]
+    fn launch_carries_the_overrides_from_settings() {
+        // The system context and `/system` read the list from the launch,
+        // so it has to survive `from_settings`.
+        let settings: Settings = toml::from_str("override = [\"system\", \"skills\"]\n").unwrap();
+        let cfg = Launch::from_settings("deepinfra", &settings);
+        assert_eq!(
+            cfg.overrides,
+            vec![
+                crate::config::Override::System,
+                crate::config::Override::Skills
+            ]
+        );
+        assert!(
+            launch().overrides.is_empty(),
+            "a plain settings file overrides nothing"
+        );
     }
 
     #[test]
