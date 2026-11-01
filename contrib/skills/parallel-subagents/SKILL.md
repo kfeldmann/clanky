@@ -49,11 +49,11 @@ JSON
 Optional per-job overrides (and in `defaults`), passed to the subagent's clanky
 command line verbatim: `provider`, `model`, `thinking`, `sampling` (string,
 `--sampling` format like `"temperature=0.7,top_p=0.9"`), `max_tool_rounds`,
-`max_retries`.
+`max_retries`. You don't need to set any of these unless you have a specific reason.
+Most of the time, the settings in the environment are appropriate.
 
-Jobs run in your cwd, so subagents see the same files and settings you do;
-sessions are never shared — the instruction is the subagent's entire prompt,
-so write it self-contained.
+Jobs run in your cwd, so subagents see the same files and settings you do (you're running in a clanky session right now);
+sessions are never shared — the instruction is the subagent's entire prompt, so write it self-contained.
 
 ## Reading the result
 
