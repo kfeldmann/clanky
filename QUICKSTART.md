@@ -72,7 +72,7 @@ There is no default system prompt. The system prompt is assembled from the follo
 
 Skills are "lazy-loaded". Only the name, description, and filepath are appended to the system prompt.
 
-If a project must not inherit your personal configuration at all, list what to drop in the project's `.clanky/settings.toml`:
+If a project must not inherit some or all of the user-level configuration, list what to drop in the project's `.clanky/settings.toml`:
 
 ```toml
 override = ["system", "skills"]   # or "settings", or all three
