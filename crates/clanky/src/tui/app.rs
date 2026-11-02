@@ -350,8 +350,14 @@ impl App {
         // The turn is over; stale estimates for content that arrived
         // without a usage report would otherwise linger.
         self.estimate_reset();
-        if let Err(err) = result {
-            self.entries.push(Entry::Error(err.to_string()));
+        match result {
+            Err(err) => self.entries.push(Entry::Error(err.to_string())),
+            // A cancelled turn otherwise ends silently and reads as a
+            // truncation: say it happened (M22 item 8).
+            Ok(output) if output.finish_reason == clanky_protocol::FinishReason::Cancelled => {
+                self.entries.push(Entry::Info("⏹ turn cancelled".into()))
+            }
+            Ok(_) => {}
         }
     }
 
@@ -1624,6 +1630,15 @@ mod tests {
             images: Vec::new(),
         });
         let lines = app.entry_lines(3, 80);
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+
+        // So is a call the user stopped (M22): the marker is the final line.
+        app.entries.push(Entry::ToolResult {
+            name: "bash".into(),
+            output: "partial\n[cancelled by user]".into(),
+            images: Vec::new(),
+        });
+        let lines = app.entry_lines(4, 80);
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
     }
 

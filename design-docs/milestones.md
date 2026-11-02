@@ -1261,3 +1261,181 @@ error, serialization), a `Launch` test, and five end-to-end runs in
 `tests/plugin_pipe.rs` against a real user scope and project scope
 (`override` absent, `system`, `system`+`skills`, `settings`, and an unknown
 value).
+
+## ✔ M22 — Esc stops the turn (cancel/stop)
+Today the only way out of a running turn is ctrl+c, which quits the whole
+session: a wrong direction, a runaway `bash`, or a model that will not stop
+thinking costs you the terminal. Make the turn itself interruptible, in the
+TUI only, without throwing away what it already produced.
+
+`Esc`, pressed while a turn is running, stops the current activity — the
+streaming response/thinking, a running tool, or the pause between retries —
+and ends the turn. The partial output survives: streamed text and thinking
+stay in the transcript and in the session file, a stopped `bash` reports
+what it printed before it was killed, and the conversation stays continuable
+(a follow-up turn sends everything the user saw).
+
+Most of the wire machinery already exists and is untouched: protocol `cancel`
+(spec §7), `CancelFlag` in every plugin, `CancelHandle`'s 2-second kill
+fallback, and `FinishReason::Cancelled` — which the turn loop already handles
+as a normal end (partial round flushed, text kept, `stopReason: "cancelled"`
+recorded, `/md` renders it). What is missing is a way to *reach* it from a key
+press, and cancellation of the parts the plugin cannot cancel for us.
+
+1. **An interrupt token, TUI → turn loop.** `turn::Interrupt` (an atomic
+   "stop requested" flag plus the id and `CancelHandle` of the in-flight
+   chat), carried in `TurnConfig` as an `Option` field beside the existing
+   doc-hidden `retry_sleep` hook (a turn run without one — every test, print
+   mode — is simply not interruptible; the five full `TurnConfig` literals
+   gain the field). `spawn_turn` attaches the session's `CancelHandle` once
+   the plugin exists; the TUI keeps a clone.
+2. **Publish the in-flight request id.** `ProviderClient::chat` allocates its
+   id internally, so nothing outside can name the chat to cancel. Add an
+   additive `chat_with(request, on_start, on_event)`; `chat` delegates with a
+   no-op hook. The turn loop publishes `(id, handle)` into the token before
+   streaming and clears it when the round's terminal message arrives.
+3. **Esc → stop.** `handle_key` gains `(false, KeyCode::Esc)`, live only while
+   `app.busy` (a modal or picker consumes Esc before this point). It sets the
+   flag and, when a chat is in flight, sends `cancel(id)` immediately — no
+   watcher thread; `CancelHandle` is built to be called from another thread.
+   Esc while idle keeps doing nothing.
+4. **Checks in the turn loop**, so an ignored or unavailable cancel still
+   ends the turn promptly: before starting a round, before each retry sleep
+   (never sleep out a backoff for a turn the user stopped), after each round,
+   and after each tool call. A stop observed between rounds or during a tool
+   ends the turn the same way a provider-reported `cancelled` does.
+5. **Cancelled tool calls report partial output.** `Tool` gains a defaulted
+   `execute_interruptible(&self, args, &Interrupt)` that delegates to
+   `execute`, so `edit`/`view-image` (plain buffered IO) need no code.
+   `BashTool` overrides it: its wait loop already polls every 100 ms, so a
+   flag check joins the deadline check and reuses the same TERM/KILL of the
+   command's process group. The kill closes the pipes, so the existing reader
+   joins hand back everything printed before the kill — partial output costs
+   no new plumbing. The result is the usual formatted output plus a final
+   `[cancelled by user]` line (the shape `[exit status: N]` already has), and
+   `is_failed_result` learns the marker so the transcript paints it red. It
+   is returned as a *result*, not an error: the model sees the partial output
+   and the reason, and can react.
+6. **No dangling tool calls.** A round can assemble tool calls and be
+   cancelled before any of them ran. That must never leave an assistant
+   message with `tool_calls` and no results: `history_from_records` papers
+   over it with a synthetic `ERROR: turn was interrupted` today, but the
+   provider would reject or mis-associate the request. A round cut short by a
+   cancel is flushed the way an errored round is (`calls: Vec::new()`), and
+   calls already dispatched but not completed each get one synthetic
+   cancelled tool result, so the message list stays valid.
+7. **Queued prompts are cleared, exactly like cancelled tool calls.** A
+   prompt typed while the turn ran (and shown as the `○ queued:` placeholder)
+   was accepted only because that turn was going to end on its own. Once the
+   user stops the turn, sending it is the opposite of what they asked for, so
+   a cancel empties `app.pending` and each dropped prompt gets one `Info` line
+   naming its preview (`cancelled queued prompt: …`) — a user-provided value
+   is never dropped silently. The placeholder stays printed (terminal history
+   cannot be rewritten), exactly as it does when the prompt does run.
+8. **Say it happened.** `on_turn_done` seeing `finish_reason: Cancelled` adds
+   a `⏹ turn cancelled` info entry; a cancelled turn otherwise ends silently
+   and looks like a truncation. README: the Esc row in the TUI key table, a
+   note beside the queued-message behavior, and the `bash` section's
+   cancellation paragraph.
+9. **Print/pipe mode is out of scope.** `-p` is a one-turn mode, so "end the
+   turn" is already "end the session": its ctrl+c path (SIGINT → kill the
+   plugin → flush the partial round) stays exactly as it is. `main::run` and
+   the plugin plugins are untouched.
+
+Design constraints:
+1. **Cancellation is cooperative first, forceful second.** Ask the plugin
+   (`cancel`), let the tool kill its own child, and fall back to the existing
+   2-second process kill. A `ProcessDied` arriving while a stop is pending is
+   the *expected* outcome of an ignored cancel, not an error to show — the
+   turn ends cancelled.
+2. **Nothing half-formed enters the conversation.** Whatever a cancel cuts
+   short, `messages` must remain a valid chat: partial text is kept as an
+   assistant message, every tool call has a result, and nothing is
+   retried/replayed after a stop.
+3. **Partial output is the point.** A stopped `bash` returns what it printed;
+   streamed text stays on screen and in the session file. The only thing a
+   stop discards is the queued prompts (item 7), and each is named.
+4. **No new protocol surface.** Spec §7 already specifies all of this; no
+   message, field, or capability is added, so no plugin changes and no
+   protocol version bump.
+
+Done when: in the TUI, Esc during streaming ends the turn at the next chunk
+with the partial answer intact and `stopReason: "cancelled"` in the session;
+Esc during `sleep 60` returns in about a second with the command's output so
+far plus `[cancelled by user]`, and the process group is gone; Esc during a
+retry backoff ends the turn instead of sleeping it out; queued prompts are
+dropped with one visible note each and no turn starts; `/resume` restores the
+cancelled turn exactly as the terminal showed it; and `-p` behavior is
+unchanged.
+
+Test surfaces: `turn.rs` unit tests with a mock handler that streams and
+then reports `cancelled` (partial text kept, no further round, no dangling
+`tool_calls`), and with a stop raised mid-round (one synthetic cancelled
+result per dispatched call); `tools.rs` tests that flag a running `sleep 30`
+from another thread and assert the call returns well under the join grace
+with its partial output, the marker, and the group gone (the existing
+`timeout_kills_grandchildren_holding_the_pipes` pattern); a fake `Transport`
+pinning the id published by `chat_with`; `tui` tests for Esc-while-busy,
+Esc-while-idle, and the queued-prompt drain with its notes; a golden
+transcript for a cancelled round.
+
+Open questions to settle while building:
+- Should Esc also stop the model-catalog fetch or the editor round-trip?
+  (Neither is a turn; the recommendation is no — they are bounded work.)
+  **Answer: No.**
+- Does a cancel mid-tool still let the remaining calls of that round run?
+  (Recommendation: no — cancel them with the same synthetic result, since the
+  user asked for the activity to stop, not for the round to finish.)
+  **Answer: Cancel them all.**
+
+As built:
+- `turn::Interrupt` carries the stop flag, the plugin's `CancelHandle`
+  (attached by the worker once the lazily-spawned plugin exists, so `Esc`
+  can name the chat to cancel without the turn owning a watcher thread), and
+  the in-flight request id. `TurnConfig::interrupt: Option<Interrupt>` sits
+  beside `retry_sleep`; `None` (print mode, every test) is uninterruptible.
+  `publish` re-checks the flag, so a stop that lands between the loop's last
+  check and the publish still cancels the chat immediately.
+- `ProviderClient::chat_with(request, on_start, on_event)`; `chat`
+  delegates with a no-op hook. The id hook fires before anything is sent.
+- Checks live before each round (also covering a stop while the plugin
+  starts), in the retry wait (`Interrupt::sleep_or_stop`, polled every
+  25 ms — a server `Retry-After` can be minutes), after each round, and
+  after each tool call. A stop ends the turn through the same path a
+  provider-reported `cancelled` does; a `ProcessDied` seen while a stop is
+  pending is that expected outcome, not an error.
+- A stopped round is flushed like an errored one (`calls: Vec::new()`), so
+  no assistant message ever carries `tool_calls` without results; calls of
+  the round that never ran each get `tools::cancelled_result()` (an `ERROR:`
+  text ending in the marker) as a real `ToolResult` event + `tool` message.
+- `Tool::execute_interruptible` defaults to `execute`; `BashTool` overrides
+  it. Its wait loop checks the flag alongside the deadline and reuses the
+  same TERM/KILL of the process group; the kill closes the pipes, so the
+  existing reader joins hand back what printed. The result is the normal
+  formatting plus a final `[cancelled by user]` line (`tools::CANCELLED_MARKER`,
+  also added as a final line of the synthetic results), and `is_failed_result`
+  matches it as an exact last line — output that merely mentions it is not a
+  failure. The exit status is deliberately not reported on that path.
+- TUI: `Action::Stop` from `(false, KeyCode::Esc)` guarded on `app.busy`
+  (a modal or picker consumes Esc earlier); `handle_key` calls
+  `interrupt.request_stop()`, and the event loop drains `app.pending` into
+  one `cancelled queued prompt: <preview>` `Info` line each. `on_turn_done`
+  pushes `⏹ turn cancelled` for `finish_reason: Cancelled`. The token is
+  recreated per turn, so a stale flag cannot leak into the next one.
+- No protocol change: §7 already specified all of it.
+- Tests: turn.rs (provider-reported cancel keeps partial text with no
+  further round; a stop mid-round gives each dispatched call a result and the
+  undispatched ones a synthetic cancelled result; a stop before the first
+  round sends nothing; a stop during backoff returns immediately with the
+  backoff hook never called; a dying plugin after a stop ends cancelled; a
+  round that ignored the stop drops its calls), tools.rs (a stopped
+  `sleep 30` returns quickly with its partial output + marker; the process
+  group goes with it; no marker on a normally-completed command; the marker's
+  exact-last-line detection), client.rs (the id `chat_with` publishes),
+  tui/mod.rs (Esc busy, Esc idle, the queued drain, the `⏹` note), a
+  `cancelled-round` golden pinning the partial assistant record, the
+  `stopReason: "cancelled"` record and the follow-up history, and two
+  `plugin_e2e` runs against real Python subprocesses: one that honors
+  `cancel` (stops at the next chunk, partial text kept) and one that ignores
+  it (the 2-second kill fallback ends the turn cancelled instead of
+  surfacing an error).

@@ -196,6 +196,14 @@ runs until it exits on its own (terminal ctrl+c propagates through
 Clanky's own turn cancellation as before). Output sent to the model is
 capped at 20 000 characters (then `… (output truncated)`).
 
+In the TUI, `Esc` stops a running command the same way a deadline does —
+the whole process group is killed — and the call returns what the command
+printed before it was killed, with `[cancelled by user]` as the final line
+instead of an exit status. That is a *result*, not an error: the model sees
+the partial output and the reason, and can react to it. The calls of that
+round that had not started yet never run; each still gets a result saying
+so, so the conversation stays valid.
+
 ### The `edit` tool
 
 The `edit` tool replaces a literal substring in a file. The model passes
@@ -306,12 +314,16 @@ replaced with a generated one, and no session file is created.
 already has its name (`/name` can still rename it mid-session).
 
 Sessions autosave as the conversation happens. When a turn is cut short —
-a provider error mid-stream, or `ctrl+c` quitting while the answer is
-still streaming — the partially streamed round (thinking and text) is
-consolidated and written anyway, so no streamed content is lost:
+a provider error mid-stream, `Esc` stopping the turn in the TUI, or
+`ctrl+c` quitting while the answer is still streaming — the partially
+streamed round (thinking and text) is consolidated and written anyway, so
+no streamed content is lost:
 `/resume` restores exactly what the terminal showed, and continuing the
 conversation (e.g. "please continue") sends the full chat as context.
-Partial tool calls and tool results that never completed are not kept.
+Partial tool calls (arguments that were still streaming) and tool results
+that never completed are not kept; a tool call that a stop cut short keeps
+its `[cancelled by user]` result, and calls that never ran get a result
+saying so, so the message list stays a valid chat.
 
 The transcript is printed straight to the terminal — no alternate
 screen, no mouse capture — so scrolling and copy/paste are your
@@ -526,6 +538,7 @@ clanky --provider hello-world -p "say hi"
 | Key | Action |
 | --- | --- |
 | `Enter` | submit (queued while a turn is streaming) |
+| `Esc` | stop the running turn: the streamed answer so far is kept, a running tool is killed (and reports what it printed), a retry backoff is cut short, and the queued prompts are dropped — each with a `cancelled queued prompt:` note. Does nothing while idle |
 | `↑`/`↓` | move within the lines of a multi-line buffer; from the top row `↑` recalls previously submitted prompts (the first `↑` saves the current input as a draft; `↓` past the newest entry restores it) and from the bottom row `↓` steps forward through history |
 | `Tab` | complete the file path at the caret: longest common prefix first, further `Tab` presses cycle candidates |
 | `ctrl+a` / `ctrl+e` | move to the start / end of the current input line (`ctrl+e` at the end of the buffer opens `$EDITOR`) |
@@ -576,6 +589,11 @@ post-quit history all work. Two details of that model are visible:
   the ones shown. Bracketed paste is on: a paste is inserted whole at
   the caret (its newlines become input lines) and never submits — only
   a pressed `Enter` submits.
+- A prompt submitted while a turn is streaming is queued: it shows as a
+  `○ queued:` placeholder and is sent when that turn ends. Stopping the turn
+  with `Esc` drops the queue instead — the placeholder lines stay printed
+  (terminal history cannot be rewritten), and each dropped prompt gets one
+  `cancelled queued prompt: …` note naming it.
 - The status line de-contents gracefully as the terminal narrows:
   elements are dropped one at a time — provider, thinking budget,
   model, cost, session name, the word "queued" (leaving just the dot) —

@@ -7,17 +7,152 @@
 //! deltas and tool activity are surfaced to the caller as [`TurnEvent`]s;
 //! in `-p` mode they are printed, in M3 the TUI will render them.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use clanky_protocol::{
-    ChatMessage, ChatRequest, ChunkPayload, Error as ProtocolError, FinishReason, Handler,
-    LoopbackTransport, ProviderClient, Sampling, StreamAssembler, Thinking, ToolCall, Transport,
-    Usage,
+    CancelHandle, ChatMessage, ChatRequest, ChunkPayload, Error as ProtocolError, FinishReason,
+    Handler, LoopbackTransport, ProviderClient, Sampling, StreamAssembler, Thinking, ToolCall,
+    Transport, Usage,
 };
 
 use crate::error::{Error, Result};
 use crate::settings::SamplingParams;
 use crate::tools::ToolSet;
+
+/// A stop request from outside the turn loop (M22): the TUI's `Esc`.
+///
+/// A turn runs on a worker thread while the UI keeps reading keys, so the
+/// only way to stop it is through shared state. The token carries three
+/// things:
+///
+/// * an atomic "stop requested" flag, which the loop polls at every point
+///   where it could otherwise keep working (before a round, between retry
+///   attempts, after a round, after each tool call) — so a plugin that
+///   ignores the cancel still cannot keep the turn alive;
+/// * the [`CancelHandle`] of the plugin running the turn, attached by the
+///   worker once the plugin process exists;
+/// * the id of the chat currently in flight, published by the loop before
+///   it starts streaming (the client allocates the id internally, so it
+///   cannot be known earlier) and cleared when the round's terminal message
+///   arrives.
+///
+/// Whoever presses `Esc` sends the protocol `cancel` through the handle
+/// itself: [`CancelHandle`] is built to be called from another thread, so no
+/// watcher thread is needed on the turn's side.
+///
+/// A turn run without a token (every test, print mode) is simply not
+/// interruptible.
+#[derive(Default, Clone)]
+pub struct Interrupt {
+    stop: Arc<AtomicBool>,
+    /// The plugin running this turn, attached once it exists.
+    handle: Arc<Mutex<Option<CancelHandle>>>,
+    /// The in-flight chat's request id; `None` between rounds.
+    in_flight: Arc<Mutex<Option<u64>>>,
+}
+
+impl std::fmt::Debug for Interrupt {
+    // `CancelHandle` has no `Debug` (it wraps a plugin process); the state
+    // that matters when reading a log is what a stop would find right now.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Interrupt")
+            .field("stop_requested", &self.stop_requested())
+            .field(
+                "in_flight",
+                &*self.in_flight.lock().unwrap_or_else(|e| e.into_inner()),
+            )
+            .finish()
+    }
+}
+
+impl Interrupt {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach the handle of the plugin this turn runs on, so a stop can name
+    /// the in-flight chat to it. Called by the worker once the plugin exists
+    /// (it is spawned lazily, so there is nothing to attach at first).
+    pub fn attach(&self, handle: CancelHandle) {
+        let mut guard = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(handle);
+    }
+
+    /// Ask the turn to stop: set the flag the loop polls and, when a chat is
+    /// in flight, cancel it right away. Idempotent — pressing `Esc` twice (or
+    /// once after the turn already ended) is harmless.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.cancel_in_flight();
+    }
+
+    /// Has a stop been requested? Polled by the turn loop.
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// The turn loop publishes the chat it is about to stream. A stop that
+    /// landed between the loop's last check and this publish cancels the chat
+    /// right away — otherwise the round would stream to completion before the
+    /// loop next looks at the flag.
+    fn publish(&self, id: u64) {
+        {
+            let mut guard = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(id);
+        }
+        if self.stop_requested() {
+            self.cancel_in_flight();
+        }
+    }
+
+    /// The round's terminal message arrived: nothing is left to cancel.
+    fn clear_in_flight(&self) {
+        let mut guard = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+
+    /// Send the protocol `cancel` for the in-flight chat, if there is one.
+    /// Advisory (spec §7): the plugin answers `cancelled`, or the client's
+    /// 2-second kill fallback ends the round. A failure to send is not an
+    /// error the user needs to see — the stop flag ends the turn regardless.
+    fn cancel_in_flight(&self) {
+        let id = *self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(id) = id else {
+            return;
+        };
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(handle) = handle {
+            let _ = handle.cancel(id);
+        }
+    }
+
+    /// Wait up to `delay` for a stop, returning early when one arrives: a
+    /// backoff must never be slept out for a turn the user stopped.
+    /// Returns whether a stop was seen.
+    fn sleep_or_stop(&self, delay: Duration) -> bool {
+        // Polled in short steps so a key press is noticed immediately while a
+        // long backoff (a server `Retry-After` can be minutes) is being
+        // waited out.
+        let step = Duration::from_millis(25);
+        let started = Instant::now();
+        loop {
+            if self.stop_requested() {
+                return true;
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= delay {
+                return false;
+            }
+            std::thread::sleep(step.min(delay - elapsed));
+        }
+    }
+}
 
 /// Fallback tool-loop round cap when neither the settings nor the
 /// `--max-tool-rounds` flag specify one. `0` disables the cap entirely,
@@ -59,6 +194,10 @@ pub struct TurnConfig {
     /// Exists so tests exercise backoff without actually waiting.
     #[doc(hidden)]
     pub retry_sleep: Option<fn(Duration)>,
+    /// The stop token (M22) carried in beside the retry hook. `None` — the
+    /// default, and what print mode and every test run with — makes the turn
+    /// uninterruptible; the TUI passes the token it also keeps a clone of.
+    pub interrupt: Option<Interrupt>,
 }
 
 impl TurnConfig {
@@ -79,6 +218,7 @@ impl TurnConfig {
             max_tool_rounds: settings.max_tool_rounds,
             max_retries: settings.max_retries,
             retry_sleep: None,
+            interrupt: None,
         }
     }
 }
@@ -189,11 +329,22 @@ pub fn run_turn_with<T: Transport>(
     let mut usage_total = Usage::default();
     let mut usage_seen = false;
 
+    // The stop token (M22), when the caller supplied one. A turn without one
+    // (print mode, every test) behaves exactly as before: `None` here means
+    // nothing can interrupt it.
+    let interrupt = config.interrupt.as_ref();
+
     let max_rounds = config.max_tool_rounds.unwrap_or(DEFAULT_MAX_TOOL_ROUNDS);
     let mut round: usize = 0;
     loop {
         if max_rounds > 0 && round >= max_rounds {
             return Err(Error::ToolLoopLimit(max_rounds));
+        }
+        // A stop that arrived between rounds — or before the first one, while
+        // the plugin was still starting — ends the turn here, before another
+        // request is sent.
+        if interrupt.is_some_and(Interrupt::stop_requested) {
+            return Ok(cancelled(text, usage_seen.then_some(usage_total)));
         }
         round += 1;
         let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
@@ -234,11 +385,39 @@ pub fn run_turn_with<T: Transport>(
                         streamed = true;
                         assembler.ingest(payload);
                     };
-                    client.chat(request.clone(), &mut on_chunk)
+                    // Publish the request id before anything is sent: the
+                    // client allocates it internally, and a cancel from
+                    // another thread (Esc) names it. Publishing also covers
+                    // the race where the stop landed just before streaming
+                    // started — the cancel goes out immediately, and the
+                    // plugin stops before it gets far.
+                    let mut on_start = |id: u64| {
+                        if let Some(interrupt) = interrupt {
+                            interrupt.publish(id);
+                        }
+                    };
+                    client.chat_with(request.clone(), &mut on_start, &mut on_chunk)
                 };
                 match outcome {
-                    Ok(done) => break (assembler, done),
+                    Ok(done) => {
+                        if let Some(interrupt) = interrupt {
+                            interrupt.clear_in_flight();
+                        }
+                        break (assembler, done);
+                    }
                     Err(err) => {
+                        if let Some(interrupt) = interrupt {
+                            interrupt.clear_in_flight();
+                        }
+                        // A stop was pending, so a dying plugin is the
+                        // expected outcome of an ignored cancel, not a
+                        // failure to show: keep what streamed and end the
+                        // turn cancelled (M22 design constraint 1).
+                        if interrupt.is_some_and(Interrupt::stop_requested) {
+                            text.push_str(assembler.text());
+                            flush_partial_round(&assembler, messages, on_event);
+                            return Ok(cancelled(text, usage_seen.then_some(usage_total)));
+                        }
                         if !is_retryable(&err) || streamed || attempt >= max_retries {
                             flush_partial_round(&assembler, messages, on_event);
                             return Err(err.into());
@@ -251,7 +430,19 @@ pub fn run_turn_with<T: Transport>(
                             delay,
                             message: err.to_string(),
                         });
-                        (config.retry_sleep.unwrap_or(std::thread::sleep))(delay);
+                        // Never sleep out a backoff for a turn the user
+                        // stopped: the wait is polled and a stop ends the
+                        // turn here (nothing streamed, so nothing to flush).
+                        let stopped = match interrupt {
+                            Some(interrupt) => interrupt.sleep_or_stop(delay),
+                            None => {
+                                (config.retry_sleep.unwrap_or(std::thread::sleep))(delay);
+                                false
+                            }
+                        };
+                        if stopped {
+                            return Ok(cancelled(text, usage_seen.then_some(usage_total)));
+                        }
                     }
                 }
             }
@@ -260,7 +451,19 @@ pub fn run_turn_with<T: Transport>(
         let round_text = assembler.text().to_string();
         let round_thinking = assembler.thinking().to_string();
         text.push_str(&round_text);
-        let calls = assembler.tool_calls();
+        // A round the user stopped — reported by the provider as `cancelled`,
+        // or observed through the stop flag when the provider finished
+        // anyway — is flushed exactly like an errored round: the partial text
+        // and thinking are kept, and its tool calls are dropped, because
+        // nothing will run them and an assistant message with `tool_calls`
+        // and no results is not a valid chat (M22 item 6).
+        let round_cancelled = done.finish_reason == FinishReason::Cancelled
+            || interrupt.is_some_and(Interrupt::stop_requested);
+        let calls = if round_cancelled {
+            Vec::new()
+        } else {
+            assembler.tool_calls()
+        };
         on_event(TurnEvent::Round {
             text: round_text.clone(),
             thinking: round_thinking,
@@ -284,7 +487,16 @@ pub fn run_turn_with<T: Transport>(
                 Some(usage_total.cached_tokens.unwrap_or(0) + usage.cached_tokens.unwrap_or(0));
         }
 
-        let calls = assembler.tool_calls();
+        if round_cancelled {
+            if !round_text.is_empty() {
+                messages.push(ChatMessage::Assistant {
+                    content: round_text,
+                    tool_calls: None,
+                });
+            }
+            return Ok(cancelled(text, usage_seen.then_some(usage_total)));
+        }
+
         if done.finish_reason != FinishReason::ToolCalls || calls.is_empty() {
             // Provider-reported continuation (Anthropic `pause_turn`): the
             // round was interrupted server-side before it finished, and the
@@ -320,15 +532,46 @@ pub fn run_turn_with<T: Transport>(
             content: assembler.text().to_string(),
             tool_calls: Some(calls.clone()),
         });
+        let mut stop_after_tool = false;
         for call in &calls {
-            let output = execute_tool_call(tools, call, on_event);
+            if stop_after_tool {
+                // The user stopped the turn before this call ran: it never
+                // executes, but its result still has to exist so the
+                // conversation stays a valid chat (M22 item 6).
+                let output = crate::tools::cancelled_result();
+                on_event(TurnEvent::ToolResult {
+                    name: call.name.clone(),
+                    output: output.text.clone(),
+                    images: Vec::new(),
+                });
+                messages.push(ChatMessage::tool(call.id.clone(), output.text));
+                continue;
+            }
+            let output = execute_tool_call(tools, call, interrupt, on_event);
             let message = if output.images.is_empty() {
                 ChatMessage::tool(call.id.clone(), output.text)
             } else {
                 ChatMessage::tool_with_images(call.id.clone(), output.text, output.images)
             };
             messages.push(message);
+            // A stop observed after a tool call ends the turn — the user
+            // asked for the activity to stop, not for the round to finish —
+            // and the calls still to come get the synthetic result above.
+            stop_after_tool = interrupt.is_some_and(Interrupt::stop_requested);
         }
+        if stop_after_tool {
+            return Ok(cancelled(text, usage_seen.then_some(usage_total)));
+        }
+    }
+}
+
+/// A turn that ended because the user stopped it: everything it produced is
+/// kept, and the finish reason says why it ended.
+fn cancelled(text: String, usage: Option<Usage>) -> TurnOutput {
+    TurnOutput {
+        text,
+        finish_reason: FinishReason::Cancelled,
+        usage,
     }
 }
 
@@ -418,6 +661,7 @@ fn retry_delay(attempt: u32, hint: Option<Duration>) -> Duration {
 fn execute_tool_call(
     tools: &ToolSet,
     call: &ToolCall,
+    interrupt: Option<&Interrupt>,
     on_event: &mut dyn FnMut(TurnEvent),
 ) -> crate::tools::ToolOutput {
     on_event(TurnEvent::ToolCall {
@@ -439,7 +683,7 @@ fn execute_tool_call(
                 message: format!("arguments must be a JSON object, got: {}", call.arguments),
             })
         }
-        Some(tool) => tool.execute(&call.arguments),
+        Some(tool) => tool.execute_interruptible(&call.arguments, interrupt),
     };
     let output = match outcome {
         Ok(output) => output,
@@ -765,6 +1009,7 @@ mod tests {
             max_tool_rounds: None,
             max_retries: Some(0),
             retry_sleep: Some(|_| {}),
+            interrupt: None,
         }
     }
 
@@ -1612,6 +1857,483 @@ mod tests {
             !events
                 .iter()
                 .any(|e| matches!(e, TurnEvent::Retrying { .. }))
+        );
+    }
+
+    // --- cancellation (M22) -------------------------------------------------
+
+    /// Streams one text delta, then reports `cancelled` — what a cooperative
+    /// plugin does after `cancel` (spec §7).
+    struct CancellingProvider;
+
+    impl Handler for CancellingProvider {
+        fn info(&self) -> PluginInfo {
+            PluginInfo {
+                name: "cancelling".into(),
+                capabilities: Capabilities {
+                    list_models: false,
+                    thinking: false,
+                    tools: true,
+                },
+                default_model: None,
+            }
+        }
+        fn list_models(&mut self) -> std::result::Result<Vec<ModelInfo>, clanky_protocol::Error> {
+            Ok(vec![])
+        }
+        fn chat(
+            &mut self,
+            _request: &ChatRequest,
+            sink: &mut dyn FnMut(ChunkPayload),
+        ) -> std::result::Result<ChatDone, clanky_protocol::Error> {
+            sink(ChunkPayload::Text {
+                text: "half an ans".into(),
+            });
+            Ok(ChatDone {
+                finish_reason: FinishReason::Cancelled,
+                usage: None,
+            })
+        }
+    }
+
+    #[test]
+    fn a_provider_reported_cancel_keeps_the_partial_text_and_ends_the_turn() {
+        // The provider streamed part of an answer and then said `cancelled`.
+        // The partial text is kept in the transcript, the session record and
+        // the conversation; no further round is attempted; and the turn
+        // reports `cancelled` as its finish reason.
+        let mut messages = vec![ChatMessage::system("Be terse."), ChatMessage::user("hi")];
+        let events = RefCell::new(Vec::new());
+        let output = run_turn(
+            Box::new(CancellingProvider),
+            &toolset(),
+            &mut messages,
+            &config("mock/model"),
+            &mut |event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+        assert_eq!(output.text, "half an ans");
+        assert_eq!(output.finish_reason, FinishReason::Cancelled);
+        // The partial round was flushed as one round with no calls, exactly
+        // like a completed round — so the recorder keeps it and the TUI
+        // renders what streamed.
+        assert_eq!(
+            events.borrow().last(),
+            Some(&TurnEvent::Round {
+                text: "half an ans".into(),
+                thinking: String::new(),
+                calls: vec![],
+            })
+        );
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, TurnEvent::Retrying { .. })),
+            "a cancel is never retried"
+        );
+        // The conversation stays continuable: the partial answer is an
+        // assistant message, nothing is dangling.
+        assert_eq!(messages.len(), 3, "system, user, partial assistant");
+        assert!(matches!(
+            &messages[2],
+            ChatMessage::Assistant {
+                content,
+                tool_calls: None,
+            } if content == "half an ans"
+        ));
+    }
+
+    /// Asks for `calls` tool calls in one round. (The stop itself is raised
+    /// by the tool that runs, as `Esc` would raise it from the UI thread.)
+    struct StopMidRound {
+        calls: usize,
+    }
+
+    impl Handler for StopMidRound {
+        fn info(&self) -> PluginInfo {
+            PluginInfo {
+                name: "stop-mid-round".into(),
+                capabilities: Capabilities {
+                    list_models: false,
+                    thinking: false,
+                    tools: true,
+                },
+                default_model: None,
+            }
+        }
+        fn list_models(&mut self) -> std::result::Result<Vec<ModelInfo>, clanky_protocol::Error> {
+            Ok(vec![])
+        }
+        fn chat(
+            &mut self,
+            _request: &ChatRequest,
+            sink: &mut dyn FnMut(ChunkPayload),
+        ) -> std::result::Result<ChatDone, clanky_protocol::Error> {
+            for i in 0..self.calls {
+                sink(ChunkPayload::ToolCallStart {
+                    index: i as u32,
+                    id: format!("call_{i}"),
+                    name: "stopper".into(),
+                });
+                sink(ChunkPayload::ToolCallArgs {
+                    index: i as u32,
+                    args_chunk: "{}".into(),
+                });
+            }
+            Ok(ChatDone {
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+            })
+        }
+    }
+
+    /// Raises the stop flag when it runs, then returns a normal result.
+    struct StopperTool(Interrupt);
+
+    impl crate::tools::Tool for StopperTool {
+        fn name(&self) -> &str {
+            "stopper"
+        }
+        fn description(&self) -> &str {
+            "Raises the stop flag"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn execute(
+            &self,
+            _arguments: &Value,
+        ) -> std::result::Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            self.0.request_stop();
+            Ok(crate::tools::ToolOutput::text("ran"))
+        }
+    }
+
+    #[test]
+    fn a_stop_mid_round_gives_every_dispatched_call_a_cancelled_result() {
+        // The model asked for two tool calls; the first one observes a stop.
+        // The turn ends there — the second call is cancelled with the same
+        // synthetic result, so the assistant message's two `tool_calls` both
+        // have a result and the conversation stays a valid chat.
+        let interrupt = Interrupt::new();
+        let handler = Box::new(StopMidRound { calls: 2 });
+        let tools: ToolSet = vec![Box::new(StopperTool(interrupt.clone()))];
+        let mut messages = vec![ChatMessage::user("go")];
+        let cfg = TurnConfig {
+            interrupt: Some(interrupt),
+            ..config("mock/model")
+        };
+        let events = RefCell::new(Vec::new());
+        let output = run_turn(handler, &tools, &mut messages, &cfg, &mut |event| {
+            events.borrow_mut().push(event)
+        })
+        .unwrap();
+        assert_eq!(output.finish_reason, FinishReason::Cancelled);
+        // user, assistant(tool_calls: 2), tool, tool — nothing dangling.
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(matches!(
+            &messages[1],
+            ChatMessage::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } if calls.len() == 2
+        ));
+        let results: Vec<String> = messages[2..]
+            .iter()
+            .map(|m| match m {
+                ChatMessage::Tool { content, .. } => content.clone(),
+                other => panic!("expected a tool result, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(results[0], "ran", "the call that ran keeps its output");
+        assert!(
+            results[1].contains(crate::tools::CANCELLED_MARKER),
+            "the call that never ran gets a cancelled result: {}",
+            results[1]
+        );
+        // Both results were surfaced to the UI (and so to the session file).
+        let tool_results = events
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, TurnEvent::ToolResult { .. }))
+            .count();
+        assert_eq!(tool_results, 2, "one result event per call");
+        // Only one round happened: a stop is never followed by another
+        // request.
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|e| matches!(e, TurnEvent::Round { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_stop_before_the_first_round_sends_nothing() {
+        // A stop that arrives while the plugin is still starting ends the
+        // turn before a request goes out: no round, no error, `cancelled`.
+        struct PanicsIfCalled;
+        impl Handler for PanicsIfCalled {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "never".into(),
+                    capabilities: Capabilities::default(),
+                    default_model: None,
+                }
+            }
+            fn list_models(
+                &mut self,
+            ) -> std::result::Result<Vec<ModelInfo>, clanky_protocol::Error> {
+                Ok(vec![])
+            }
+            fn chat(
+                &mut self,
+                _request: &ChatRequest,
+                _sink: &mut dyn FnMut(ChunkPayload),
+            ) -> std::result::Result<ChatDone, clanky_protocol::Error> {
+                panic!("no chat may be sent after a stop");
+            }
+        }
+        let interrupt = Interrupt::new();
+        interrupt.request_stop();
+        let cfg = TurnConfig {
+            interrupt: Some(interrupt),
+            ..config("mock/model")
+        };
+        let mut messages = vec![ChatMessage::user("go")];
+        let output = run_turn(
+            Box::new(PanicsIfCalled),
+            &toolset(),
+            &mut messages,
+            &cfg,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(output.finish_reason, FinishReason::Cancelled);
+        assert!(output.text.is_empty());
+        assert_eq!(messages.len(), 1, "nothing appended");
+    }
+
+    #[test]
+    fn a_stop_during_a_retry_backoff_ends_the_turn_instead_of_sleeping() {
+        // The provider answers with a retryable error and a long Retry-After;
+        // the user stops the turn while the loop waits. The wait is cut short
+        // and the turn ends cancelled instead of sleeping the backoff out.
+        let interrupt = Interrupt::new();
+        let stopper = interrupt.clone();
+        struct SlowRateLimit(Interrupt);
+        impl Handler for SlowRateLimit {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "slow".into(),
+                    capabilities: Capabilities::default(),
+                    default_model: None,
+                }
+            }
+            fn list_models(
+                &mut self,
+            ) -> std::result::Result<Vec<ModelInfo>, clanky_protocol::Error> {
+                Ok(vec![])
+            }
+            fn chat(
+                &mut self,
+                _request: &ChatRequest,
+                _sink: &mut dyn FnMut(ChunkPayload),
+            ) -> std::result::Result<ChatDone, clanky_protocol::Error> {
+                // Stop the turn from another thread, then report a
+                // retryable failure with a long server hint.
+                let stopper = self.0.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    stopper.request_stop();
+                });
+                Err(clanky_protocol::Error::Provider {
+                    code: ErrorCode::RateLimit,
+                    message: "429: Model busy".into(),
+                    retryable: true,
+                    retry_after_ms: Some(45_000),
+                })
+            }
+        }
+        let cfg = TurnConfig {
+            max_retries: Some(5),
+            retry_sleep: Some(|_| panic!("the backoff hook must not run: the stop is polled")),
+            interrupt: Some(stopper),
+            ..config("mock/model")
+        };
+        let started = Instant::now();
+        let output = run_turn(
+            Box::new(SlowRateLimit(interrupt)),
+            &toolset(),
+            &mut vec![ChatMessage::user("go")],
+            &cfg,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(output.finish_reason, FinishReason::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the 45s backoff was cut short, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_dying_plugin_after_a_stop_ends_the_turn_cancelled() {
+        // The plugin ignored the cancel and the client's kill fallback took
+        // it down. That death is the expected outcome of an ignored cancel,
+        // not an error to show the user (M22 design constraint 1).
+        struct DiesAfterStop(Interrupt);
+        impl Handler for DiesAfterStop {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "dies".into(),
+                    capabilities: Capabilities::default(),
+                    default_model: None,
+                }
+            }
+            fn list_models(
+                &mut self,
+            ) -> std::result::Result<Vec<ModelInfo>, clanky_protocol::Error> {
+                Ok(vec![])
+            }
+            fn chat(
+                &mut self,
+                _request: &ChatRequest,
+                sink: &mut dyn FnMut(ChunkPayload),
+            ) -> std::result::Result<ChatDone, clanky_protocol::Error> {
+                sink(ChunkPayload::Text {
+                    text: "started".into(),
+                });
+                self.0.request_stop();
+                Err(clanky_protocol::Error::ProcessDied {
+                    message: "did not answer cancel".into(),
+                })
+            }
+        }
+        let interrupt = Interrupt::new();
+        let cfg = TurnConfig {
+            interrupt: Some(interrupt.clone()),
+            ..config("mock/model")
+        };
+        let mut messages = vec![ChatMessage::user("go")];
+        let events = RefCell::new(Vec::new());
+        let output = run_turn(
+            Box::new(DiesAfterStop(interrupt)),
+            &toolset(),
+            &mut messages,
+            &cfg,
+            &mut |event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+        assert_eq!(output.finish_reason, FinishReason::Cancelled);
+        assert_eq!(output.text, "started");
+        assert_eq!(messages.len(), 2, "the partial text was kept");
+        // The partial round was flushed, so the recorder keeps it.
+        assert!(events.borrow().iter().any(|e| matches!(
+            e,
+            TurnEvent::Round { text, .. } if text == "started"
+        )));
+    }
+
+    #[test]
+    fn a_round_that_ignored_the_stop_drops_its_tool_calls() {
+        // The plugin ignores the cancel, finishes the round anyway and asks
+        // for two tools. Nothing may run, and the assistant message must not
+        // carry calls without results (M22 item 6): the round is flushed with
+        // `calls: Vec::new()`, exactly like an errored round.
+        struct IgnoresCancel {
+            interrupt: Interrupt,
+        }
+        impl Handler for IgnoresCancel {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "ignoring".into(),
+                    capabilities: Capabilities {
+                        list_models: false,
+                        thinking: false,
+                        tools: true,
+                    },
+                    default_model: None,
+                }
+            }
+            fn list_models(
+                &mut self,
+            ) -> std::result::Result<Vec<ModelInfo>, clanky_protocol::Error> {
+                Ok(vec![])
+            }
+            fn chat(
+                &mut self,
+                _request: &ChatRequest,
+                sink: &mut dyn FnMut(ChunkPayload),
+            ) -> std::result::Result<ChatDone, clanky_protocol::Error> {
+                sink(ChunkPayload::Text {
+                    text: "thinking about it".into(),
+                });
+                // The user stopped the turn mid-stream; this plugin does not
+                // look at the flag and completes its round.
+                self.interrupt.request_stop();
+                sink(ChunkPayload::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "stopper".into(),
+                });
+                sink(ChunkPayload::ToolCallArgs {
+                    index: 0,
+                    args_chunk: "{}".into(),
+                });
+                Ok(ChatDone {
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: None,
+                })
+            }
+        }
+        let interrupt = Interrupt::new();
+        let tools: ToolSet = vec![Box::new(StopperTool(interrupt.clone()))];
+        let cfg = TurnConfig {
+            interrupt: Some(interrupt.clone()),
+            ..config("mock/model")
+        };
+        let mut messages = vec![ChatMessage::user("go")];
+        let events = RefCell::new(Vec::new());
+        let output = run_turn(
+            Box::new(IgnoresCancel { interrupt }),
+            &tools,
+            &mut messages,
+            &cfg,
+            &mut |event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+        assert_eq!(output.finish_reason, FinishReason::Cancelled);
+        assert_eq!(output.text, "thinking about it");
+        // user, partial assistant — no dangling `tool_calls`.
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(matches!(
+            &messages[1],
+            ChatMessage::Assistant {
+                content,
+                tool_calls: None,
+            } if content == "thinking about it"
+        ));
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, TurnEvent::ToolCall { .. })),
+            "nothing ran"
+        );
+        // The round was flushed with no calls, so the session file keeps the
+        // partial text without inventing tool calls.
+        assert_eq!(
+            events.borrow().last(),
+            Some(&TurnEvent::Round {
+                text: "thinking about it".into(),
+                thinking: String::new(),
+                calls: vec![],
+            })
         );
     }
 

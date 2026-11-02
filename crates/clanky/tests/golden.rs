@@ -170,6 +170,7 @@ fn config() -> TurnConfig {
         max_tool_rounds: None,
         max_retries: Some(0),
         retry_sleep: Some(|_| {}),
+        interrupt: None,
     }
 }
 
@@ -392,6 +393,84 @@ fn tool_preview_rendering_matches_golden() {
         .collect();
     let transcript = json!({ "rows": rows });
     compare_or_update("tool-preview", &transcript);
+}
+
+#[test]
+fn cancelled_round_transcript_matches_golden() {
+    // Esc stops a turn (M22): the provider streams part of an answer, then
+    // reports `cancelled`. The golden pins what survives — the partial round
+    // as one assistant record (no tool calls), the session's `stopReason:
+    // "cancelled"`, and the conversation the next turn would send.
+    use clanky::recorder::{self, Recorder};
+    use clanky::session::Record;
+
+    let script = vec![ScriptedTurn {
+        chunks: [
+            vec![ChunkPayload::Thinking {
+                text: "Working out the answer.".into(),
+            }],
+            vec![ChunkPayload::Text {
+                text: "The first half of an answer".into(),
+            }],
+        ]
+        .concat(),
+        finish_reason: FinishReason::Cancelled,
+        usage: Some(Usage {
+            prompt_tokens: Some(11),
+            completion_tokens: Some(6),
+            cached_tokens: None,
+        }),
+    }];
+
+    let dir = temp_session_dir("cancelled");
+    let mut recorder = Recorder::with_dir(
+        dir.clone(),
+        "session",
+        clanky::settings::SessionSettings {
+            provider: Some("deepinfra".into()),
+            model: Some("mock/model".into()),
+            ..Default::default()
+        },
+    );
+    recorder.record(
+        &mut NoSink,
+        Record::User {
+            text: "write me a long answer".into(),
+        },
+    );
+    let (provider, requests) = ScriptedProvider::new(script);
+    let mut messages = vec![ChatMessage::user("write me a long answer")];
+    let output = run_turn(
+        Box::new(provider),
+        &fake_tools(),
+        &mut messages,
+        &config(),
+        &mut |event| {
+            recorder::record_turn_event(&mut recorder, &mut NoSink, &event);
+        },
+    )
+    .unwrap();
+    recorder.record_done(&mut NoSink, &Ok(output.clone()));
+
+    let data = clanky::session::load(&dir.join("session.jsonl")).unwrap();
+    let records: Vec<Value> = data
+        .records
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap())
+        .collect();
+    let transcript = json!({
+        "requests": *requests.borrow(),
+        "output": {
+            "text": output.text,
+            "finishReason": output.finish_reason,
+            "usage": output.usage,
+        },
+        "records": records,
+        // What a follow-up turn would send: everything the user saw.
+        "history": messages,
+    });
+    std::fs::remove_dir_all(dir).ok();
+    compare_or_update("cancelled-round", &transcript);
 }
 
 #[test]

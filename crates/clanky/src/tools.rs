@@ -63,6 +63,22 @@ pub trait Tool {
     /// Execute the tool with parsed arguments.
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError>;
 
+    /// Execute the tool, stopping if the user asks for it (M22).
+    ///
+    /// The default simply runs [`Tool::execute`]: the buffered-IO tools
+    /// (`edit`, `view-image`) are bounded, atomic operations that cannot be
+    /// usefully interrupted, and the turn loop drops their result anyway once
+    /// a stop is pending. A tool that runs for a long time overrides this —
+    /// [`BashTool`] polls the token alongside its deadline and returns what
+    /// the command printed before it was killed.
+    fn execute_interruptible(
+        &self,
+        arguments: &Value,
+        _interrupt: Option<&crate::turn::Interrupt>,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute(arguments)
+    }
+
     /// The wire-format tool definition offered to the model.
     fn wire(&self) -> clanky_protocol::Tool {
         clanky_protocol::Tool {
@@ -165,6 +181,19 @@ impl Tool for BashTool {
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
+        self.execute_interruptible(arguments, None)
+    }
+
+    /// A stopped `bash` reports what it printed (M22 item 5): the wait loop
+    /// already polls every 100 ms, so the stop flag joins the deadline check
+    /// and reuses the same TERM/KILL of the command's process group. The kill
+    /// closes the pipes, so the existing reader joins hand back everything
+    /// printed before it — partial output costs no new plumbing.
+    fn execute_interruptible(
+        &self,
+        arguments: &Value,
+        interrupt: Option<&crate::turn::Interrupt>,
+    ) -> Result<ToolOutput, ToolError> {
         let Some(command) = arguments.get("command").and_then(Value::as_str) else {
             return Err(ToolError::InvalidArguments {
                 tool: self.name().into(),
@@ -204,12 +233,17 @@ impl Tool for BashTool {
                 Some(Duration::from_secs(seconds))
             }
         };
-        self.run_with_timeout(command, timeout.unwrap_or(self.timeout))
+        self.run_with_timeout(command, timeout.unwrap_or(self.timeout), interrupt)
     }
 }
 
 impl BashTool {
-    fn run_with_timeout(&self, command: &str, timeout: Duration) -> Result<ToolOutput, ToolError> {
+    fn run_with_timeout(
+        &self,
+        command: &str,
+        timeout: Duration,
+        interrupt: Option<&crate::turn::Interrupt>,
+    ) -> Result<ToolOutput, ToolError> {
         let mut shell = Command::new("bash");
         shell
             .arg("-c")
@@ -248,11 +282,16 @@ impl BashTool {
         // A deadline past `Instant`'s range (the unset sentinel) runs the
         // command unbounded: only a voluntary timeout ever kills it.
         let deadline = Instant::now().checked_add(timeout);
+        // `Ok(status)` — the command finished; `Err(reason)` — it was killed
+        // (deadline or a stop); `Err(Killed::Cancelled)` additionally says the
+        // user asked for it, so the result carries the cancelled marker.
+        let mut cancelled = false;
         let status = loop {
             match child.wait_timeout(Duration::from_millis(100)) {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => {
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    let stopped = interrupt.is_some_and(|i| i.stop_requested());
+                    if stopped || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         // Kill the whole process group (TERM, then KILL if
                         // the group lingers): grandchildren inherited the
                         // output pipes, and the reader joins below would
@@ -269,10 +308,15 @@ impl BashTool {
                         }
                         let _ = child.kill();
                         let _ = child.wait();
-                        break Err(format!(
-                            "command exceeded its {}s timeout and was killed",
-                            timeout.as_secs()
-                        ));
+                        cancelled = stopped;
+                        break Err(if stopped {
+                            "command was stopped by the user and killed".to_string()
+                        } else {
+                            format!(
+                                "command exceeded its {}s timeout and was killed",
+                                timeout.as_secs()
+                            )
+                        });
                     }
                 }
                 Err(e) => break Err(format!("waiting for bash failed: {e}")),
@@ -290,6 +334,11 @@ impl BashTool {
         // backgrounded writer would hang a plain `join` forever, so the
         // group-kill fallback runs on the reader loop, not the wait loop.
         let (stdout, stderr) = join_with_deadline([stdout_reader, stderr_reader], child.id());
+        if cancelled {
+            // A stop is a *result*, not an error: the model sees what the
+            // command printed plus the reason, and can react.
+            return Ok(ToolOutput::text(self.format_cancelled(&stdout, &stderr)));
+        }
         let status = status.map_err(|message| ToolError::Failed {
             tool: "bash".into(),
             message,
@@ -326,6 +375,32 @@ impl BashTool {
         if output.is_empty() {
             output.push_str("(no output)");
         }
+        truncate_chars(&output, self.max_output_chars)
+    }
+
+    /// The result of a stopped command: what it printed before the kill, then
+    /// the cancelled marker as the final line (the shape `[exit status: N]`
+    /// has). The exit status is deliberately not reported — the kill produced
+    /// it, not the command — and a command that printed nothing says so.
+    fn format_cancelled(&self, stdout: &[u8], stderr: &[u8]) -> String {
+        let mut output = String::new();
+        let stdout = String::from_utf8_lossy(stdout);
+        let stderr = String::from_utf8_lossy(stderr);
+        if !stdout.trim_end_matches('\n').is_empty() {
+            output.push_str(stdout.trim_end_matches('\n'));
+        }
+        if !stderr.trim_end_matches('\n').is_empty() {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str("stderr: ");
+            output.push_str(stderr.trim_end_matches('\n'));
+        }
+        if output.is_empty() {
+            output.push_str("(no output)");
+        }
+        output.push('\n');
+        output.push_str(CANCELLED_MARKER);
         truncate_chars(&output, self.max_output_chars)
     }
 }
@@ -745,6 +820,20 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// The final line a stopped tool call's result carries (M22): the same
+/// shape as the exit-status marker, so it reads as a status line to the model
+/// and the transcript can paint the result as a non-success.
+pub const CANCELLED_MARKER: &str = "[cancelled by user]";
+
+/// The synthetic result for a tool call the user stopped before it ran (M22
+/// item 6): a valid `tool` message has to exist for every call in an
+/// assistant message, and the model should be able to tell what happened.
+pub fn cancelled_result() -> ToolOutput {
+    ToolOutput::text(format!(
+        "ERROR: turn was interrupted; the call was not run\n{CANCELLED_MARKER}"
+    ))
+}
+
 /// Whether a tool result reports a failure. Bash embeds an exit-status
 /// marker as the *final line* on a non-zero status (see `BashTool::format`),
 /// and the agentic loop prefixes `ERROR:` when the call itself fails
@@ -754,10 +843,9 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// quoting the marker) is not misclassified as failed.
 pub fn is_failed_result(output: &str) -> bool {
     output.starts_with("ERROR:")
-        || output
-            .lines()
-            .next_back()
-            .is_some_and(|line| line.starts_with("[exit status: ") && line.ends_with(']'))
+        || output.lines().next_back().is_some_and(|line| {
+            (line.starts_with("[exit status: ") && line.ends_with(']')) || line == CANCELLED_MARKER
+        })
 }
 
 /// Default number of output lines shown when previewing a tool result for
@@ -1135,6 +1223,103 @@ mod tests {
             "returned promptly, took {:?}",
             started.elapsed()
         );
+    }
+
+    /// Start `command` and stop it from another thread after `delay`, as the
+    /// TUI's `Esc` does: returns the call's output, its elapsed time and the
+    /// token that was used.
+    fn run_stopped(command: &str, delay: Duration) -> (String, Duration, crate::turn::Interrupt) {
+        let interrupt = crate::turn::Interrupt::new();
+        let stopper = interrupt.clone();
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            stopper.request_stop();
+        });
+        let output = BashTool::default()
+            .execute_interruptible(&json!({ "command": command }), Some(&interrupt))
+            .expect("a stop is a result, not an error")
+            .text;
+        handle.join().expect("stopper thread");
+        (output, started.elapsed(), interrupt)
+    }
+
+    #[test]
+    fn a_stopped_command_returns_its_output_plus_the_marker() {
+        // `Esc` during a long command: the call returns quickly (the kill
+        // closes the pipes, so the reader joins hand back what was printed),
+        // the result carries the cancelled marker, and it is a result — not
+        // an error — so the model sees the output and the reason.
+        let (output, elapsed, _) = run_stopped(
+            "echo before; sleep 30; echo after",
+            Duration::from_millis(300),
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "returned promptly, took {elapsed:?}"
+        );
+        assert_eq!(
+            output,
+            format!("before\n{}", CANCELLED_MARKER),
+            "only what printed before the kill, plus the marker"
+        );
+        assert!(is_failed_result(&output), "the transcript paints it red");
+    }
+
+    #[test]
+    fn a_stopped_command_with_no_output_says_so() {
+        let (output, elapsed, _) = run_stopped("sleep 30", Duration::from_millis(300));
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+        assert_eq!(output, format!("(no output)\n{CANCELLED_MARKER}"));
+    }
+
+    #[test]
+    fn a_stopped_command_takes_its_process_group_with_it() {
+        // The same wedge the timeout guards against: grandchildren inherit
+        // the pipes. The stop must kill the whole group, so the call returns
+        // quickly instead of waiting on a writer that outlived the child.
+        let (output, elapsed, _) =
+            run_stopped("sleep 30 & sleep 30 | tail -1", Duration::from_millis(300));
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+        assert!(output.ends_with(CANCELLED_MARKER), "{output}");
+    }
+
+    #[test]
+    fn a_command_that_completes_normally_gets_no_cancelled_marker() {
+        // The marker is only ever added on the kill path: a command that
+        // finished on its own reports its own status, stop token or not.
+        let interrupt = crate::turn::Interrupt::new();
+        let output = BashTool::default()
+            .execute_interruptible(&json!({"command": "echo done; false"}), Some(&interrupt))
+            .unwrap()
+            .text;
+        assert_eq!(output, "done\n[exit status: 1]");
+        assert!(!output.contains(CANCELLED_MARKER));
+    }
+
+    #[test]
+    fn a_turn_without_a_token_runs_uninterrupted() {
+        let output = BashTool::default()
+            .execute_interruptible(&json!({"command": "echo ok"}), None)
+            .unwrap()
+            .text;
+        assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn the_cancelled_marker_is_recognized_as_a_failure() {
+        assert!(is_failed_result(&format!(
+            "some output\n{CANCELLED_MARKER}"
+        )));
+        assert!(is_failed_result(CANCELLED_MARKER));
+        // Only as the exact final line: output that merely mentions it (a
+        // `cat` of a stopped transcript) is not a cancelled result.
+        assert!(!is_failed_result(&format!(
+            "{CANCELLED_MARKER} earlier\nall good"
+        )));
+        assert!(!is_failed_result("the result ended in [cancelled by user]"));
+        // The synthetic result for a call that never ran is a failure too.
+        assert!(is_failed_result(&cancelled_result().text));
     }
 
     #[test]

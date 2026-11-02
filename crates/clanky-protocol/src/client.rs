@@ -129,7 +129,22 @@ impl<T: Transport> ProviderClient<T> {
         request: ChatRequest,
         on_event: &mut dyn FnMut(&ChunkPayload),
     ) -> Result<ChatDone, Error> {
+        self.chat_with(request, &mut |_| {}, on_event)
+    }
+
+    /// [`ProviderClient::chat`], plus a hook that receives the request id the
+    /// client allocated before anything is sent. The id is what a
+    /// [`cancel`](ProviderClient::cancel) names, so a caller that wants to
+    /// cancel from another thread (the TUI's Esc, M22) learns it here: it
+    /// cannot be known in advance, since the client allocates it internally.
+    pub fn chat_with(
+        &mut self,
+        request: ChatRequest,
+        on_start: &mut dyn FnMut(u64),
+        on_event: &mut dyn FnMut(&ChunkPayload),
+    ) -> Result<ChatDone, Error> {
         let id = self.alloc_id();
+        on_start(id);
         let msg = Message::Chat {
             id,
             model: request.model,
@@ -384,6 +399,28 @@ mod tests {
         assert_eq!(done.finish_reason, FinishReason::Stop);
         assert_eq!(done.usage.unwrap().completion_tokens, Some(3));
         assert_eq!(events, ["think:hmm ", "text:Hi", "text: there"]);
+    }
+
+    #[test]
+    fn chat_with_publishes_the_id_the_chat_is_sent_under() {
+        // A cancel names a request id, so a caller that cancels from another
+        // thread needs the id *before* the chat blocks. The hook is called
+        // exactly once, before any chunk, with the id the client allocated.
+        let mut client =
+            ProviderClient::new(crate::transport::LoopbackTransport::new(FakePlugin::new()));
+        client.handshake().unwrap();
+        let mut started: Vec<u64> = Vec::new();
+        let mut events = 0usize;
+        client
+            .chat_with(
+                request("fake/m", "hi"),
+                &mut |id| started.push(id),
+                &mut |_| events += 1,
+            )
+            .unwrap();
+        assert_eq!(started.len(), 1, "published exactly once");
+        assert_eq!(started[0], 1, "the first request id the client allocates");
+        assert_eq!(events, 3, "and before the chunks");
     }
 
     #[test]

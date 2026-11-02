@@ -104,6 +104,7 @@ fn config() -> TurnConfig {
         max_tool_rounds: None,
         max_retries: Some(0),
         retry_sleep: Some(|_| {}),
+        interrupt: None,
     }
 }
 

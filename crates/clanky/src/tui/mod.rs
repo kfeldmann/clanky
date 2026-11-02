@@ -12,6 +12,13 @@
 //! render loop over a channel. Ctrl+C quits; `clanky` falls back to
 //! command-line mode when stdin or stdout is redirected (see `main.rs`).
 //!
+//! `Esc` stops a running turn (M22) without quitting: the worker's
+//! [`Interrupt`] token is shared with this thread, so a key press sets the
+//! flag the turn loop polls and cancels the in-flight chat through the
+//! plugin's own handle. Whatever the turn already produced stays — streamed
+//! text and thinking, a stopped tool's partial output — and the queued
+//! prompts are dropped, each with a note naming it.
+//!
 //! Sessions (M4): every submitted prompt and every turn event is appended
 //! to a JSONL session file under `./.clanky/sessions/` (autosave), so a
 //! killed TUI loses at most the event being written. `/name <name>` renames
@@ -92,7 +99,7 @@ use crate::recorder::ErrorSink as _;
 use crate::session::{self, SessionInfo};
 use crate::settings::{SamplingParams, SessionSettings, Settings};
 use crate::tools;
-use crate::turn::{TurnConfig, TurnEvent, TurnOutput};
+use crate::turn::{Interrupt, TurnConfig, TurnEvent, TurnOutput};
 use commands::{Command, SamplingEdit, TimeoutEdit};
 
 /// Presets offered by the bare `/thinking` picker.
@@ -406,6 +413,7 @@ fn spawn_turn(
     session: Option<ProviderSession>,
     prompt: String,
     tx: Sender<WorkerEvent>,
+    interrupt: Interrupt,
 ) {
     let launch = launch.clone();
     let mut messages = history;
@@ -430,6 +438,10 @@ fn spawn_turn(
                     session = Some(crate::provider::create(&launch.provider)?);
                 }
                 let session = session.as_mut().expect("session was just ensured");
+                // The stop token needs the plugin's handle before the turn
+                // starts: a stop is only useful if it can name the chat to
+                // cancel, and the plugin is spawned lazily right here.
+                interrupt.attach(session.cancel_handle());
                 // The plugin's advertised default fills in for an unset model.
                 let model = launch
                     .model
@@ -442,6 +454,7 @@ fn spawn_turn(
                     max_tool_rounds: launch.max_tool_rounds,
                     max_retries: launch.max_retries,
                     retry_sleep: None,
+                    interrupt: Some(interrupt),
                 };
                 crate::turn::run_turn_with(
                     session.client_mut(),
@@ -494,6 +507,8 @@ fn spawn_models(provider_name: String, tx: Sender<WorkerEvent>) {
 enum Action {
     None,
     Quit,
+    /// Stop the running turn (Esc while busy, M22).
+    Stop,
     Clear,
     /// Toggle the display of streamed thinking (ctrl+t); display-only.
     ToggleThinking,
@@ -793,6 +808,9 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
     let mut picker: Option<(picker::Picker, PickerKind)> = None;
     // Open modal, with the `/md` export it will write, when active.
     let mut modal: Option<(modal::Modal, ExportSource)> = None;
+    // The stop token of the running turn (M22), shared with its worker so
+    // `Esc` can end the turn without quitting the session.
+    let mut interrupt = Interrupt::new();
     // Something changed since the last render (transcript, input, popup).
     let mut dirty = true;
 
@@ -821,12 +839,14 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
             },
         );
         app.busy = true;
+        interrupt = Interrupt::new();
         spawn_turn(
             app.history.clone(),
             launch,
             session_owner.take(),
             prompt,
             tx.clone(),
+            interrupt.clone(),
         );
     }
 
@@ -875,8 +895,34 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                                 PickerOutcome::None => {}
                             }
                         } else {
-                            match handle_key(&mut app, &mut state, launch, &mut catalog, &tx, key) {
+                            match handle_key(
+                                &mut app,
+                                &mut state,
+                                launch,
+                                &mut catalog,
+                                &tx,
+                                &interrupt,
+                                key,
+                            ) {
                                 Action::Quit => break,
+                                Action::Stop => {
+                                    // Esc: the stop itself was requested in
+                                    // `handle_key`. What is left is the queue:
+                                    // a prompt typed while the turn ran was
+                                    // only ever going to be sent when that
+                                    // turn ended on its own, and stopping it
+                                    // means it must not be sent. Each dropped
+                                    // prompt is named — a user-provided value
+                                    // is never dropped silently — and its
+                                    // `○ queued:` line stays printed, exactly
+                                    // as it does when the prompt does run.
+                                    for prompt in app.pending.drain(..) {
+                                        app.entries.push(app::Entry::Info(format!(
+                                            "cancelled queued prompt: {}",
+                                            queued_preview(&prompt)
+                                        )));
+                                    }
+                                }
                                 Action::Clear => {
                                     app.clear();
                                     screen.clear_screen();
@@ -917,12 +963,14 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                                             },
                                         );
                                         app.busy = true;
+                                        interrupt = Interrupt::new();
                                         spawn_turn(
                                             app.history.clone(),
                                             launch,
                                             session_owner.take(),
                                             prompt,
                                             tx.clone(),
+                                            interrupt.clone(),
                                         );
                                     }
                                 }
@@ -1023,12 +1071,14 @@ fn event_loop(launch: &mut Launch, screen: &mut screen::Screen<Stdout>) -> Resul
                 },
             );
             app.busy = true;
+            interrupt = Interrupt::new();
             spawn_turn(
                 app.history.clone(),
                 launch,
                 session_owner.take(),
                 prompt,
                 tx.clone(),
+                interrupt.clone(),
             );
         }
 
@@ -1711,10 +1761,23 @@ fn handle_key(
     launch: &mut Launch,
     catalog: &mut Catalog,
     tx: &Sender<WorkerEvent>,
+    interrupt: &Interrupt,
     key: KeyEvent,
 ) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match (ctrl, key.code) {
+        // Esc stops the turn that is running (M22). It is live only while
+        // busy: an idle Esc does nothing, and an open modal or picker
+        // consumes Esc before it reaches here (both are handled ahead of
+        // `handle_key` in the event loop). The flag is set here and the
+        // in-flight chat is cancelled through the plugin's own handle right
+        // away — `CancelHandle` is built to be called from another thread, so
+        // no watcher thread is needed. The event loop finishes the job by
+        // dropping the queued prompts.
+        (false, KeyCode::Esc) if app.busy => {
+            interrupt.request_stop();
+            Action::Stop
+        }
         (true, KeyCode::Char('c')) | (true, KeyCode::Char('q')) => Action::Quit,
         (true, KeyCode::Char('d')) if app.input.is_empty() => Action::Quit,
         (true, KeyCode::Char('l')) => Action::Clear,
@@ -1853,15 +1916,32 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let interrupt = Interrupt::new();
         app.input = "hello".into();
         app.cursor = 3;
         let key = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, key);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            key,
+        );
         assert_eq!(app.input, "lo");
         assert_eq!(app.cursor, 0);
         // Plain `u` still types a character.
         let plain = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, plain);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            plain,
+        );
         assert_eq!(app.input, "ulo");
     }
 
@@ -1872,15 +1952,32 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let interrupt = Interrupt::new();
 
         let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert!(matches!(
-            handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, key),
+            handle_key(
+                &mut app,
+                &mut state,
+                &mut cfg,
+                &mut catalog,
+                &tx,
+                &interrupt,
+                key
+            ),
             Action::ToggleThinking
         ));
         // Plain `t` still types a character.
         let plain = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, plain);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            plain,
+        );
         assert_eq!(app.input, "t");
     }
 
@@ -1891,27 +1988,52 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let interrupt = Interrupt::new();
         app.input = "earlier".into();
         app.cursor = 7;
         app.take_input();
 
         // Single-row buffer: ↑ recalls the previous prompt (top row).
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, up);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            up,
+        );
         assert_eq!(app.input, "earlier");
 
         // Multi-line buffer, caret on the top row: ↑ still recalls.
         app.history_down(); // back to live
         app.input = "top\nbottom".into();
         app.cursor = 0;
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, up);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            up,
+        );
         assert_eq!(app.input, "earlier");
 
         // ... but on a lower row it moves within the text instead.
         app.history_down();
         app.input = "top\nbottom".into();
         app.cursor = 6;
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, up);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            up,
+        );
         assert_eq!(app.input, "top\nbottom");
         assert_eq!(app.cursor, 2, "column 2 of the top row");
     }
@@ -1923,6 +2045,7 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let interrupt = Interrupt::new();
         app.input = "earlier".into();
         app.cursor = 7;
         app.take_input();
@@ -1930,13 +2053,29 @@ mod tests {
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         // Recall with ↑ first, then build a multi-line buffer over it.
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, up);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            up,
+        );
         assert_eq!(app.input, "earlier");
         app.input = "row1\nrow2\nrow3".into();
         app.cursor = app.input.find("row2").unwrap();
 
         // ↓ on the middle row: within the text, no history step.
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, down);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            down,
+        );
         assert_eq!(app.input, "row1\nrow2\nrow3", "unchanged");
         assert_eq!(
             app.cursor,
@@ -1946,7 +2085,15 @@ mod tests {
 
         // ↓ on the bottom row: a history step (past the newest entry, the
         // saved draft comes back — here the empty draft).
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, down);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            down,
+        );
         assert_eq!(app.input, "");
     }
 
@@ -1957,29 +2104,70 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let interrupt = Interrupt::new();
 
         app.input = "one two".into();
         app.cursor = 3;
         let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, j);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            j,
+        );
         assert_eq!(app.input, "one\n two");
 
         // ctrl+a / ctrl+e are line-scoped.
         let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
         let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, a);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            a,
+        );
         assert_eq!(app.cursor, 4, "start of the second row");
-        handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, e);
+        handle_key(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+            &interrupt,
+            e,
+        );
         assert_eq!(app.cursor, 8, "end of the second row");
         // On the last row at the buffer end, ctrl+e opens $EDITOR.
         assert!(matches!(
-            handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, e),
+            handle_key(
+                &mut app,
+                &mut state,
+                &mut cfg,
+                &mut catalog,
+                &tx,
+                &interrupt,
+                e
+            ),
             Action::OpenEditor
         ));
         // ... mid-buffer it does not.
         app.cursor = 1;
         assert!(matches!(
-            handle_key(&mut app, &mut state, &mut cfg, &mut catalog, &tx, e),
+            handle_key(
+                &mut app,
+                &mut state,
+                &mut cfg,
+                &mut catalog,
+                &tx,
+                &interrupt,
+                e
+            ),
             Action::None
         ));
         assert_eq!(app.cursor, 3, "end of the first row");
@@ -2214,6 +2402,7 @@ mod tests {
     #[test]
     fn cost_includes_live_estimates_between_usage_reports() {
         let mut catalog = Catalog::new("deepinfra".into());
+        let _interrupt = Interrupt::new();
         catalog.models = vec![ModelInfo {
             id: "mock/model".into(),
             display_name: None,
@@ -2443,6 +2632,7 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let _interrupt = Interrupt::new();
 
         let action = handle_command(
             &mut app,
@@ -2492,6 +2682,7 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let _interrupt = Interrupt::new();
 
         handle_command(
             &mut app,
@@ -2523,6 +2714,7 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let _interrupt = Interrupt::new();
         let template = Template {
             name: "review".into(),
             content: "Review this code".into(),
@@ -2669,6 +2861,7 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let _interrupt = Interrupt::new();
 
         let action = handle_command(
             &mut app,
@@ -2719,6 +2912,7 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let _interrupt = Interrupt::new();
 
         handle_command(
             &mut app,
@@ -2779,6 +2973,7 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let _interrupt = Interrupt::new();
 
         handle_command(
             &mut app,
@@ -3004,6 +3199,136 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    // --- Esc stops the turn (M22) ------------------------------------------
+
+    #[test]
+    fn esc_while_busy_requests_a_stop() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(SessionSettings::default());
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+        let interrupt = Interrupt::new();
+        app.busy = true;
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_key(
+                &mut app,
+                &mut state,
+                &mut cfg,
+                &mut catalog,
+                &tx,
+                &interrupt,
+                esc
+            ),
+            Action::Stop
+        ));
+        assert!(
+            interrupt.stop_requested(),
+            "the turn loop polls this flag, so Esc must set it"
+        );
+    }
+
+    #[test]
+    fn esc_while_idle_does_nothing() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(SessionSettings::default());
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+        let interrupt = Interrupt::new();
+        app.busy = false;
+        app.input = "half typed".into();
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_key(
+                &mut app,
+                &mut state,
+                &mut cfg,
+                &mut catalog,
+                &tx,
+                &interrupt,
+                esc
+            ),
+            Action::None
+        ));
+        assert!(!interrupt.stop_requested(), "no turn, nothing to stop");
+        assert_eq!(app.input, "half typed", "the input is untouched");
+    }
+
+    #[test]
+    fn a_stop_drops_queued_prompts_with_one_note_each() {
+        // A prompt typed mid-turn was only ever going to be sent when the
+        // turn ended on its own. Once the user stops the turn, sending it is
+        // the opposite of what they asked for — but a user-provided value is
+        // never dropped silently, so each one is named.
+        let mut cfg = launch();
+        let mut state = SessionState::new(SessionSettings::default());
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+        let interrupt = Interrupt::new();
+        app.busy = true;
+        app.pending = vec!["second question".into(), "third one".into()];
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_key(
+                &mut app,
+                &mut state,
+                &mut cfg,
+                &mut catalog,
+                &tx,
+                &interrupt,
+                esc
+            ),
+            Action::Stop
+        ));
+        // The event loop's half of the action: drain and name each prompt.
+        let notes: Vec<String> = app
+            .pending
+            .drain(..)
+            .map(|prompt| format!("cancelled queued prompt: {}", queued_preview(&prompt)))
+            .collect();
+        assert!(app.pending.is_empty(), "nothing is left to send");
+        assert_eq!(
+            notes,
+            vec![
+                "cancelled queued prompt: second question",
+                "cancelled queued prompt: third one",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_turn_says_so() {
+        // A cancelled turn otherwise ends silently and reads as a
+        // truncation.
+        let mut app = app::App::new(None);
+        app.busy = true;
+        app.on_turn_done(&Ok(TurnOutput {
+            text: "half".into(),
+            finish_reason: clanky_protocol::FinishReason::Cancelled,
+            usage: None,
+        }));
+        assert!(!app.busy);
+        assert_eq!(
+            app.entries.last(),
+            Some(&app::Entry::Info("⏹ turn cancelled".into()))
+        );
+
+        // A normal end adds no such note.
+        let mut app = app::App::new(None);
+        app.on_turn_done(&Ok(TurnOutput {
+            text: "done".into(),
+            finish_reason: clanky_protocol::FinishReason::Stop,
+            usage: None,
+        }));
+        assert!(app.entries.is_empty(), "{:?}", app.entries);
+    }
+
     #[test]
     fn a_completed_turn_appends_the_stop_reason_record() {
         // The terminal `done` of a successful turn becomes a `stopReason`
@@ -3086,6 +3411,7 @@ mod tests {
         let mut app = app::App::new(None);
         let (tx, _rx) = mpsc::channel::<WorkerEvent>();
         let mut catalog = Catalog::new("deepinfra".into());
+        let _interrupt = Interrupt::new();
 
         let action = handle_command(
             &mut app,
