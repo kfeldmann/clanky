@@ -202,24 +202,29 @@ pub fn effective_settings(header: &Header, records: &[Record]) -> SessionSetting
 
 /// Total token usage across `records` (prompt and completion summed over
 /// every per-round usage report), for the transcript footer and `/md`
-/// summaries.
+/// summaries. The cached share is summed alongside the prompt total it
+/// is a subset of, so the returned value describes the same tokens the
+/// cost display prices.
 pub fn total_usage(records: &[Record]) -> Usage {
     let mut prompt = 0u64;
     let mut completion = 0u64;
+    let mut cached = 0u64;
     for record in records {
         if let Record::Usage {
             prompt_tokens,
             completion_tokens,
+            cached_tokens,
         } = record
         {
             prompt += prompt_tokens.unwrap_or(0);
             completion += completion_tokens.unwrap_or(0);
+            cached += cached_tokens.unwrap_or(0);
         }
     }
     Usage {
         prompt_tokens: Some(prompt),
         completion_tokens: Some(completion),
-        cached_tokens: None,
+        cached_tokens: (cached > 0).then_some(cached),
     }
 }
 
@@ -315,6 +320,7 @@ mod tests {
             Record::Usage {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(4),
+                cached_tokens: None,
             },
         ]
     }
@@ -474,10 +480,12 @@ mod tests {
             Record::Usage {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(4),
+                cached_tokens: None,
             },
             Record::Usage {
                 prompt_tokens: Some(20),
                 completion_tokens: Some(6),
+                cached_tokens: None,
             },
         ];
         let doc = render(None, &header(), &records, ExportOptions::default());

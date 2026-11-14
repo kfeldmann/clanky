@@ -580,15 +580,20 @@ impl App {
                 Record::Usage {
                     prompt_tokens,
                     completion_tokens,
+                    cached_tokens,
                 } => {
                     self.last_usage = Some(Usage {
                         prompt_tokens: *prompt_tokens,
                         completion_tokens: *completion_tokens,
-                        cached_tokens: None,
+                        cached_tokens: *cached_tokens,
                     });
+                    // The cached share is restored too: pricing it at the
+                    // input rate (which dropping it here would do) is what
+                    // made a resumed session's cost read far higher than
+                    // the same session showed before it was quit.
                     self.billed_usage.add_round(
                         prompt_tokens.unwrap_or(0),
-                        0,
+                        cached_tokens.unwrap_or(0),
                         completion_tokens.unwrap_or(0),
                     );
                 }
@@ -1507,6 +1512,46 @@ mod tests {
         assert_eq!(app.billed_usage.cached_tokens, 810, "clamped to the prompt");
     }
 
+    /// Regression: resuming a session must restore the same billed totals
+    /// the live session had, cached share included. Dropping the cached
+    /// tokens on restore re-priced that portion at the full input rate,
+    /// so the cost after `/resume` read far higher than the cost the same
+    /// session showed before it was quit.
+    #[test]
+    fn resume_restores_the_cached_share_so_the_cost_matches_the_live_session() {
+        let live_round = Usage {
+            prompt_tokens: Some(1000),
+            completion_tokens: Some(50),
+            cached_tokens: Some(800),
+        };
+
+        // Live session: the round's report folds into the billed totals.
+        let mut app = App::new(None);
+        app.on_turn_event(TurnEvent::Usage { usage: live_round });
+        let live = app.billed_usage;
+
+        // Quit and resume: the recorder persisted the round, and restore
+        // folds it back from the session records.
+        let records = vec![Record::Usage {
+            prompt_tokens: live_round.prompt_tokens,
+            completion_tokens: live_round.completion_tokens,
+            cached_tokens: live_round.cached_tokens,
+        }];
+        let mut resumed = App::new(None);
+        resumed.restore(&records);
+
+        assert_eq!(
+            resumed.billed_usage, live,
+            "a resumed session bills exactly what the live session billed"
+        );
+        assert_eq!(resumed.billed_usage.cached_tokens, 800);
+        assert_eq!(
+            resumed.last_usage.and_then(|u| u.cached_tokens),
+            Some(800),
+            "the ctx-driving last usage keeps its cached share too"
+        );
+    }
+
     #[test]
     fn estimates_streamed_text_and_resets_on_usage() {
         let mut app = App::new(None);
@@ -2016,6 +2061,7 @@ mod tests {
             Record::Usage {
                 prompt_tokens: Some(9),
                 completion_tokens: Some(2),
+                cached_tokens: None,
             },
         ];
         let mut app = App::new(None);

@@ -208,7 +208,7 @@ Plugin → client, terminal:
 
 ```json
 {"type": "done", "requestId": 42, "finishReason": "toolCalls",
- "usage": {"promptTokens": 1523, "completionTokens": 87}}
+ "usage": {"promptTokens": 1523, "completionTokens": 87, "cachedTokens": 1400}}
 ```
 
 Rules:
@@ -226,7 +226,15 @@ Rules:
   conversation, does *not* bill its usage (the next request re-reports it,
   cumulatively), and resumes automatically. A provider that never emits it
   costs nothing, so no capability flag is needed.
-- `usage` is optional; present it when the backend reports it.
+- `usage` is optional; present it when the backend reports it. Its
+  `cachedTokens` field (a subset of `promptTokens`) says how much of the
+  prompt the backend served from its prompt cache — OpenAI-compatible
+  backends report it as `prompt_tokens_details.cached_tokens`, Anthropic
+  as `cache_read_input_tokens`. It is optional: absent means unknown, and
+  the client then prices the whole prompt at the full input rate. Reporting
+  it lets the client's cost estimate use the provider's cheaper cache-read
+  rate, and the client persists it in the session file so a resumed
+  session keeps the same cost.
 - **Ordering:** chunks for a given `requestId` arrive in order. **Only one chat
   may be in flight per plugin connection.** This removes all interleaving
   complexity; parallel requests would need multiplexing we don't want in
@@ -368,6 +376,6 @@ if __name__ == "__main__":
 < {"type":"chunk","requestId":42,"payload":{"kind":"toolCallArgs","index":0,
    "argsChunk":"{\"command\": \"ls /tmp | wc -l\"}"}}
 < {"type":"done","requestId":42,"finishReason":"toolCalls",
-   "usage":{"promptTokens":1523,"completionTokens":87}}
+   "usage":{"promptTokens":1523,"completionTokens":87,"cachedTokens":1400}}
   ... clanky runs bash, appends role:"tool" message, sends new chat id:43 ...
 ```

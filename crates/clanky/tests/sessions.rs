@@ -539,6 +539,7 @@ fn markdown_export_covers_the_session_and_honors_its_flags() {
         Record::Usage {
             prompt_tokens: Some(120),
             completion_tokens: Some(30),
+            cached_tokens: None,
         },
     ];
     let mut writer = SessionWriter::new(

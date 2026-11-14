@@ -325,6 +325,25 @@ replaced with a generated one, and no session file is created.
 `--name` together with `--resume` is a usage error too — the resumed file
 already has its name (`/name` can still rename it mid-session).
 
+### Usage records and the cost indicator
+
+Every completed chat round writes one `usage` record — `promptTokens`,
+`completionTokens`, and, when the backend reports it, `cachedTokens` (the
+part of the prompt the provider served from its prompt cache). Rounds
+simply sum: each round is its own billed request, and a turn re-sends the
+conversation every round.
+
+`cachedTokens` is recorded because the status line's cost estimate prices
+that portion at the provider's cache-read rate rather than the full input
+rate. That rate is dramatically cheaper (on DeepInfra, $0.006/Mtok against
+$0.20/Mtok for one current model), and a long agentic session serves the
+bulk of each re-sent prompt from cache — so a resumed session that dropped
+the field would re-price most of its prompt tokens at ~33× and show a
+cost far above what the same session showed before it was quit.
+`/resume` therefore restores the cached share along with the totals, and
+the cost continues from the same number. Records written before the field
+existed (absent, not null) load fine and simply carry no cached share.
+
 Sessions autosave as the conversation happens. When a turn is cut short —
 a provider error mid-stream, `Esc` stopping the turn in the TUI, or
 `ctrl+c` quitting while the answer is still streaming — the partially

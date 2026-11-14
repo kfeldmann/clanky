@@ -2472,6 +2472,71 @@ mod tests {
         assert_eq!(session_cost(&empty, &launch, &app), None);
     }
 
+    /// Regression, end to end at the status line: the cost shown after
+    /// `/resume` must equal the cost the same session showed before it
+    /// was quit. The reported symptom was the opposite — a much higher
+    /// number after resuming — because the session record dropped the
+    /// cached share of each round's prompt, so restore re-priced those
+    /// tokens at the full input rate. The rates here mirror a real
+    /// DeepInfra model ($0.20/Mtok input, $0.006/Mtok cache read), where
+    /// the difference is ~33×.
+    #[test]
+    fn resumed_session_cost_matches_the_cost_before_quitting() {
+        let mut catalog = Catalog::new("deepinfra".into());
+        catalog.models = vec![ModelInfo {
+            id: "mock/model".into(),
+            display_name: None,
+            context_window: None,
+            supports_thinking: None,
+            supports_tools: None,
+            supports_text_generation: None,
+            input_price_per_mtok: Some(0.20),
+            output_price_per_mtok: Some(0.60),
+            cache_read_price_per_mtok: Some(0.006),
+        }];
+        let mut launch = launch();
+        launch.model = Some("mock/model".into());
+
+        // A heavily cached round, as a long agentic session produces: the
+        // bulk of the re-sent prompt is served from the provider's cache.
+        let round = clanky_protocol::Usage {
+            prompt_tokens: Some(100_000),
+            completion_tokens: Some(1_000),
+            cached_tokens: Some(90_000),
+        };
+
+        // Live: the report folds into the billed totals.
+        let mut app = app::App::new(None);
+        app.on_turn_event(TurnEvent::Usage { usage: round });
+        let before_quit = session_cost(&catalog, &launch, &app).unwrap();
+        // 10k uncached prompt at $0.20 + 90k cached at $0.006 + 1k out at
+        // $0.60, all per million tokens.
+        let expected = (10_000.0 * 0.20 + 90_000.0 * 0.006 + 1_000.0 * 0.60) / 1e6;
+        assert!((before_quit - expected).abs() < 1e-12, "{before_quit}");
+
+        // Quit and resume: restore folds the persisted record back.
+        let records = vec![session::Record::Usage {
+            prompt_tokens: round.prompt_tokens,
+            completion_tokens: round.completion_tokens,
+            cached_tokens: round.cached_tokens,
+        }];
+        let mut resumed = app::App::new(None);
+        resumed.restore(&records);
+        let after_resume = session_cost(&catalog, &launch, &resumed).unwrap();
+
+        assert!(
+            (after_resume - before_quit).abs() < 1e-12,
+            "resumed cost ${after_resume} must equal the pre-quit cost ${before_quit}"
+        );
+        // Guard the magnitude too: pricing every prompt token at the input
+        // rate (the bug) is ~1.7× the honest total, not a rounding blip.
+        let uncached_everything = (100_000.0 * 0.20 + 1_000.0 * 0.60) / 1e6;
+        assert!(
+            after_resume < uncached_everything * 0.9,
+            "the cached share must still be priced at the cache-read rate"
+        );
+    }
+
     #[test]
     fn model_detail_combines_fields() {
         assert_eq!(

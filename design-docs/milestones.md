@@ -95,6 +95,38 @@ Architectural decisions already made:
 - Status line: provider · model, streaming/queued state, last-turn token usage
 - Done when: interactive chat works with streaming, `|` pipe still prints plain.
 
+## ✔ M3.1 — Session cost survives `/resume`
+
+Reported symptom: the status line's cost was accurate during a session but
+read much higher after quitting and resuming the same session.
+
+Root cause: `Record::Usage` persisted only `promptTokens`/`completionTokens`,
+and `App::restore` folded a restored round with `cached: 0`. The live session
+priced the cache-served share of each prompt at the provider's cache-read
+rate; after a resume that share was re-priced at the full input rate. The
+factor is large — DeepInfra's current catalog has `cache_read_tokens` at
+$0.006/Mtok against `input_tokens` at $0.20/Mtok (~33×) — and a long agentic
+session serves most of every re-sent prompt from cache, so the resumed number
+could be many times the honest one. Reproduced at $0.00314 → $0.0206 (6.5×)
+for one heavily cached round.
+
+Fix: the `usage` record carries `cachedTokens` (`#[serde(default,
+skip_serializing_if = "Option::is_none")]`), `session::usage_record` copies it
+from the protocol `Usage`, and `App::restore` folds it into `BilledUsage`
+(and into the `last_usage` that drives the ctx %). Records written before the
+field load unchanged with no cached share, and a record for a backend that
+reports none serializes exactly as before — the existing goldens did not
+move.
+
+Coverage: `usage_records_round_trip_the_cached_prompt_share`,
+`usage_records_without_cached_tokens_still_load`,
+`a_usage_record_without_a_cached_share_omits_the_field` (session.rs),
+`resume_restores_the_cached_share_so_the_cost_matches_the_live_session`
+(app.rs), and `resumed_session_cost_matches_the_cost_before_quitting`
+(tui/mod.rs) — the last one asserts the restored status-line cost equals the
+pre-quit cost and that it stays below an all-at-input-rate total, so the
+cheap rate is still being applied.
+
 ## ✔ M4 — Sessions
 - Session file format (JSONL: one record per event, versioned header)
 - `/name`, `/resume` (picker), autosave

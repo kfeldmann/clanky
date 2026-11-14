@@ -166,6 +166,16 @@ pub enum Record {
         prompt_tokens: Option<u64>,
         #[serde(default)]
         completion_tokens: Option<u64>,
+        /// How many of `prompt_tokens` were served from the provider's
+        /// prompt cache. Persisted because the cost display prices that
+        /// portion at the cache-read rate: dropping it would re-price the
+        /// cached tokens at the full input rate on `/resume`, inflating
+        /// the session cost well above what the same session showed
+        /// before it was quit. Absent when the backend reported none
+        /// (most do not), which also keeps records written before this
+        /// field existed loading unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_tokens: Option<u64>,
     },
     /// A turn or write error, kept so the transcript survives resume.
     Error { message: String },
@@ -646,11 +656,15 @@ pub fn history_from_records(records: &[Record]) -> Vec<ChatMessage> {
 
 /// Convenience: one chat round's usage as a record (clamps `None`s for
 /// the file). Called per [`crate::turn::TurnEvent::Usage`], i.e. once per
-/// round, so a multi-round turn writes one record per round.
+/// round, so a multi-round turn writes one record per round. The cached
+/// share of the prompt is persisted so `/resume` prices those tokens at
+/// the cache-read rate the live session used, instead of re-pricing them
+/// at the full input rate and inflating the restored cost.
 pub fn usage_record(usage: Usage) -> Record {
     Record::Usage {
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
+        cached_tokens: usage.cached_tokens,
     }
 }
 
@@ -709,6 +723,7 @@ mod tests {
             Record::Usage {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(4),
+                cached_tokens: None,
             },
         ]
     }
@@ -740,6 +755,83 @@ mod tests {
         assert_eq!(data.header.provider.as_deref(), Some("deepinfra"));
         assert_eq!(data.records, records);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A usage record keeps the cached share of the prompt, so a resumed
+    /// session prices those tokens at the cache-read rate the live session
+    /// used. Dropping it re-priced them at the full input rate and made
+    /// the resumed cost read far higher than the pre-quit cost.
+    #[test]
+    fn usage_records_round_trip_the_cached_prompt_share() {
+        let dir = temp_dir("usage-cached");
+        let records = vec![Record::Usage {
+            prompt_tokens: Some(1000),
+            completion_tokens: Some(50),
+            cached_tokens: Some(800),
+        }];
+        let path = write_session(&dir, "usage", &records);
+        let data = load(&path).unwrap();
+        assert_eq!(data.records, records);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Records written before `cached_tokens` existed must still load: the
+    /// field is absent, not null, and defaults to "unknown" — which the
+    /// cost display treats as no cached share.
+    #[test]
+    fn usage_records_without_cached_tokens_still_load() {
+        let dir = temp_dir("usage-legacy");
+        let path = dir.join("legacy.jsonl");
+        // Written by hand: the pre-cached-tokens shape, exactly.
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"version":1,"created":1700000000000,"type":"header"}"#,
+                "\n",
+                r#"{"type":"usage","promptTokens":1000,"completionTokens":50}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let data = load(&path).unwrap();
+        assert_eq!(
+            data.records,
+            vec![Record::Usage {
+                prompt_tokens: Some(1000),
+                completion_tokens: Some(50),
+                cached_tokens: None,
+            }]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The field is omitted from the wire when unknown, so a record for a
+    /// backend that reports no cache data stays as compact as it was
+    /// before the field existed.
+    #[test]
+    fn a_usage_record_without_a_cached_share_omits_the_field() {
+        let record = usage_record(Usage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(4),
+            cached_tokens: None,
+        });
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("cachedTokens"), "{json}");
+        assert_eq!(
+            json,
+            r#"{"type":"usage","promptTokens":10,"completionTokens":4}"#
+        );
+        // And with one, it is carried under the record's camelCase name.
+        let record = usage_record(Usage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(4),
+            cached_tokens: Some(8),
+        });
+        let json = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"usage","promptTokens":10,"completionTokens":4,"cachedTokens":8}"#
+        );
     }
 
     #[test]
