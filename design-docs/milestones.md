@@ -989,9 +989,10 @@ back as tool results, golden transcripts updated.
   the tool's own actionable one. Zero matches → "not found: `old_string`
   occurs 0 times in <path> (check the exact text, including whitespace)";
   multiple matches without `replace_all` → "`old_string` occurs N times in
-  <path>; provide more surrounding context to make it unique, or pass
-  `replace_all: true`"; success → "Replaced N occurrence(s) in <path>" (N
-  counted the same way for `replace_all`, so the count is verifiable).
+  <path> (lines 42, 57, 88); provide more surrounding context to make it
+  unique, or pass `replace_all: true`"; success → "Replaced N occurrence(s)
+  in <path> (lines 42-44)" (N counted the same way for `replace_all`, so the
+  count is verifiable).
   All failures are `ToolError::Failed` — they rise through the existing
   `ERROR:` prefixing / `is_failed_result` red-rendering path unchanged, no
   new display code. The default deadline does not apply (the M17 design's
@@ -1011,6 +1012,59 @@ back as tool results, golden transcripts updated.
   definition appears in every transcript). README: new "The `edit` tool"
   section and the `timeout_seconds` bullet now notes the default applies
   only to `bash` ('killable' tools).
+
+  **Revised after use** (observed sessions showed ~6,400 `bash` calls to 3
+  `edit` calls; 43 of 51 `python3` heredocs were reimplementing the tool,
+  22 of them single-file/single-replace — i.e. exactly `edit`'s shape, and
+  only one `edit` failure ever occurred, so models were not bouncing off
+  the tool but never reaching for it):
+
+  1. *Description.* It advertised two failure modes and no benefit, which
+     reads as "this thing fails a lot" next to `bash`'s unconstrained one
+     line. It now names the preference ("prefer this over shell commands
+     (`sed -i`, `python3` heredocs) for changing files"), says why (match
+     count and line numbers, fails loudly), and says several calls in one
+     round are fine (the loop has always supported that — 137 recorded
+     rounds carried more than one call).
+  2. *Success carries line numbers.* `Replaced N occurrence(s) in <path>
+     (lines 42-44)`. This keeps the M19 "no contents, no diff" decision —
+     a diff repeats strings the conversation already has — while adding
+     the one fact it does not: where the change landed. Spans are computed
+     in the *new* file (post-edit state, what the next read sees) by
+     shifting each match offset by the accumulated length delta; several
+     matches report distinct start lines, deduped, capped at 5 then
+     `+N more`, and never collapsed into a range (two matches on adjacent
+     lines are two locations, not one span). A deletion is zero-width and
+     reports the single line it emptied. The end clamps to the file's last
+     existing line (`last_line_number`): deleting the final line leaves the
+     offset one past the last `\n`, and naming a line the file no longer has
+     would contradict "the state after the edit", which is the point.
+  3. *Zero-match diagnostic.* A whitespace-insensitive second pass (all
+     ASCII whitespace runs → one space, both ends trimmed, with a parallel
+     origin-offset map) locates a near miss and the error names the line
+     *and quotes the file's own bytes there* — the model cannot rebuild the
+     right `old_string` from a line number without re-reading the file, and
+     re-reading with bash is the habit being fixed. The pass is
+     **diagnostic only**: it never applies a match, so the byte-for-byte
+     guarantee and M19's "literal, no patterns" decision both still hold
+     (auto-applying a fuzzy match would edit text the model did not
+     specify, and can land in the wrong place). A whitespace-only
+     `old_string` normalizes to nothing and is skipped, so it cannot
+     "match" at offset 0. Invalid UTF-8 is fine — it all works on bytes and
+     renders with `from_utf8_lossy`.
+  4. *Multiple-match error names the lines* (`(lines 42, 57, 88)`), which
+     is what makes "add surrounding context" actionable.
+  5. *Scan.* `count_subsequence`/`replace_subsequence` became
+     `match_offsets`/`replace_at`: one scan yields both the count and the
+     offsets the line reporting needs.
+  6. Tests: the exact-string unit assertions moved to the new shapes, plus
+     new cases for spans (single line, span, deletion), `replace_all`
+     start-line lists and same-line dedupe, the multi-match line list, the
+     whitespace diagnostic (tabs, trailing whitespace, CRLF) including
+     that the file is untouched, the no-near-miss plain message, the
+     whitespace-only guard, and the `line_of`/`line_span`/`describe_*`
+     helpers. The `edit-tool` golden was regenerated (description + line
+     number).
 
 ## ✔ M20 — View-image (vision) tool
 A built-in `view-image` tool that puts an image file into the model's context,

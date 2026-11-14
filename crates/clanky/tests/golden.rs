@@ -505,7 +505,7 @@ fn sampling_and_thinking_are_plumbed_through_every_round() {
 /// The edit tool in the agentic loop (M19): a scripted model edits a real
 /// scratch file through one round, then reads it back and answers. The
 /// golden pins the `edit` tool definition as offered on the wire and the
-/// exact fed-back result text ("Replaced N occurrence(s) in <path>") in
+/// exact fed-back result text ("Replaced N occurrence(s) in <path> (line N)") in
 /// the second round's messages — any change to either breaks the golden.
 ///
 /// Regenerate with: `CLANKY_UPDATE_GOLDEN=1 cargo test --test golden`
@@ -598,7 +598,7 @@ fn edit_tool_transcript_matches_golden() {
         .expect("edit result message in round 2");
     assert_eq!(
         tool_message.get("content").and_then(Value::as_str),
-        Some(format!("Replaced 1 occurrence(s) in {path}").as_str())
+        Some(format!("Replaced 1 occurrence(s) in {path} (line 1)").as_str())
     );
 
     let transcript = json!({

@@ -206,20 +206,32 @@ so, so the conversation stays valid.
 
 ### The `edit` tool
 
-The `edit` tool replaces a literal substring in a file. The model passes
-`path`, `old_string`, `new_string`, and optionally `replace_all: true`.
+The `edit` tool replaces a literal substring in an existing file. The model
+passes `path`, `old_string`, `new_string`, and optionally `replace_all: true`.
 Matching is byte-for-byte literal — no patterns, no wildcards — so the text
 in the tool call is exactly the text in the file (there is no read-before-edit
-requirement; the model reads files through `bash`).
+requirement; the model reads files through `bash`). Its description asks the
+model to prefer it over `sed -i` and `python3` heredocs for changing files,
+and to call it several times in one round for several edits.
 
-- Zero matches fails with `not found` (naming the file); the model re-reads
-  the file and retries.
-- Multiple matches fail without `replace_all`, naming the match count and
-  asking for more surrounding context — with `replace_all: true` every
-  occurrence is replaced.
+- Zero matches fails with `not found` (naming the file). When the text is
+  present but *whitespace* differs (tabs vs spaces, trailing whitespace,
+  reflowed lines, CRLF), a whitespace-insensitive second pass locates it and
+  the error names the line **and quotes the file's own bytes there**, so the
+  model can retry with the right text instead of re-reading the file. That
+  pass is diagnostic only — it never applies a match, so the literal rule
+  still holds.
+- Multiple matches fail without `replace_all`, naming the match count, the
+  lines they start on, and asking for more surrounding context — with
+  `replace_all: true` every occurrence is replaced.
 - On success the result is a short confirmation, `Replaced N occurrence(s)
-  in <path>` — no file contents, no diff: the tool call in the conversation
-  already carries both strings.
+  in <path> (line 42)` — the line or lines the change now occupies, or the
+  distinct start lines for `replace_all`. No file contents, no diff: the
+  tool call in the conversation already carries both strings. The line
+  numbers are the one fact it does not, and they say where the change landed.
+
+Line numbers describe the file **after** the edit — the state the model's
+next read or edit will see.
 
 Failures are data: they are fed back to the model as normal tool results
 (rendered red in the TUI, like a non-zero bash exit) so it can recover, not

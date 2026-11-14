@@ -415,6 +415,16 @@ impl BashTool {
 /// already writes anywhere. The tool's value is intent and failure messages —
 /// the match-count errors below are data the model can recover from, instead
 /// of a silent `sed` that hit the wrong line.
+///
+/// Both results carry line numbers. On success they are the one thing the
+/// conversation does not already contain (the call holds both strings, so a
+/// diff would repeat them) and they say where the change landed, which is
+/// what the model needs to continue editing the same file. On a zero-match
+/// failure a *whitespace-insensitive* second pass finds where the text
+/// probably was and shows the file's own bytes there — the model cannot
+/// reconstruct the right `old_string` from a line number alone. That pass is
+/// diagnostic only: it never applies a match, so the byte-for-byte guarantee
+/// above holds.
 pub struct EditTool;
 
 impl Default for EditTool {
@@ -429,7 +439,7 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Replace a literal substring in a file (byte-for-byte, no patterns). Fails on zero matches; fails on multiple matches unless `replace_all` is set."
+        "Edit an existing file by replacing an exact substring (byte-for-byte, no patterns). Prefer this over shell commands (`sed -i`, `python3` heredocs) for changing files: it reports the match count and line numbers, and fails loudly instead of silently editing the wrong place. Call it several times in one round to make several edits. `old_string` must be unique: include a few lines of surrounding context, or pass `replace_all`."
     }
 
     fn parameters(&self) -> Value {
@@ -496,43 +506,69 @@ impl Tool for EditTool {
             tool: self.name().into(),
             message: format!("failed to read {path}: {err}"),
         })?;
-        let count = count_subsequence(&bytes, old_string.as_bytes());
+        let offsets = match_offsets(&bytes, old_string.as_bytes());
+        let count = offsets.len();
 
         // Failures are data, not turn errors: each error names exactly what
-        // went wrong so the model can re-read the file and retry.
+        // went wrong *and where*, so the model can fix its `old_string` and
+        // retry instead of falling back to a shell command.
         if count == 0 {
-            return Err(ToolError::Failed {
-                tool: self.name().into(),
-                message: format!(
+            // A whitespace-insensitive second pass turns the dead end into
+            // a repair: name the line and show the file's own bytes there.
+            // It never applies a match — the literal rule still holds.
+            let message = match whitespace_insensitive_match(&bytes, old_string) {
+                Some((first, last, excerpt)) => format!(
+                    "not found: `old_string` occurs 0 times in {path}, but a whitespace-insensitive match is at {}. The file's text there is:\n\n{excerpt}\n\nUse that text exactly.",
+                    describe_line_span(first, last)
+                ),
+                None => format!(
                     "not found: `old_string` occurs 0 times in {path} (check the exact text, including whitespace)"
                 ),
+            };
+            return Err(ToolError::Failed {
+                tool: self.name().into(),
+                message,
             });
         }
         if count > 1 && !replace_all {
             return Err(ToolError::Failed {
                 tool: self.name().into(),
                 message: format!(
-                    "`old_string` occurs {count} times in {path}; provide more surrounding context to make it unique, or pass `replace_all: true`"
+                    "`old_string` occurs {count} times in {path} ({}); provide more surrounding context to make it unique, or pass `replace_all: true`",
+                    describe_lines(&match_line_starts(&bytes, &offsets))
                 ),
             });
         }
 
-        let (replaced, replacements) =
-            replace_subsequence(&bytes, old_string.as_bytes(), new_string.as_bytes());
-        debug_assert_eq!(
-            replacements, count,
-            "replacement count must match the match count"
+        let replaced = replace_at(
+            &bytes,
+            old_string.as_bytes(),
+            new_string.as_bytes(),
+            &offsets,
         );
+        // Where the replacements landed, in the *new* file — the state the
+        // model's next read or edit will see. Offsets shift as the new text
+        // changes length, so they are recomputed rather than reused.
+        let spans: Vec<(usize, usize)> = offsets
+            .iter()
+            .scan(0isize, |shift, &offset| {
+                let start = (offset as isize + *shift) as usize;
+                *shift += new_string.len() as isize - old_string.len() as isize;
+                Some(line_span(&replaced, start, new_string.len()))
+            })
+            .collect();
         std::fs::write(path, &replaced).map_err(|err| ToolError::Failed {
             tool: self.name().into(),
             message: format!("failed to write {path}: {err}"),
         })?;
 
         // A short confirmation: the count is how the model verifies it did
-        // what it intended. No file contents, no diff — the tool call in
-        // context already carries `old_string`/`new_string`.
+        // what it intended, and the line numbers are the one fact the
+        // conversation does not already carry (the call holds both
+        // strings). No file contents, no diff.
         Ok(ToolOutput::text(format!(
-            "Replaced {count} occurrence(s) in {path}"
+            "Replaced {count} occurrence(s) in {path} ({})",
+            describe_spans(&spans)
         )))
     }
 }
@@ -670,29 +706,203 @@ fn media_type_for(path: &str, bytes: &[u8]) -> std::result::Result<MediaType, St
     })
 }
 
-/// Count non-overlapping occurrences of `needle` in `haystack`.
-fn count_subsequence(haystack: &[u8], needle: &[u8]) -> usize {
-    replace_subsequence(haystack, needle, needle).1
-}
-
-/// Replace every occurrence of `needle` with `replacement`, returning the
-/// new bytes and the number of replacements.
-fn replace_subsequence(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>, usize) {
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut count = 0;
+/// Every non-overlapping occurrence of `needle` in `haystack`, as byte
+/// offsets, in ascending order. One scan serves both counting and locating:
+/// the edit path needs the offsets to report line numbers, and the count is
+/// just the length.
+fn match_offsets(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
     let mut index = 0;
     while index + needle.len() <= haystack.len() {
         if &haystack[index..index + needle.len()] == needle {
-            out.extend_from_slice(replacement);
+            offsets.push(index);
             index += needle.len();
-            count += 1;
         } else {
-            out.push(haystack[index]);
             index += 1;
         }
     }
-    out.extend_from_slice(&haystack[index..]);
-    (out, count)
+    offsets
+}
+
+/// Replace every occurrence of `needle` with `replacement`, returning the
+/// new bytes and the number of replacements. `offsets` is the scan the
+/// caller already ran ([`match_offsets`]) — passing it in keeps the match
+/// count and the replacement count from being computed twice from
+/// potentially different scans.
+fn replace_at(haystack: &[u8], needle: &[u8], replacement: &[u8], offsets: &[usize]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut previous = 0;
+    for &offset in offsets {
+        out.extend_from_slice(&haystack[previous..offset]);
+        out.extend_from_slice(replacement);
+        previous = offset + needle.len();
+    }
+    out.extend_from_slice(&haystack[previous..]);
+    out
+}
+
+/// 1-based line number of `offset` in `bytes`, counting `\n` as the
+/// separator (a trailing newline therefore does not open a new line).
+fn line_of(bytes: &[u8], offset: usize) -> usize {
+    1 + bytes[..offset.min(bytes.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+}
+
+/// The 1-based line range `start..end` of a replacement spans, in the file
+/// *after* the edit — the state the model's next read or edit will see.
+/// `new_len` is the replacement's length, so a deletion (`0`) collapses to
+/// the single line it removed text from.
+///
+/// The end is clamped to the last line that exists: deleting the final line
+/// leaves the offset at end-of-file, one past the last `\n`, and reporting
+/// a line the file no longer has would contradict "the state after the
+/// edit" — which is the whole point of reporting it.
+fn line_span(bytes: &[u8], start: usize, new_len: usize) -> (usize, usize) {
+    let first = line_of(bytes, start);
+    // The last line the new text occupies: the end offset is exclusive, so
+    // a replacement ending in a newline does not reach into the next line.
+    let end = start + new_len;
+    let last = if new_len == 0 {
+        first
+    } else {
+        line_of(bytes, end.saturating_sub(1))
+    };
+    let last_line = last_line_number(bytes);
+    (first.min(last_line), last.max(first).min(last_line))
+}
+
+/// The number of lines a file actually has: a trailing newline terminates
+/// the last line rather than opening an empty one, so `"a\nb\n"` is two
+/// lines and `"a\n"` is one. An empty file counts as one line (the line
+/// the first insertion lands on).
+fn last_line_number(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 1;
+    }
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+    if bytes.ends_with(b"\n") {
+        newlines.max(1)
+    } else {
+        newlines + 1
+    }
+}
+
+/// Render a *contiguous* line range: `line 42` for a single line,
+/// `lines 42-44` for a span. Used where one replacement covers several
+/// lines, and for a single location found by the whitespace diagnostic.
+fn describe_line_span(first: usize, last: usize) -> String {
+    if first == last {
+        format!("line {first}")
+    } else {
+        format!("lines {first}-{last}")
+    }
+}
+
+/// Render several *distinct* locations: `line 42`, `lines 42, 57, 88`, or a
+/// capped `lines 42, 57, 88, 101, 133 +7 more`. Never collapses adjacent
+/// numbers into a range — two separate matches on consecutive lines are two
+/// locations, not one span, and `lines 42-43` would read as a single
+/// contiguous region.
+fn describe_lines(lines: &[usize]) -> String {
+    const SHOWN: usize = 5;
+    match lines {
+        [] => String::new(),
+        [one] => format!("line {one}"),
+        many => {
+            let shown: Vec<String> = many.iter().take(SHOWN).map(usize::to_string).collect();
+            if many.len() > SHOWN {
+                format!("lines {} +{} more", shown.join(", "), many.len() - SHOWN)
+            } else {
+                format!("lines {}", shown.join(", "))
+            }
+        }
+    }
+}
+
+/// Where a set of replacements landed: one contiguous span for a single
+/// replacement, the start lines for several (`replace_all`).
+fn describe_spans(spans: &[(usize, usize)]) -> String {
+    match spans {
+        [] => String::new(),
+        [(first, last)] => describe_line_span(*first, *last),
+        many => {
+            // Several matches on one line are one location, not repeats.
+            let mut starts: Vec<usize> = many.iter().map(|(first, _)| *first).collect();
+            starts.dedup();
+            describe_lines(&starts)
+        }
+    }
+}
+
+/// Collapse every run of ASCII whitespace to a single space and trim the
+/// ends, recording for each output byte the offset it came from in the
+/// original. This is the whitespace-insensitive *diagnostic*: it finds
+/// where a slightly-misquoted `old_string` probably came from (tabs vs
+/// spaces, trailing whitespace, reflowed line breaks, CRLF) without ever
+/// being used to apply an edit.
+///
+/// Returns the normalized bytes and the parallel original offsets. The
+/// needle is normalized the same way by the caller, which must skip the
+/// search when the result is empty (a whitespace-only `old_string` would
+/// otherwise "match" at offset 0).
+fn normalize_whitespace(bytes: &[u8]) -> (Vec<u8>, Vec<usize>) {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut origins = Vec::with_capacity(bytes.len());
+    let mut pending_space: Option<usize> = None;
+    for (offset, &byte) in bytes.iter().enumerate() {
+        if byte.is_ascii_whitespace() {
+            // Defer the space: a run collapses to one, and a run at the
+            // very end is dropped (the trim).
+            pending_space.get_or_insert(offset);
+            continue;
+        }
+        if let Some(space) = pending_space.take()
+            && !normalized.is_empty()
+        {
+            normalized.push(b' ');
+            origins.push(space);
+        }
+        normalized.push(byte);
+        origins.push(offset);
+    }
+    (normalized, origins)
+}
+
+/// Where a whitespace-insensitive match of `old_string` sits in `bytes`,
+/// as `(first_line, last_line, excerpt)` — the diagnostic reported when the
+/// literal match fails. `None` when even ignoring whitespace there is no
+/// match, or when `old_string` is entirely whitespace (nothing to look for).
+///
+/// The excerpt is the file's own text for that region, which is the point:
+/// the model cannot reconstruct the right `old_string` from a line number
+/// without re-reading the file, and re-reading it with bash is exactly the
+/// habit this diagnostic exists to avoid.
+fn whitespace_insensitive_match(bytes: &[u8], old_string: &str) -> Option<(usize, usize, String)> {
+    let (needle, _) = normalize_whitespace(old_string.as_bytes());
+    if needle.is_empty() {
+        return None;
+    }
+    let (haystack, origins) = normalize_whitespace(bytes);
+    let offset = match_offsets(&haystack, &needle).first().copied()?;
+    // Map the normalized match back to the original bytes: from the origin
+    // of the first needle byte through the end of the last one.
+    let start = origins[offset];
+    let end = origins[offset + needle.len() - 1] + 1;
+    let (first, last) = line_span(bytes, start, end - start);
+    Some((
+        first,
+        last,
+        String::from_utf8_lossy(&bytes[start..end]).to_string(),
+    ))
+}
+
+/// The line ranges every match of `old_string` starts on, in file order —
+/// what a multiple-match failure reports so the model can see the spread it
+/// needs to disambiguate.
+fn match_line_starts(bytes: &[u8], offsets: &[usize]) -> Vec<usize> {
+    offsets.iter().map(|&o| line_of(bytes, o)).collect()
 }
 
 /// How long the reader joins may wait past a missed deadline before
@@ -1444,7 +1654,10 @@ mod tests {
             "new_string": "TWO"
         }))
         .unwrap();
-        assert_eq!(result, format!("Replaced 1 occurrence(s) in {path}"));
+        assert_eq!(
+            result,
+            format!("Replaced 1 occurrence(s) in {path} (line 2)")
+        );
         assert_eq!(read(&path), "one\nTWO\nthree\n");
     }
 
@@ -1488,7 +1701,10 @@ mod tests {
             "replace_all": true
         }))
         .unwrap();
-        assert_eq!(result, format!("Replaced 2 occurrence(s) in {path}"));
+        assert_eq!(
+            result,
+            format!("Replaced 2 occurrence(s) in {path} (line 1)")
+        );
         assert_eq!(read(&path), "x b x\n");
     }
 
@@ -1599,7 +1815,12 @@ mod tests {
             "replace_all": true
         }))
         .unwrap();
-        assert_eq!(result, format!("Replaced 2 occurrence(s) in {path}"));
+        // Lines are in the file *after* the edit: the first block collapsed
+        // three lines into one, so the second lands on line 2, not 4.
+        assert_eq!(
+            result,
+            format!("Replaced 2 occurrence(s) in {path} (lines 1, 2)")
+        );
         assert_eq!(read(&path), "block\nblock\n");
 
         // Adjacent occurrences are found: "xx" in "xxxx" is 2 replacements.
@@ -1611,8 +1832,239 @@ mod tests {
             "replace_all": true
         }))
         .unwrap();
-        assert_eq!(result, format!("Replaced 2 occurrence(s) in {path}"));
+        assert_eq!(
+            result,
+            format!("Replaced 2 occurrence(s) in {path} (line 1)")
+        );
         assert_eq!(read(&path), "yy\n");
+    }
+
+    #[test]
+    fn edit_reports_the_line_span_it_changed() {
+        // A single line.
+        let path = scratch("span1.txt", "one\ntwo\nthree\n");
+        let result = edit(json!({
+            "path": path,
+            "old_string": "two",
+            "new_string": "TWO"
+        }))
+        .unwrap();
+        assert_eq!(
+            result,
+            format!("Replaced 1 occurrence(s) in {path} (line 2)")
+        );
+
+        // A span: the replacement is reported where it now sits.
+        let path = scratch("span2.txt", "alpha\nbeta\ngamma\ndelta\n");
+        let result = edit(json!({
+            "path": path,
+            "old_string": "beta\ngamma",
+            "new_string": "BETA\nGAMMA\nEXTRA"
+        }))
+        .unwrap();
+        assert_eq!(
+            result,
+            format!("Replaced 1 occurrence(s) in {path} (lines 2-4)")
+        );
+
+        // A deletion is a zero-width range: the line it emptied.
+        let path = scratch("span3.txt", "keep\ndrop\nkeep2\n");
+        let result = edit(json!({
+            "path": path,
+            "old_string": "drop\n",
+            "new_string": ""
+        }))
+        .unwrap();
+        assert_eq!(
+            result,
+            format!("Replaced 1 occurrence(s) in {path} (line 2)")
+        );
+        assert_eq!(read(&path), "keep\nkeep2\n");
+    }
+
+    #[test]
+    fn edit_replace_all_lists_distinct_start_lines() {
+        let path = scratch("all-lines.txt", "a\nb\na\nc\na\n");
+        let result = edit(json!({
+            "path": path,
+            "old_string": "a",
+            "new_string": "x",
+            "replace_all": true
+        }))
+        .unwrap();
+        assert_eq!(
+            result,
+            format!("Replaced 3 occurrence(s) in {path} (lines 1, 3, 5)")
+        );
+
+        // Several matches on one line are one location, not repeats.
+        let path = scratch("all-same-line.txt", "xx xx xx\n");
+        let result = edit(json!({
+            "path": path,
+            "old_string": "xx",
+            "new_string": "y",
+            "replace_all": true
+        }))
+        .unwrap();
+        assert_eq!(
+            result,
+            format!("Replaced 3 occurrence(s) in {path} (line 1)")
+        );
+    }
+
+    #[test]
+    fn edit_multiple_matches_names_their_lines() {
+        let path = scratch("multi-lines.txt", "a\nb\na\nc\na\n");
+        let err = edit(json!({
+            "path": path,
+            "old_string": "a",
+            "new_string": "x"
+        }))
+        .unwrap_err();
+        let ToolError::Failed { message, .. } = &err else {
+            panic!("expected a failed tool error, got {err:?}");
+        };
+        assert!(message.contains("occurs 3 times"), "{message}");
+        assert!(message.contains("lines 1, 3, 5"), "{message}");
+    }
+
+    #[test]
+    fn edit_zero_matches_shows_the_file_text_when_only_whitespace_differs() {
+        // Tabs in the file, spaces in the needle: the literal match fails,
+        // and the diagnostic shows the file's own bytes at the line.
+        let path = scratch("ws-miss.txt", "fn main() {\n\tlet x = 1;\n}\n");
+        let err = edit(json!({
+            "path": path,
+            "old_string": "fn main() {\n    let x = 1;\n}",
+            "new_string": "fn main() {}"
+        }))
+        .unwrap_err();
+        let ToolError::Failed { message, .. } = &err else {
+            panic!("expected a failed tool error, got {err:?}");
+        };
+        assert!(message.contains("occurs 0 times"), "{message}");
+        assert!(
+            message.contains("whitespace-insensitive match is at lines 1-3"),
+            "{message}"
+        );
+        // The excerpt is the file's text, tab included, not the needle's.
+        assert!(message.contains("\tlet x = 1;"), "{message}");
+        assert!(message.contains("Use that text exactly"), "{message}");
+
+        // The edit really did not happen.
+        assert_eq!(read(&path), "fn main() {\n\tlet x = 1;\n}\n");
+    }
+
+    #[test]
+    fn edit_whitespace_diagnostic_covers_trailing_whitespace_and_crlf() {
+        // Trailing whitespace the model did not reproduce.
+        let path = scratch("ws-trail.txt", "line1\nline2   \nline3\n");
+        let err = edit(json!({
+            "path": path,
+            "old_string": "line2\nline3",
+            "new_string": "x"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Failed { message, .. }
+                if message.contains("whitespace-insensitive match is at lines 2-3")),
+            "{err}"
+        );
+
+        // CRLF line endings.
+        let path = scratch("ws-crlf.txt", "one\r\ntwo\r\nthree\r\n");
+        let err = edit(json!({
+            "path": path,
+            "old_string": "two\nthree",
+            "new_string": "x"
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Failed { message, .. }
+                if message.contains("whitespace-insensitive match is at lines 2-3")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn edit_zero_matches_without_a_near_miss_keeps_the_plain_message() {
+        let path = scratch("ws-none.txt", "one\ntwo\n");
+        let err = edit(json!({
+            "path": path,
+            "old_string": "zzz",
+            "new_string": "x"
+        }))
+        .unwrap_err();
+        let ToolError::Failed { message, .. } = &err else {
+            panic!("expected a failed tool error, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            &format!(
+                "not found: `old_string` occurs 0 times in {path} (check the exact text, including whitespace)"
+            )
+        );
+    }
+
+    #[test]
+    fn edit_whitespace_only_old_string_does_not_produce_a_bogus_match() {
+        // A whitespace-only needle normalizes to nothing; the diagnostic
+        // must not "find" it at offset 0.
+        let path = scratch("ws-only.txt", "a\n\n\nb\n");
+        let err = edit(json!({
+            "path": path,
+            "old_string": "   ",
+            "new_string": "x"
+        }))
+        .unwrap_err();
+        let ToolError::Failed { message, .. } = &err else {
+            panic!("expected a failed tool error, got {err:?}");
+        };
+        assert!(!message.contains("whitespace-insensitive"), "{message}");
+        assert_eq!(read(&path), "a\n\n\nb\n");
+    }
+
+    #[test]
+    fn line_helpers_count_from_one_and_handle_edges() {
+        let bytes = b"a\nb\nc\n";
+        assert_eq!(line_of(bytes, 0), 1);
+        assert_eq!(line_of(bytes, 2), 2);
+        assert_eq!(line_of(bytes, 4), 3);
+        // Past the end clamps rather than panicking.
+        assert_eq!(line_of(bytes, 99), 4);
+
+        // A span stays on one line when it does not reach the newline.
+        assert_eq!(line_span(b"abc\ndef\n", 0, 3), (1, 1));
+        // Ending exactly at a newline does not reach the next line.
+        assert_eq!(line_span(b"abc\ndef\n", 0, 4), (1, 1));
+        // A zero-length replacement is the line it emptied.
+        assert_eq!(line_span(b"abc\ndef\n", 4, 0), (2, 2));
+        // Deleting the final line leaves the offset at end-of-file; the
+        // span clamps to the lines that still exist ("a\n" is one line).
+        assert_eq!(line_span(b"a\n", 2, 0), (1, 1));
+        assert_eq!(line_span(b"a", 1, 0), (1, 1));
+
+        assert_eq!(last_line_number(b""), 1);
+        assert_eq!(last_line_number(b"a"), 1);
+        assert_eq!(last_line_number(b"a\n"), 1);
+        assert_eq!(last_line_number(b"a\nb"), 2);
+        assert_eq!(last_line_number(b"a\nb\n"), 2);
+        assert_eq!(last_line_number(b"a\nb\n\n"), 3);
+    }
+
+    #[test]
+    fn describe_helpers_format_ranges_and_capped_lists() {
+        assert_eq!(describe_line_span(42, 42), "line 42");
+        assert_eq!(describe_line_span(42, 44), "lines 42-44");
+        assert_eq!(describe_lines(&[]), "");
+        assert_eq!(describe_lines(&[42]), "line 42");
+        // Distinct locations never collapse into a range, even adjacent.
+        assert_eq!(describe_lines(&[42, 43]), "lines 42, 43");
+        assert_eq!(describe_lines(&[42, 57, 88]), "lines 42, 57, 88");
+        assert_eq!(
+            describe_lines(&[1, 2, 3, 4, 5, 6, 7]),
+            "lines 1, 2, 3, 4, 5 +2 more"
+        );
     }
 
     // ---- view-image tool ----

@@ -40,7 +40,7 @@
           }
         },
         {
-          "description": "Replace a literal substring in a file (byte-for-byte, no patterns). Fails on zero matches; fails on multiple matches unless `replace_all` is set.",
+          "description": "Edit an existing file by replacing an exact substring (byte-for-byte, no patterns). Prefer this over shell commands (`sed -i`, `python3` heredocs) for changing files: it reports the match count and line numbers, and fails loudly instead of silently editing the wrong place. Call it several times in one round to make several edits. `old_string` must be unique: include a few lines of surrounding context, or pass `replace_all`.",
           "name": "edit",
           "parameters": {
             "properties": {
@@ -150,7 +150,7 @@
           }
         },
         {
-          "description": "Replace a literal substring in a file (byte-for-byte, no patterns). Fails on zero matches; fails on multiple matches unless `replace_all` is set.",
+          "description": "Edit an existing file by replacing an exact substring (byte-for-byte, no patterns). Prefer this over shell commands (`sed -i`, `python3` heredocs) for changing files: it reports the match count and line numbers, and fails loudly instead of silently editing the wrong place. Call it several times in one round to make several edits. `old_string` must be unique: include a few lines of surrounding context, or pass `replace_all`.",
           "name": "edit",
           "parameters": {
             "properties": {
