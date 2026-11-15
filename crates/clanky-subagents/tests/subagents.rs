@@ -13,12 +13,20 @@ instr=$(eval "printf '%s' \"\${$#}\"")
 case "$instr" in
   *sleep*) sleep 4 ;;
   *fail*) exit 3 ;;
+  # A job killed from outside (the user's `kill`, the OOM killer): the
+  # child dies by signal, so there is no exit code to report.
+  *selfterm*) kill -TERM $$ ;;
+  *selfkill9*) kill -KILL $$ ;;
   *stderr*) echo "stub stderr" >&2 ;;
   *big*) head -c 2097152 /dev/zero | tr '\0' 'x' ;;
   # A grandchild that daemonizes out of the job's process group (setsid)
   # and holds the stdout pipe: no process-group kill can reach it, so only
   # a *bounded* capture join keeps the job from running to its 60s.
   *pipeholder*) setsid sh -c 'sleep 60' & echo "started"; wait ;;
+  # A helper left behind in the job's own group that holds the pipes: the
+  # job is finished, but the pipes are not closed, so an unbounded capture
+  # join would hang the batch on a job that already exited.
+  *leavehelper*) sleep 60 & echo "left a helper"; exit 0 ;;
 esac
 "#;
 
@@ -308,4 +316,99 @@ fn timeout_is_not_extended_by_a_pipe_holding_grandchild() {
         elapsed < std::time::Duration::from_secs(20),
         "job ran past its timeout: {elapsed:?}"
     );
+}
+
+#[test]
+fn signal_killed_job_reports_a_nonzero_exit_and_the_signal() {
+    // The reported bug: a job killed from outside (`kill`, the OOM killer,
+    // a crashed plugin) dies *by signal*, so `ExitStatus::code()` is None.
+    // It used to be reported as no `exit` field at all, which reads as "the
+    // job is still running" and, worse, `exit != 0` checks silently passed.
+    // It must instead read as a failure, with the reason named.
+    let bin = setup();
+    let out = run(
+        &bin,
+        r#"{"jobs":[
+            {"id":"term","instruction":"selfterm now"},
+            {"id":"kill9","instruction":"selfkill9 now"},
+            {"id":"ok","instruction":"plain job"}
+        ]}"#,
+    );
+    assert!(out.status.success(), "the batch still ran");
+    let v = jobs_of(&out);
+    // 128+N is the shell convention, so any `exit != 0` test sees a failure.
+    assert_eq!(v["jobs"][0]["exit"], serde_json::json!(143), "{}", v);
+    assert_eq!(v["jobs"][1]["exit"], serde_json::json!(137), "{}", v);
+    // The reason is spelled out, not left to be decoded from the number.
+    assert_eq!(
+        v["jobs"][0]["stderr"].as_str().unwrap(),
+        "killed by signal 15 (Term)"
+    );
+    assert_eq!(
+        v["jobs"][1]["stderr"].as_str().unwrap(),
+        "killed by signal 9 (Kill)"
+    );
+    // Partial output survives, and the ordinary jobs are untouched.
+    assert!(
+        v["jobs"][0]["stdout"].as_str().unwrap().contains("ARG -pq"),
+        "{}",
+        v["jobs"][0]
+    );
+    assert_eq!(v["jobs"][2]["exit"], serde_json::json!(0));
+    assert_eq!(v["jobs"][2]["stderr"].as_str().unwrap(), "");
+}
+
+#[test]
+fn normal_exit_codes_are_unaffected_by_signal_handling() {
+    // The counterpart guard: keeping the reaped status (rather than asking
+    // a second time) must not disturb the ordinary paths.
+    let bin = setup();
+    let out = run(
+        &bin,
+        r#"{"jobs":[
+            {"id":"ok","instruction":"plain"},
+            {"id":"bad","instruction":"fail here"}
+        ]}"#,
+    );
+    let v = jobs_of(&out);
+    assert_eq!(v["jobs"][0]["exit"], serde_json::json!(0));
+    assert_eq!(v["jobs"][1]["exit"], serde_json::json!(3));
+    for j in v["jobs"].as_array().unwrap() {
+        assert!(
+            j.get("error").is_none(),
+            "no error field on a clean exit: {j}"
+        );
+    }
+}
+
+#[test]
+fn a_helper_holding_the_pipes_does_not_hang_a_finished_job() {
+    // The companion to the timeout case: the job *exits* (here cleanly, and
+    // in the reported bug by signal) while a child it spawned still holds
+    // the capture pipes. The join used to be unbounded off the timeout path,
+    // so the whole batch hung on a job that had already finished. The
+    // readers now wait out a grace and the group is signalled, so the batch
+    // returns — with the output, since the helper is in the job's group.
+    let bin = setup();
+    let input = r#"{"jobs":[
+        {"id":"a","instruction":"leavehelper now"},
+        {"id":"b","instruction":"plain job"}
+    ]}"#;
+    let start = std::time::Instant::now();
+    let out = run(&bin, input);
+    let elapsed = start.elapsed();
+    assert!(out.status.success());
+    // 5s grace + 0.5s TERM flush + slack; the hang was unbounded (60s here).
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the batch hung on a finished job: {elapsed:?}"
+    );
+    let v = jobs_of(&out);
+    assert_eq!(v["jobs"][0]["exit"], serde_json::json!(0));
+    // The helper was in the job's group, so the grace-expiry TERM closes the
+    // pipes and the bytes are kept, not discarded.
+    let stdout = v["jobs"][0]["stdout"].as_str().unwrap();
+    assert!(stdout.contains("left a helper"), "{stdout}");
+    assert_eq!(v["jobs"][0]["stderr"].as_str().unwrap(), "");
+    assert_eq!(v["jobs"][1]["exit"], serde_json::json!(0));
 }

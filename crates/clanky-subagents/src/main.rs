@@ -148,56 +148,115 @@ fn capture_tail<R: Read>(mut reader: R) -> std::io::Result<String> {
     })
 }
 
-/// How long a timed-out job's capture threads may take to hit EOF before
-/// the run moves on (what arrived is kept; stragglers are detached).
+/// How long a job's capture threads may wait for EOF after the job's process
+/// exited before the run moves on. Applies to *every* exit path, not just the
+/// timeout path: the direct child exiting does not close the pipes — a
+/// backgrounded helper it left behind still holds them — so an unbounded join
+/// would wedge the whole batch on a job that has already finished (or been
+/// killed).
 const JOIN_GRACE: Duration = Duration::from_secs(5);
 
-/// Join capture threads, but never past `grace` *in total*: a pipe-holding
-/// grandchild that survived the group kill would otherwise wedge the job
-/// past `timeout_secs` forever. On grace expiry the unfinished threads are
-/// detached (their captured bytes are lost, the run carries on).
-/// `Duration::MAX` means "join unconditionally" (the no-timeout path, where
-/// a lingering writer is the job's own doing and still worth waiting for).
+/// How long the readers may take to observe EOF after a pipe-holding group
+/// was sent TERM, before it is escalated to KILL.
+#[cfg(unix)]
+const TERM_FLUSH: Duration = Duration::from_millis(500);
+
+/// How long the readers may take to observe EOF once the group was sent
+/// KILL, before the run moves on and their bytes are lost.
+#[cfg(unix)]
+const KILL_FLUSH: Duration = Duration::from_secs(1);
+
+/// Join the capture threads, but never past `grace` *in total*: a writer that
+/// outlived the job — a backgrounded or `setsid`'d helper holding a pipe —
+/// would otherwise wedge the job forever, timeout or no timeout.
+///
+/// On grace expiry the group is signalled (TERM, then KILL, the same
+/// escalation the bash tool uses) and the readers get a short
+/// [`KILL_FLUSH`] to hit EOF, so what they captured lands in the result
+/// instead of being discarded. Only a writer that escaped the group entirely
+/// is left detached, and then the result says so rather than reporting an
+/// empty stream.
 fn join_captures_bounded(
     handles: [thread::JoinHandle<std::io::Result<String>>; 2],
+    pgid: u32,
     grace: Duration,
 ) -> [(String, Option<String>); 2] {
-    // One deadline for both streams: a shared budget, so a grandchild
-    // holding *both* pipes costs one grace period, not two.
-    let deadline = (grace != Duration::MAX).then(|| Instant::now() + grace);
-    let mut out = Vec::with_capacity(2);
-    for (stream, handle) in ["stdout", "stderr"].into_iter().zip(handles) {
-        if let Some(deadline) = deadline {
-            while Instant::now() < deadline && !handle.is_finished() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            if !handle.is_finished() {
-                // A straggler was detached: what it held is lost, and the
-                // job result says so rather than reporting an empty stream.
-                out.push((
-                    String::new(),
-                    Some(format!("capture {stream}: timed out waiting for EOF")),
-                ));
-                continue;
+    // One deadline for both streams: a shared budget, so a helper holding
+    // *both* pipes costs one grace period, not two.
+    let deadline = Instant::now() + grace;
+    let mut pending: Vec<(usize, thread::JoinHandle<std::io::Result<String>>)> =
+        handles.into_iter().enumerate().collect();
+    let mut joined: [Option<std::io::Result<String>>; 2] = [None, None];
+    wait_for_readers(&mut pending, &mut joined, deadline);
+    if !pending.is_empty() {
+        // Last resort: the job is gone but something it spawned still holds
+        // the pipes, so close them for it — TERM first, then KILL, so a
+        // helper that still has output to flush gets to write it. The probe
+        // inside `killpg_if_alive` keeps a fully-reaped group from being
+        // signalled; a writer that escaped the group entirely (its own
+        // `setsid`) survives, and its stream is reported as lost below
+        // rather than as empty.
+        #[cfg(unix)]
+        {
+            use rustix::process::Signal;
+            let _ = killpg_if_alive(pgid, Signal::Term);
+            wait_for_readers(&mut pending, &mut joined, Instant::now() + TERM_FLUSH);
+            if !pending.is_empty() {
+                let _ = killpg_if_alive(pgid, Signal::Kill);
             }
         }
-        match handle.join() {
-            // The thread read to EOF: its bytes, no error.
-            Ok(Ok(s)) => out.push((s, None)),
-            // A read error or a panicked thread: say which stream failed
-            // (the other stream's bytes are still reported).
-            Ok(Err(e)) => out.push((String::new(), Some(format!("capture {stream}: {e}")))),
-            Err(_) => out.push((
-                String::new(),
-                Some(format!("capture {stream}: reader thread panicked")),
-            )),
-        }
+        wait_for_readers(&mut pending, &mut joined, Instant::now() + KILL_FLUSH);
     }
-    let mut it = out.into_iter();
-    [
-        it.next().expect("two streams"),
-        it.next().expect("two streams"),
-    ]
+    std::array::from_fn(|i| match joined[i].take() {
+        // The thread read to EOF: its bytes, no error.
+        Some(Ok(s)) => (s, None),
+        // A read error or a panicked thread: say which stream failed (the
+        // other stream's bytes are still reported).
+        Some(Err(e)) => (String::new(), Some(format!("capture {}: {e}", STREAMS[i]))),
+        // Still blocked at the end of the grace: the reader is detached and
+        // what it held is lost, which the result says rather than showing
+        // the stream as legitimately empty.
+        None => (
+            String::new(),
+            Some(format!(
+                "capture {}: timed out waiting for EOF (a child of the job is still holding it)",
+                STREAMS[i]
+            )),
+        ),
+    })
+}
+
+/// The stream names, in the order [`join_captures_bounded`] takes them.
+const STREAMS: [&str; 2] = ["stdout", "stderr"];
+
+/// Join every reader that finished before `deadline`, moving its result into
+/// `joined`; whatever is still blocked at the deadline is left in `pending`.
+fn wait_for_readers(
+    pending: &mut Vec<(usize, thread::JoinHandle<std::io::Result<String>>)>,
+    joined: &mut [Option<std::io::Result<String>>; 2],
+    deadline: Instant,
+) {
+    loop {
+        // Take out the readers that finished: `join` on a finished thread
+        // cannot block, and removing it keeps `pending` for the stragglers.
+        let mut i = 0;
+        while i < pending.len() {
+            if pending[i].1.is_finished() {
+                let (index, handle) = pending.swap_remove(i);
+                joined[index] = Some(
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(std::io::Error::other("reader thread panicked"))),
+                );
+            } else {
+                i += 1;
+            }
+        }
+        if pending.is_empty() || Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Kill a process group, guarding against pid recycling: probe the group
@@ -210,9 +269,9 @@ fn join_captures_bounded(
 /// `--`), no dependence on which `kill` a user has, and `unsafe` stays
 /// inside rustix where the workspace lint cannot see it.
 #[cfg(unix)]
-fn killpg_if_alive(pgid: u32) -> std::io::Result<()> {
+fn killpg_if_alive(pgid: u32, signal: rustix::process::Signal) -> std::io::Result<()> {
     use rustix::io::Errno;
-    use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+    use rustix::process::{Pid, kill_process_group, test_kill_process_group};
 
     // A pgid is a positive pid; `0` would mean "my own process group", which
     // must never be signalled by accident.
@@ -225,14 +284,64 @@ fn killpg_if_alive(pgid: u32) -> std::io::Result<()> {
         Ok(()) => {}
         Err(e) => return Err(std::io::Error::from_raw_os_error(e.raw_os_error())),
     }
-    kill_process_group(pgid, Signal::Term)
+    kill_process_group(pgid, signal)
         .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
 enum WaitOutcome {
-    Done,
+    /// The child exited; its status is carried from the wait that reaped it
+    /// (see [`exit_fields`] for why it must not be re-asked for later).
+    Done(std::process::ExitStatus),
     TimedOut,
     WaitFailed(std::io::Error),
+}
+
+/// The job's exit information: `(exit, note)`.
+///
+/// A job that exits normally reports its code. A job killed by a signal —
+/// the user's `kill`, the OOM killer, a crashed plugin — has *no* exit
+/// code: `ExitStatus::code()` is `None`, and omitting the field would read
+/// as "the job is still running" (and let an `exit != 0` check pass). So
+/// the signal stands in for the code: `exit` becomes `128+N` (the shell
+/// convention, so a SIGKILLed job reads as 137) and the returned note says
+/// which signal it was, so the *reason* is not left to be decoded from a
+/// number. The note is a diagnostic and joins the job's `stderr`; `error`
+/// stays reserved for "the job produced no result at all".
+#[cfg(unix)]
+fn exit_fields(status: std::process::ExitStatus) -> (Option<i32>, Option<String>) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    if let Some(code) = status.code() {
+        return (Some(code), None);
+    }
+    match status.signal() {
+        Some(sig) => {
+            let name = rustix::process::Signal::from_raw(sig)
+                .map(|s| format!(" ({s:?})"))
+                .unwrap_or_default();
+            (
+                Some(128 + sig),
+                Some(format!("killed by signal {sig}{name}")),
+            )
+        }
+        // Neither a code nor a signal: not reachable on Unix, but the honest
+        // answer beats inventing a 0.
+        None => (
+            None,
+            Some(format!("exited without an exit code: {status:?}")),
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn exit_fields(status: std::process::ExitStatus) -> (Option<i32>, Option<String>) {
+    (
+        status.code(),
+        status
+            .code()
+            .is_none()
+            .then(|| format!("exited without an exit code: {status:?}")),
+    )
 }
 
 fn run_job(job: &Job, defaults: &Options, timeout: Option<Duration>) -> JobResult {
@@ -278,19 +387,18 @@ fn run_job(job: &Job, defaults: &Options, timeout: Option<Duration>) -> JobResul
     let out_handle = thread::spawn(move || capture_tail(out_pipe));
     let err_handle = thread::spawn(move || capture_tail(err_pipe));
 
+    // The status the wait reaped is kept, never re-asked for: a second
+    // `child.wait()` after a successful one has no child left to report on.
     let wait_outcome = match timeout {
         Some(t) => match child.wait_timeout(t) {
-            Ok(Some(_)) => WaitOutcome::Done,
+            Ok(Some(status)) => WaitOutcome::Done(status),
             Ok(None) => WaitOutcome::TimedOut,
             Err(e) => WaitOutcome::WaitFailed(e),
         },
-        None => {
-            if child.wait().is_err() {
-                WaitOutcome::WaitFailed(std::io::Error::other("wait failed"))
-            } else {
-                WaitOutcome::Done
-            }
-        }
+        None => match child.wait() {
+            Ok(status) => WaitOutcome::Done(status),
+            Err(e) => WaitOutcome::WaitFailed(e),
+        },
     };
     if let WaitOutcome::WaitFailed(e) = wait_outcome {
         return JobResult {
@@ -313,25 +421,33 @@ fn run_job(job: &Job, defaults: &Options, timeout: Option<Duration>) -> JobResul
         #[cfg(unix)]
         {
             let pgid = child.id();
-            if let Err(e) = killpg_if_alive(pgid) {
+            if let Err(e) = killpg_if_alive(pgid, rustix::process::Signal::Term) {
                 kill_note = Some(format!("process-group kill: {e}"));
             }
         }
         let _ = child.kill();
         let _ = child.wait();
     }
-    // The joins are bounded even on the failure path: if the group kill
-    // did not reach a pipe-holding grandchild, an unbounded `join` would
-    // run this job past `timeout_secs` forever. Collect what arrived in
-    // the grace window and detach the stragglers.
-    let [(stdout, stdout_err), (stderr, stderr_err)] = join_captures_bounded(
-        [out_handle, err_handle],
-        if timed_out { JOIN_GRACE } else { Duration::MAX },
-    );
-    // Capture failures and a failed group kill are diagnostics, not data:
-    // they belong on stderr, after whatever the plugin itself wrote.
+    // The joins are bounded on every path: the direct child exiting does not
+    // mean the pipes are closed — a backgrounded helper it left behind still
+    // holds them — so an unbounded `join` would hang the whole batch on a job
+    // that has already finished (or been killed). The usual case costs
+    // nothing (the readers hit EOF at once); only a genuine straggler waits
+    // out the grace, and then the group is signalled to unblock it.
+    let [(stdout, stdout_err), (stderr, stderr_err)] =
+        join_captures_bounded([out_handle, err_handle], child.id(), JOIN_GRACE);
+    // Capture failures, a failed group kill, and a signal death are
+    // diagnostics, not data: they are appended to stderr, after whatever the
+    // plugin itself wrote and in the order the job hit them.
     let mut stderr_note = stderr;
-    for note in [stdout_err, stderr_err, kill_note].into_iter().flatten() {
+    let exit_note = match wait_outcome {
+        WaitOutcome::Done(status) => exit_fields(status).1,
+        _ => None,
+    };
+    for note in [stdout_err, stderr_err, kill_note, exit_note]
+        .into_iter()
+        .flatten()
+    {
         if !stderr_note.is_empty() && !stderr_note.ends_with('\n') {
             stderr_note.push('\n');
         }
@@ -351,7 +467,10 @@ fn run_job(job: &Job, defaults: &Options, timeout: Option<Duration>) -> JobResul
         };
     }
 
-    let exit = child.wait().ok().and_then(|s| s.code());
+    let WaitOutcome::Done(status) = wait_outcome else {
+        unreachable!("the timeout and wait-failure paths returned above")
+    };
+    let (exit, _) = exit_fields(status);
     JobResult {
         id: job.id.clone(),
         exit,
@@ -456,7 +575,7 @@ mod tests {
         let stale_pgid = child.id();
         child.wait().expect("reap the group leader");
         assert!(
-            killpg_if_alive(stale_pgid).is_ok(),
+            killpg_if_alive(stale_pgid, rustix::process::Signal::Term).is_ok(),
             "a gone group is a no-op, not an error"
         );
     }
@@ -471,7 +590,7 @@ mod tests {
             .spawn()
             .expect("spawn `sleep` in its own group");
         let pgid = child.id();
-        killpg_if_alive(pgid).expect("live group is signalled");
+        killpg_if_alive(pgid, rustix::process::Signal::Term).expect("live group is signalled");
         let status = child.wait().expect("wait for the signalled child");
         assert_eq!(
             status.signal(),

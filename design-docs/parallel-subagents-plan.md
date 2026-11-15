@@ -96,6 +96,10 @@ abnormal completion):
 - spawn failure: `{ "id": ..., "error": "spawn: <message>" }`
 - timeout: `{ "id": ..., "error": "timeout after <n>s", "stdout": "...", "stderr": "..." }`
   (partial output is still returned — it's the only evidence of what happened)
+- killed by a signal: `{ "id": ..., "exit": 128+N, "stdout": "...", "stderr":
+  "...killed by signal N (Name)" }` — a signalled child has no exit code of
+  its own, so `128 + N` stands in for it (the shell convention) rather than
+  leaving `exit` absent, which would read as "still running".
 
 ## Design decisions
 
@@ -200,7 +204,9 @@ bash-tool invocation path doesn't need it. Ship the binary name
 | Job fails to spawn | job entry with `"error": "spawn: ..."` |
 | Job times out (if `timeout_secs` set) | job entry with `"error": "timeout ..."`, partial output kept |
 | Stream exceeds cap | tail-kept with truncation marker |
+| Job leaves a pipe-holding child behind | capture joins bounded by a grace, then the job's group is signalled (TERM, then KILL); output kept if the group is reachable, otherwise the stream is reported as lost |
 | Job exits nonzero | reported as `"exit": N` with its output |
+| Job killed by a signal | reported as `"exit": 128+N` (shell convention) with the signal named on `stderr`, e.g. `killed by signal 15 (Term)` |
 
 ## Testing strategy
 

@@ -65,7 +65,10 @@ The tool result is one JSON object, jobs in **input order**:
 
 - The subagent's answer is in `stdout`. `stderr` holds activity/errors.
 - `exit` is the subagent's own exit code; nonzero there means the job itself
-  reported failure — read its `stdout`/`stderr` for why. The runner exits 0
+  reported failure — read its `stdout`/`stderr` for why. A job killed by a
+  signal (your `kill`, the OOM killer) reports `128 + N` — `137` for
+  SIGKILL, `143` for SIGTERM — and `stderr` names the signal, so a killed
+  job is always visible as a failure. The runner exits 0
   whenever it ran the batch, so a plain zero exit on your bash call does
   **not** mean all jobs succeeded: check each `exit`.
 - A timed-out or unspawnable job has an `error` field instead of `exit`

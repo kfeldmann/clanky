@@ -828,6 +828,13 @@ Output: one JSON object on stdout, jobs in **input order**:
 }
 ```
 
+`exit` is the job's own exit code. A job that was **killed by a signal** —
+your `kill`, the OOM killer, a crashed provider plugin — has no exit code of
+its own, so it reports `128 + N` (the shell convention: `137` for SIGKILL,
+`143` for SIGTERM) and the signal is named in that job's `stderr`, e.g.
+`killed by signal 15 (Term)`. A signal death therefore always reads as a
+failure, never as a missing or zero `exit`.
+
 Each stream is kept up to 1 MiB (the tail, with a truncation marker). The
 runner itself exits 0 whenever it ran the batch — per-job failures are in
 the JSON — and nonzero only for bad input (malformed JSON, empty `jobs`,

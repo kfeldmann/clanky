@@ -554,6 +554,29 @@ real tenant.
      subagents"). Shipped with `contrib/skills/parallel-subagents/SKILL.md`,
      an agent-facing skill (when to fan out, how to call the runner, how to
      read the result) for users to copy into a skills scope.
+   - Fix (signal deaths reported as no `exit`): `run_job` called
+     `child.wait()` a second time *after* the wait that reaped the child, so
+     the status it read back was an error and the code came out `None`. A job
+     the user kills (or the OOM killer, or a crashed plugin) therefore
+     reported no `exit` field at all — indistinguishable from "still
+     running", and an `exit != 0` check passed on it. The wait's
+     `ExitStatus` is now carried in `WaitOutcome::Done` and reported once.
+     Since a signalled child has no exit code, `exit_fields` maps it to
+     `128 + N` (shell convention: 137 for SIGKILL, 143 for SIGTERM) and
+     appends `killed by signal N (Name)` to that job's `stderr` — the number
+     reads as failure, the note says why.
+   - Fix (a finished job could hang the batch): the capture joins were
+     unbounded off the timeout path (`Duration::MAX`), on the assumption that
+     a lingering writer was the job's own doing. But the direct child exiting
+     does not close the pipes — a helper it left behind (`sleep 60 &`) holds
+     them — so a job that had already finished, or been killed, could wedge
+     the whole batch forever (reproduced with a killed job: the runner never
+     printed results). `join_captures_bounded` now applies a shared grace on
+     every path, then signals the job's group (TERM, then KILL after a short
+     flush) so the readers hit EOF and their bytes are kept; only a writer
+     that escaped the group (`setsid`) is detached, and its stream is then
+     reported as lost rather than as empty. Mirrors the bash tool's
+     `join_with_deadline`.
 
 ## ✔ M14 — Unified sessions: print mode records, `--no-session`, `--resume` everywhere
 Session recording has so far been a TUI feature only (it was specified in M4
