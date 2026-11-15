@@ -1,0 +1,6 @@
+# `extra-binaries` is sourced by build-runner.
+# Add commands here to copy additional binaries into the runner image.
+# CWD is build-runner's directory.
+
+cp ~/repos/diagrammer/target/release/diagrammer docker/binaries/
+chmod 755 docker/binaries/diagrammer

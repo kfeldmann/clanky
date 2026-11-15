@@ -51,6 +51,11 @@ chmod 755 docker/binaries/clanky \
     docker/binaries/clanky-provider-anthropic \
     docker/binaries/clanky-subagents
 
+if [ -f extra-binaries ]
+then
+    . extra-binaries
+fi
+
 if [ -f ~/.vimrc ]
 then
     cp ~/.vimrc docker/vimrc
