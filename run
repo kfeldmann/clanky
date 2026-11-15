@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run the clanky runner container.
+# Run `clanky` in the clanky runner container.
 #
 # Mounts the current working directory as the working directory inside the
 # container (project-scope .clanky lives in there), and ~/.clanky as the
@@ -7,7 +7,7 @@
 # stays in these mounts, so the container is run with --rm.
 #
 # Any arguments are passed through to clanky, e.g.:
-#   ./run                  (interactive TUI)
+#   ./run --model foo      (interactive TUI)
 #   ./run -p "prompt"      (CLI mode)
 #
 # Terminal detection:
@@ -44,4 +44,5 @@ docker run \
   -v "$(pwd):/work" \
   -v "$HOME/.clanky:/home/clanky/.clanky" \
   -w /work \
+  --init \
   clanky-runner:latest "$@"
