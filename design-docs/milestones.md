@@ -1548,3 +1548,438 @@ As built:
   `cancel` (stops at the next chunk, partial text kept) and one that ignores
   it (the 2-second kill fallback ends the turn cancelled instead of
   surfacing an error).
+
+## ☐ M23 — Thinking passback: send reasoning back to the model
+
+Clanky never sends an assistant round's thinking back to the provider. The
+protocol's assistant message is `{content, tool_calls}` and nothing else
+(`crates/clanky-protocol/src/messages.rs:255`), every `ChatMessage::Assistant`
+the turn loop pushes carries text plus calls only (`turn.rs:492, 511, 519,
+531, 601`), `StreamAssembler` keeps thinking "for display/session storage;
+they are not part of the assistant message sent back"
+(`crates/clanky-protocol/src/stream.rs:34`), and `history_from_records` drops
+`Record::Thinking` outright (`session.rs:621`). The reasoning is streamed,
+shown, and stored — and then thrown away.
+
+For two of the three providers that is merely a missed optimization. For
+Anthropic it is a correctness problem in the tool loop, and for LiteLLM
+fronting Anthropic it is a documented 400. This milestone closes it.
+
+### Why this is worth doing (and what the docs actually say)
+
+M23 exists because an earlier claim — that OpenAI-compatible APIs are not
+*supposed* to receive reasoning back — did not survive checking. The real
+picture, per provider:
+
+- **DeepInfra (OpenAI-compatible):** permissive. Its request schema has
+  `reasoning_content` on the *input* `ChatCompletionAssistantMessage`
+  (`docs.deepinfra.com/api-reference/chat-completions/openai-chat-completions.md`,
+  the `ChatCompletionAssistantMessage` schema), and it is tokenized as
+  context when sent. Measured against the live API with a `tools` +
+  `reasoning_effort: "high"` tool loop, second round with the tool result:
+
+  | model | without `reasoning_content` | with `reasoning_content` |
+  |---|---|---|
+  | `openai/gpt-oss-20b` | 200, prompt=154 | 200, prompt=**196** |
+  | `deepseek-ai/DeepSeek-V4-Flash-0731` | 200, prompt=426 | 200, prompt=**438** |
+
+  No 400 either way — DeepInfra is more lenient than DeepSeek's native API.
+  Omitting is *safe* but forfeits continuity.
+- **DeepSeek native (normative, conditional):** with `tools` present,
+  "`reasoning_content` must be fully passed back to the API in all
+  subsequent requests — even for turns where the model did not perform a
+  tool call. If your code does not correctly pass back `reasoning_content`,
+  the API will return a 400 error." Without `tools`, it "does not need to be
+  passed back; even if passed to the API, it will be ignored."
+- **Anthropic (normative):** "**Required:** within a tool-use turn, pass
+  thinking blocks back." The block must be returned *complete and
+  unmodified*, signature included; modified blocks are rejected with a 400
+  `thinking blocks cannot be modified`. Older blocks may be omitted
+  ("**Allowed:** outside tool use, omit prior turns' thinking"), and the API
+  filters what it keeps per model.
+- **LiteLLM fronting Anthropic:** documents this exact client shape as
+  broken — "you must include `thinking_blocks` from the previous assistant
+  response... Failure to do so will result in a 400 Bad Request error"
+  (`docs.litellm.ai/docs/reasoning_content`), with `modify_params=True`
+  silently dropping thinking as the workaround.
+
+### Re-measured against the live API (2026-11): the effect is ~1:1, and the text really is used
+
+A second round of measurement, run against DeepInfra with real credentials,
+corrects two things the table above understates and settles the question
+"is the reasoning *used*, or merely accepted?".
+
+**It is used — the text is genuine model context, not decoration.** Placing
+a self-instruction in the previous assistant message's `reasoning_content`
+changes the answer, which is the only direct proof available that the field
+is not inert:
+
+| model | plain | with injected `reasoning_content` |
+|---|---|---|
+| `openai/gpt-oss-20b` | "The current time in Paris is 12:00 PM" | "Il est 12:00 à Tokyo." (French + wrong city) |
+| `deepseek-ai/DeepSeek-V4-Flash-0731` (tools, effort) | "2+2 equals 4." | "Quatre, et Tokyo n'est concernée par ce calcul." |
+
+No 400 in any shape: DeepInfra accepts `reasoning_content`, `reasoning`,
+`thinking_blocks`, `reasoning_details`, `thinking` and unknown fields alike.
+`reasoning_content` and `reasoning` are aliases that both work and both cost
+tokens; **`thinking_blocks`, `reasoning_details` and `thinking` are silently
+ignored** (measured: +0 prompt tokens). So the LiteLLM bullet above stays
+right — `thinking_blocks` is what an Anthropic-backed model through the proxy
+needs — but sending it to DeepInfra is a no-op, not a fidelity win.
+
+**The token cost is ~1:1, not the ~40 tokens of the earlier table.** That
+table used a short reasoning string; a ~1800-character block costs **+401
+prompt tokens**, i.e. ≈4.5 chars/token, on every later round that carries it.
+Whether a given model *counts* the block is per-model and per-shape, which
+is exactly the "tool calling is part of the chain-of-thought" pattern:
+
+| model | counted when |
+|---|---|
+| `openai/gpt-oss-20b` | the assistant message carries `tool_calls` (always otherwise ignored) |
+| `deepseek-ai/DeepSeek-V4-Flash-0731`, `-V4.1-Flash-1017` | the *request* carries `tools` (always otherwise ignored) |
+| `Qwen/Qwen3-32B`, `zai-org/GLM-5.3-Flash` | always |
+
+**What that costs in clanky's own sessions.** Replaying the 11 saved
+sessions in `.clanky/sessions/` through the passback arithmetic at the
+measured 4.49 chars/token, over a prompt total of 73.3M tokens:
+
+| policy | added prompt tokens | vs. today |
+|---|---|---|
+| immediately previous round only | +0.98M | **+1%** |
+| current turn only (the tool-loop rounds) | +40.6M | **+56%** |
+| previous turn only | +10.4M | **+14%** |
+| all turns | +53.4M | **+73%** |
+
+The intra-turn share is **76% of the all-turns cost**, which is the single
+most important number here: the expensive part is not cross-turn retention,
+it is the tool loop, where it is also *mandatory* on Anthropic and DeepSeek.
+The reasoning in those sessions is 4.37M characters against 81k characters
+of visible answers — 54× — so this is a real multiplier, not a rounding
+error.
+
+Two facts keep it tolerable:
+
+- **Prompt caching still applies to passed-back reasoning.** The same request
+  repeated, with and without `reasoning_content`: `cached_tokens` rose
+  4352 → 7424 → 7680 with passback, and caching works normally on the
+  rc-bearing prefix. The marginal cost is cache-read priced.
+- **Anthropic filters and bills only what it keeps.** Sending everything is
+  documented as safe there; DeepInfra/DeepSeek have no server-side filter,
+  so what you send is what you pay for. That asymmetry is why the knob below
+  is per-provider rather than one global switch.
+
+**Corroboration that passback is worth its cost:** arXiv 2606.00135 (ICML
+2026) §3.3 measures retaining thinking history on multi-turn BFCL at
+**~2–5% better** on Qwen3 models and adopted it for all later experiments;
+OpenAI's harmony docs (the actual gpt-oss chat format) say "the model is able
+to call tools as part of its chain-of-thought and because of that, we should
+pass the previous chain-of-thought back in as input for subsequent sampling";
+OpenAI's function-calling guide makes it mandatory for reasoning items
+returned with tool calls; and OpenAI's reasoning guide notes that a prefix
+change makes the API *drop* reasoning, after which the model "may have to
+redo some reasoning, which can increase token usage, cost, and latency."
+
+**Server-side storage is not a substitute.** Every provider clanky speaks is
+stateless for reasoning: Anthropic's Messages API is stateless by design
+(only the `message-threads` beta and Managed Agents keep state server-side),
+and Chat Completions has no reasoning input field at all. OpenAI's
+`previous_response_id`/`encrypted_content` model does not apply to anything
+clanky sends. Nothing re-includes the reasoning unless the client does.
+
+### The finding that shapes the design: the signature, not the text
+
+**The block that must be passed back is `{type, thinking, signature}`, and
+clanky captures neither the signature nor redacted blocks today.**
+
+- `AnthropicBlock` (`adapter.rs:224`) has `type`/`text`/`thinking`/`id`/
+  `name`/`input` — **no `signature`**, and no `data` for `redacted_thinking`.
+- `StreamDelta` (`adapter.rs:393`) has **no `signature` field**, so the
+  `signature_delta` event falls into the `_ => {}` arm (`adapter.rs:489`).
+- Non-streaming responses drop `redacted_thinking` entirely.
+
+Consequence: a milestone that simply re-sent the accumulated *text* would be
+**worse than doing nothing** — Anthropic verifies signatures and rejects
+altered blocks with a 400. The signature is the payload; the text is a
+display convenience. On models whose `display` defaults to `"omitted"`
+(including Claude Haiku 5.5, Claude Opus 5.5, Claude Sonnet 5.5 and the
+other current models), thinking blocks arrive with an **empty `thinking`
+field and a populated signature** — so text-only passback would send
+nothing at all, and text-plus-fabricated-signature would 400.
+
+This is why the protocol field must carry an opaque, per-block payload rather
+than a `String` of thinking text.
+
+### Why it works today without erroring (verify before implementing)
+
+Anthropic documents graceful degradation: "If you toggle thinking mid-turn
+(the API doesn't error). Instead, it silently disables thinking for that
+request... or disable thinking when the conversation history is incompatible
+with thinking being enabled." Sending a tool-loop history with no thinking
+blocks at all is exactly "incompatible history", which is the likely reason
+the Anthropic provider runs without a 400 — **but that is an inference, not
+an observed fact**, and it predicts a real cost: thinking silently disabled
+for the follow-up rounds of every tool loop, plus no cache reuse of the
+thinking prefix. Item 0 confirms it against the live API before any code is
+written, because it decides whether this milestone is a bug fix or an
+optimization.
+
+**Field report (the reason this milestone is hedged, not asserted):** the
+maintainer has been running the Anthropic provider with `thinking = "32000"`
+and has seen **no errors at all** — including, presumably, through tool
+loops. That is in direct tension with the per-model table below, which lists
+`{type: "enabled", budget_tokens: N}` as a 400 for Claude Haiku 5.5. Either
+the configured model resolves to something the table describes differently,
+the deployment's API version predates that rejection, or the thinking block
+is being dropped before it reaches the wire. Item 0 exists to find out which
+— do not "fix" the thinking mode on the strength of the table alone, since a
+working configuration that the docs call invalid is exactly the kind of
+user-supplied value the project invariants say to pass through, not correct.
+
+### Implementation
+
+0. **Spike first, live.** With real Anthropic credentials and
+   `thinking` enabled, drive one tool loop and capture the follow-up request
+   clanky sends. Confirm (a) no 400 today, (b) what the API does with the
+   thinking-less history — `message_delta` stop reason and the round's
+   `output_tokens_details.thinking_tokens` show whether thinking was
+   disabled. Also record which thinking *mode* the configured model accepts:
+   the per-model table makes `{type: "enabled", budget_tokens: N}` a 400 on
+   several current models (Claude Haiku 5.5 among them, which prefers
+   `adaptive`), so `settings.toml`'s `thinking = "32000"` may already be
+   failing or being degraded on the model actually configured. Findings go
+   in this section's "As built" note and settle items 1–2's shape.
+
+   **Amendments from the 2026-11 re-measurement** (see the section above):
+
+   - **The configured pair to check is `claude-haiku-5-5` +
+     `thinking = "32000"`.** `~/.clanky/settings-anthropic.toml` sets
+     exactly that, and `adapter.rs:170-178` turns a positive budget into
+     `{"type":"enabled","budget_tokens":32000}`. The current per-model table
+     lists `enabled` + `budget_tokens` as a **400 on Haiku 5.5** (adaptive
+     only). This is now the top item to resolve, not a side note: if the
+     request is being rejected, everything else in this milestone is being
+     validated against a configuration that is not running.
+   - **Record `display` too.** Haiku 5.5 defaults to `display: "omitted"`,
+     so a working request still returns `thinking: ""` with a populated
+     `signature`. Capture a real response body: if the text is empty, the
+     signature-only case is the *normal* path for this deployment, and
+     constraint 3 below is the mainline rather than the edge case. It also
+     means the "the thinking text would often be useful" premise holds on
+     DeepInfra/DeepSeek but **not** on this Anthropic config — there the
+     encrypted signature is the payload and the text is a display
+     convenience. Do not let the Anthropic arm of this milestone assume
+     readable text exists.
+   - **Do not add the `thinking-binding-controls-2026-08-01` beta header.**
+     It would buy `input_transformations` diagnostics and
+     `prefix_mismatch_behavior: "drop_block"`, both useful, but it is a
+     second behavioral change riding on a correctness fix. Note it as a
+     follow-up; keep this milestone to passback.
+
+1. **Capture the signature (both transports).** `AnthropicBlock` gains
+   `signature: Option<String>` and `data: Option<String>` (the
+   `redacted_thinking` payload); `StreamDelta` gains `signature:
+   Option<String>` and the `signature_delta` arm joins the match
+   (`adapter.rs:489`). The streaming state accumulates per-block signature
+   by wire index — the existing `blocks: HashMap<u32, String>` holds only a
+   type, so it grows into a small per-block struct carrying the type, the
+   accumulated signature, and (for redacted blocks) the data. Non-streaming
+   `response_to_events` reads them off the block. `redacted_thinking` must
+   reach the client too, not be dropped.
+
+2. **Carry it through the protocol.** `ChatMessage::Assistant` gains
+   `#[serde(default, skip_serializing_if = "Option::is_none")] thinking:
+   Option<Vec<ThinkingBlock>>`, with `ThinkingBlock { kind: thinking |
+   redacted, text: Option<String>, signature: Option<String>, data:
+   Option<String> }`. Ordering within the vector is the wire order — the
+   spec requires the sequence of consecutive thinking blocks in the latest
+   assistant message to match what the model generated. **Additive and
+   optional, so no protocol version bump** (spec §9); it joins the
+   `images`/`continuable` precedents in the version history. Providers that
+   do not use it ignore it.
+
+3. **Stream it into the assembler.** `ChunkPayload` gains
+   `ThinkingBlockStart { index, kind }` / `ThinkingBlockEnd { index,
+   signature?, data? }`, or — simpler and preferred — one terminal
+   `ThinkingBlock { kind, text, signature, data }` chunk emitted when the
+   block closes. Pick the shape that keeps `StreamAssembler`'s "assemble
+   deltas, hand back a finished round" model intact; `Thinking` deltas stay
+   exactly as they are so display, `TurnEvent::Thinking`, and the session
+   record do not change. `TurnEvent::Round` gains the assembled blocks
+   beside `thinking` (the 20 `TurnEvent::Round` literal sites and 30
+   `ChatMessage::Assistant` sites are the blast radius).
+
+4. **Send it back.** The turn loop attaches the round's blocks to the
+   assistant message it pushes for the next round (`turn.rs:531`) and for a
+   `Continuable` resume (`turn.rs:511`). A round cut short (error or cancel)
+   sends no blocks — partial signatures are unusable, and the existing
+   partial-round flush already drops tool calls for the same reason.
+
+5. **Session fidelity.** `Record::Thinking` gains optional
+   `blocks: Option<Vec<ThinkingBlock>>` (defaulted, so existing files load),
+   and `history_from_records` stops skipping thinking: it must fold a
+   round's `Thinking` record back onto the preceding assistant message
+   rather than emitting a message of its own. This is the delicate part —
+   records are written thinking-first then assistant (`recorder.rs:375`),
+   and `history_from_records` currently walks them positionally. `/resume`
+   must reconstruct exactly what the model saw, the same standard the
+   `ToolResult.images` field is held to.
+
+6. **Provider behavior, per plugin.**
+   - **Anthropic — send everything.** Emit the blocks as content blocks in
+     wire order, before the text block, exactly as received. Never
+     reconstruct, reorder, or rewrite them. Send *all* prior turns' blocks,
+     not a window: the API filters and bills only what it keeps ("the API
+     automatically filters them, keeps the blocks needed to preserve the
+     model's reasoning, and bills input tokens only for the blocks actually
+     shown to Claude"), so over-sending on Anthropic is free and
+     under-sending is what costs quality. This is the one provider where the
+     passback window in item 8 does not apply.
+   - **DeepInfra / LiteLLM — `reasoning_content` (concatenated text)** on the
+     assistant message when present. The measured token accounting above is
+     the expected effect, not a bug. Note the field findings from the
+     re-measurement: DeepInfra treats `reasoning` as an exact alias of
+     `reasoning_content` (both counted) but **silently ignores
+     `thinking_blocks`, `reasoning_details` and `thinking`** (measured +0
+     prompt tokens), so send `reasoning_content` and nothing else there.
+     LiteLLM additionally accepts `thinking_blocks`; send it too so an
+     Anthropic-backed model through the proxy gets the same fidelity — that
+     is the case LiteLLM documents as a 400 today.
+   - **DeepSeek native** requires the same `reasoning_content` passback
+     whenever `tools` is present (400 otherwise). The OpenAI-compatible path
+     already sends it, so this comes for free; the only requirement is that
+     the field is not gated on `tools` being absent.
+   - Providers that ignore unknown fields lose nothing.
+
+7. **Budget accounting must stay honest.** `session-cost.py` and the README
+   section it documents currently state, as a fact, that "Thinking is
+   completion-side only... it is never sent back, so it costs once and never
+   inflates a later prompt" (`README.md:403-407`, `session-cost.py:33-38`).
+   After this milestone that is false: passed-back thinking is input on
+   every later round. The reporter's `context` model (`session-cost.py:145`)
+   and its "drop thinking from prompt shares" rule (`:210-212`) both need to
+   attribute passed-back thinking to the prompt, and its module docstring,
+   worked example, and the README paragraph all need rewriting.
+
+   **Write the replacement with the measured magnitudes, not a vague
+   warning.** The honest sentence is that passback multiplies the prompt by
+   roughly `1 + thinking_chars / (4.49 × prompt_tokens)`, that in clanky's
+   own saved sessions this came to **+56% for the current turn alone and
+   +73% for all turns**, that the intra-turn share is **76% of that** and so
+   is unavoidable wherever the provider requires it, and that the cached
+   input rate is what keeps it affordable. A passback that inflates cost
+   while the docs promise it does not is exactly the kind of silent surprise
+   the project invariants exist to prevent; a doc that says "it may cost
+   more" without the factor is only marginally better.
+
+8. **Make it controllable, because it costs money — and split the knob.**
+   The re-measurement shows one boolean would conflate two different
+   questions:
+
+   - **Intra-turn passback (the tool loop)** is *correctness*. Anthropic and
+     DeepSeek require it; omitting it is the silent-degradation bug this
+     milestone exists to fix. It must not be switchable off — `off` here
+     would mean "run Anthropic in a documented-degraded mode".
+   - **Cross-turn passback** is a *cost* decision, and the measured numbers
+     say it is the cheap half: the immediately-previous-round policy costs
+     **+1%** and the previous-turn policy **+14%**, against the +56% already
+     spent intra-turn. Recommendation: default to **previous turn** on the
+     OpenAI-compatible providers (captures the measured continuity benefit
+     and the whole tool-loop story for +14% rather than +73%), and ignore
+     the knob on Anthropic (send everything; the server filters).
+
+   **Model it as a window, not an on/off.** Anthropic documents that you may
+   "leave out the oldest blocks, the newest, or all of them, but none in
+   between", and that "once a block is out, keep it out" — so the only legal
+   trimming is a prefix drop. Use
+   `thinking_passback = "off" | "previous-turn" | "all"` (default
+   `previous-turn`) and, whatever is chosen, keep the emitted sequence an
+   unbroken run: never drop a block from the middle, and never drop one whose
+   `tool_use` is still in the conversation. The setting must appear in the
+   effective-settings dump, the session `settings` records, and README, like
+   every other knob — and `off` must be a real off (send no blocks at all,
+   not an empty field).
+
+### Design constraints
+
+1. **Never modify a thinking block.** No trimming, no re-wrapping, no
+   re-encoding, no reordering, no deduplication. Anthropic rejects altered
+   blocks with a 400 and binds signatures to a conversation
+   (`Invalid signature in thinking block. The block is bound to a different
+   conversation`), so the only correct transformation is identity. This
+   extends the project invariant from user-supplied values to
+   provider-supplied ones: both are authoritative.
+2. **Signature or nothing.** If a round's signature was not captured, send
+   no block for that round rather than an unsigned one. A missing block is
+   documented as allowed outside tool use and degrades to today's behavior;
+   a forged one is a 400.
+3. **Text is optional, signature is not.** Handle empty-text blocks as the
+   normal case, not an edge case — they are the default on current models,
+   and on the configured `claude-haiku-5-5` (display defaults to
+   `"omitted"`) the empty-text case is the *only* case. The measured
+   DeepInfra behavior is the mirror image: there the text is the payload and
+   there is no signature at all, so the protocol field must carry both
+   without either being required.
+4. **The conversation stays valid.** Item 5 must not produce an assistant
+   message whose blocks disagree with its text/calls, and the existing
+   synthetic-result repair for interrupted tool calls must keep working.
+   With a window policy (item 8) this gains a second edge: a dropped block
+   must never orphan a `tool_use` that is still in the conversation, and the
+   remaining blocks must stay an unbroken run — Anthropic allows dropping
+   the oldest, the newest, or all of them, but not one in between.
+5. **Additive protocol change.** Optional field, no version bump, both
+   directions ignore it when absent; update `provider-protocol.md` §5 field
+   rules and §9 version history in the same change, per the spec's own
+   policy.
+6. **Resumed history is only as trustworthy as the file.** Passed-back
+   reasoning is model-authored text that the model treats as authoritative
+   context — the injection experiment above is a working proof (a French,
+   Tokyo-flavored answer to a Paris question). clanky writes thinking to
+   session files and exports it to Markdown (`/md --thinking`), so a
+   hand-edited export resumed with `/resume` becomes an instruction channel
+   the model will follow. This is not a reason to withhold passback, but the
+   README section for `/resume` and `/md --thinking` should say plainly that
+   a session file is trusted input, and item 5 must not invent or repair
+   blocks to make a file load.
+
+### Done when
+
+A tool loop against Anthropic sends each round's thinking blocks back
+verbatim (signature intact), the follow-up request shows thinking still
+enabled rather than silently degraded, a `redacted_thinking` block survives
+a round trip, `/resume` replays a session into the same message list a live
+session had, DeepInfra and LiteLLM receive `reasoning_content` /
+`thinking_blocks` and their token accounting reflects it, the cost reporter
+attributes passed-back thinking to the prompt, and README plus
+`provider-protocol.md` describe the new behavior. Because the new field is
+`skip_serializing_if = "Option::is_none"`, the existing goldens
+(`tests/golden/`) do not change unless a scripted turn emits blocks — add
+one such turn (the two scripts that already emit `ChunkPayload::Thinking`,
+`golden.rs:409` and `:731`, are the natural places) so the field is pinned
+in a request, and confirm the untouched goldens still pass unchanged. The
+protocol and plugin tests cover the ignore-when-absent direction for every
+provider.
+
+**Measured acceptance checks, added by the 2026-11 re-measurement:**
+
+- A live DeepInfra round-trip asserts the *observed* accounting rather than
+  just the field's presence: with a ~1800-character reasoning block, a
+  request whose assistant message carries `tool_calls` shows prompt tokens
+  up by **≈400** on `openai/gpt-oss-20b`, and one carrying `tools` shows the
+  same on `deepseek-ai/DeepSeek-V4-Flash-0731`. Both are the expected
+  effect; assert them so a future refactor that silently stops sending the
+  field fails a test instead of quietly changing behavior.
+- A test pins the field-name asymmetry: `reasoning_content` and `reasoning`
+  are counted, `thinking_blocks` / `reasoning_details` / `thinking` are
+  ignored by DeepInfra. This is the fact that makes the LiteLLM
+  `thinking_blocks` bullet provider-specific rather than universal.
+- `thinking_passback = "off"` is exercised end to end on both an
+  OpenAI-compatible provider and Anthropic: no blocks on the wire, the
+  request otherwise byte-identical, and the setting visible in the
+  effective-settings dump and the session `settings` record.
+- The window policy is exercised on a three-round tool loop: the default
+  (`previous-turn`) drops the oldest round's blocks but keeps the current
+  turn's, and the emitted run stays unbroken.
+- `session-cost.py` gains a regression fixture whose expected prompt
+  attribution includes passed-back thinking, so the "never inflates a later
+  prompt" claim cannot creep back into the docs while the code does
+  otherwise.
