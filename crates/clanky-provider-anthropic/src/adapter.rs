@@ -79,6 +79,10 @@ pub fn build_request_body(
             ChatMessage::Assistant {
                 content,
                 tool_calls,
+                // The round's reasoning blocks (M23). Captured and carried
+                // end to end; sending them back is the passback session's
+                // change, not this one.
+                thinking: _,
             } => {
                 // Blocks: text first (if any), then one tool_use per call.
                 let mut blocks = Vec::new();
@@ -234,6 +238,16 @@ pub struct AnthropicBlock {
     pub name: Option<String>,
     #[serde(default)]
     pub input: Option<Value>,
+    /// A `thinking` block's signature (M23): the payload a later request
+    /// must pass back verbatim. Present on the `content_block_start` of a
+    /// streaming thinking block as an empty string, then filled by one
+    /// `signature_delta`.
+    #[serde(default)]
+    pub signature: Option<String>,
+    /// A `redacted_thinking` block's opaque payload (M23). The whole block
+    /// arrives in one `content_block_start`; there are no deltas for it.
+    #[serde(default)]
+    pub data: Option<String>,
 }
 
 /// Anthropic Messages response (parsed leniently).
@@ -298,6 +312,26 @@ pub fn response_to_events(
                 if let Some(text) = block.thinking.as_deref().filter(|t| !t.is_empty()) {
                     sink(ChunkPayload::Thinking {
                         text: text.to_string(),
+                    });
+                }
+                // The passback payload (M23): signature or nothing — an
+                // unsigned thinking block is a 400 on Anthropic, while a
+                // missing one is documented as allowed.
+                if let Some(signature) = block.signature.as_deref().filter(|s| !s.is_empty()) {
+                    sink(ChunkPayload::ThinkingBlock {
+                        block: clanky_protocol::ThinkingBlock::thinking(
+                            block.thinking.clone().unwrap_or_default(),
+                            Some(signature.to_string()),
+                        ),
+                    });
+                }
+            }
+            "redacted_thinking" => {
+                // No display text exists for these; only the opaque payload,
+                // which must reach the client to be passed back.
+                if let Some(data) = block.data.as_deref().filter(|d| !d.is_empty()) {
+                    sink(ChunkPayload::ThinkingBlock {
+                        block: clanky_protocol::ThinkingBlock::redacted(data.to_string()),
                     });
                 }
             }
@@ -402,6 +436,33 @@ pub struct StreamDelta {
     pub thinking: Option<String>,
     #[serde(default)]
     pub partial_json: Option<String>,
+    /// `signature_delta` only (M23): one fragment of a thinking block's
+    /// signature. Anthropic sends exactly one per block today, but the
+    /// accumulator joins them so a future multi-fragment shape still
+    /// reassembles correctly.
+    #[serde(default)]
+    pub signature: Option<String>,
+}
+
+/// One content block as the stream built it (M23): the wire type plus the
+/// passback payload accumulated for it. `signature` is joined from
+/// `signature_delta`s; `data` is a `redacted_thinking` block's payload,
+/// which arrives whole on `content_block_start`; `text` is the block's own
+/// copy of its thinking text (the display stream is separate).
+#[derive(Debug, Clone, Default)]
+struct StreamBlock {
+    kind: String,
+    text: String,
+    signature: String,
+    data: Option<String>,
+    /// Whether the block's passback payload has already been handed to the
+    /// client (so the `message_stop` sweep does not emit it twice).
+    closed: bool,
+}
+
+/// Is this wire block type one that carries a passback payload?
+fn is_reasoning_block(kind: &str) -> bool {
+    matches!(kind, "thinking" | "redacted_thinking")
 }
 
 /// Stream state, mirroring the wire exactly: one block per `index`, tool
@@ -409,8 +470,9 @@ pub struct StreamDelta {
 /// keys on a 0..n `toolCall` index) keeps them apart.
 #[derive(Debug, Default)]
 pub struct StreamState {
-    /// Content block types by wire `index` (from `content_block_start`).
-    blocks: std::collections::HashMap<u32, String>,
+    /// Per-block accumulation by wire `index` (from `content_block_start`):
+    /// the wire type plus the passback payload (M23).
+    blocks: std::collections::HashMap<u32, StreamBlock>,
     finish_reason: Option<FinishReason>,
     usage: Option<Usage>,
     /// Protocol tool-call index of the next tool_use block.
@@ -434,18 +496,24 @@ impl StreamState {
                 false
             }
             "content_block_start" => {
-                let block_type = event
-                    .content_block
-                    .as_ref()
-                    .map(|b| b.r#type.clone())
-                    .unwrap_or_default();
-                self.blocks.insert(event.index, block_type.clone());
-                if block_type == "tool_use" {
-                    let block = event.content_block.as_ref();
+                let started = event.content_block.clone().unwrap_or_default();
+                self.blocks.insert(
+                    event.index,
+                    StreamBlock {
+                        kind: started.r#type.clone(),
+                        signature: started.signature.clone().unwrap_or_default(),
+                        // A `redacted_thinking` block arrives whole on its
+                        // start event — the wire sends no deltas for it.
+                        data: started.data.clone(),
+                        text: String::new(),
+                        closed: false,
+                    },
+                );
+                if started.r#type == "tool_use" {
                     sink(ChunkPayload::ToolCallStart {
                         index: self.tool_index,
-                        id: block.and_then(|b| b.id.clone()).unwrap_or_default(),
-                        name: block.and_then(|b| b.name.clone()).unwrap_or_default(),
+                        id: started.id.clone().unwrap_or_default(),
+                        name: started.name.clone().unwrap_or_default(),
                     });
                     self.tool_index += 1;
                 }
@@ -458,9 +526,9 @@ impl StreamState {
                 // Deltas for an unannounced block are dropped: the wire
                 // guarantees a `content_block_start` first, and without it
                 // there is no type to map the delta onto.
-                if !self.blocks.contains_key(&event.index) {
+                let Some(block) = self.blocks.get_mut(&event.index) else {
                     return false;
-                }
+                };
                 match delta.r#type.as_str() {
                     "text_delta" => {
                         if let Some(text) = delta.text.as_deref().filter(|t| !t.is_empty()) {
@@ -471,9 +539,20 @@ impl StreamState {
                     }
                     "thinking_delta" => {
                         if let Some(text) = delta.thinking.as_deref().filter(|t| !t.is_empty()) {
+                            // The block's own copy is what rides back to the
+                            // provider; the chunk is the display stream.
+                            block.text.push_str(text);
                             sink(ChunkPayload::Thinking {
                                 text: text.to_string(),
                             });
+                        }
+                    }
+                    // One `signature_delta` per thinking block today; the
+                    // accumulator joins them so a multi-fragment shape would
+                    // still reassemble.
+                    "signature_delta" => {
+                        if let Some(signature) = delta.signature.as_deref() {
+                            block.signature.push_str(signature);
                         }
                     }
                     // `input_json_delta` fragments are forwarded verbatim —
@@ -502,10 +581,70 @@ impl StreamState {
                 }
                 false
             }
-            "message_stop" => true,
-            // `ping`, `content_block_stop`, and anything else carry no
-            // protocol content.
+            // A block is complete: hand back its passback payload as one
+            // terminal chunk (M23).
+            "content_block_stop" => {
+                self.close_block(event.index, sink);
+                false
+            }
+            "message_stop" => {
+                // A stream that ended without a `content_block_stop` for a
+                // reasoning block still has its payload; close whatever is
+                // left, in wire order, so nothing is silently dropped.
+                let mut open: Vec<u32> = self
+                    .blocks
+                    .iter()
+                    .filter(|(_, block)| !block.closed && is_reasoning_block(&block.kind))
+                    .map(|(index, _)| *index)
+                    .collect();
+                open.sort_unstable();
+                for index in open {
+                    self.close_block(index, sink);
+                }
+                true
+            }
+            // `ping` and anything else carry no protocol content.
             _ => false,
+        }
+    }
+
+    /// Emit the reasoning block at `index` as one terminal
+    /// [`ChunkPayload::ThinkingBlock`] and mark it closed, so the
+    /// `message_stop` sweep does not emit it twice.
+    ///
+    /// The payload rule (spec §5, M23 constraint 2 — "signature or
+    /// nothing"): a `thinking` block without a signature is not emitted at
+    /// all, because an unsigned block is a 400 on Anthropic and a missing
+    /// block is documented as allowed. A `redacted_thinking` block without
+    /// its data is likewise dropped. Text and `tool_use` blocks carry no
+    /// passback payload.
+    fn close_block(&mut self, index: u32, sink: &mut dyn FnMut(clanky_protocol::ChunkPayload)) {
+        let Some(block) = self.blocks.get_mut(&index) else {
+            return;
+        };
+        if block.closed || !is_reasoning_block(&block.kind) {
+            return;
+        }
+        block.closed = true;
+        let payload = match block.kind.as_str() {
+            "thinking" if !block.signature.is_empty() => {
+                // `thinking` is always present on the wire, even when empty
+                // (`display: "omitted"` models): the block goes back exactly
+                // as received, so the empty string is kept, not dropped.
+                Some(clanky_protocol::ThinkingBlock::thinking(
+                    std::mem::take(&mut block.text),
+                    Some(std::mem::take(&mut block.signature)),
+                ))
+            }
+            "redacted_thinking" => block
+                .data
+                .take()
+                .filter(|data| !data.is_empty())
+                .map(clanky_protocol::ThinkingBlock::redacted),
+            _ => None,
+        };
+        if let Some(block) = payload {
+            sink(clanky_protocol::ChunkPayload::ThinkingBlock { block });
         }
     }
 
@@ -526,7 +665,11 @@ impl StreamState {
         sorted
             .iter()
             .take(wire_position as usize)
-            .filter(|index| self.blocks.get(*index).is_some_and(|t| t == "tool_use"))
+            .filter(|index| {
+                self.blocks
+                    .get(*index)
+                    .is_some_and(|block| block.kind == "tool_use")
+            })
             .count() as u32
     }
 
@@ -703,6 +846,7 @@ mod tests {
             ChatMessage::user("count the files in /tmp using the bash tool"),
             ChatMessage::Assistant {
                 content: String::new(),
+                thinking: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "toolu_01BhVetyfKsqmX56rNskCQuh".into(),
                     name: "bash".into(),
@@ -749,6 +893,7 @@ mod tests {
             ChatMessage::user("show me /work/sample.jpg"),
             ChatMessage::Assistant {
                 content: String::new(),
+                thinking: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "toolu_01".into(),
                     name: "view-image".into(),
@@ -802,6 +947,7 @@ mod tests {
             ChatMessage::user("do two things"),
             ChatMessage::Assistant {
                 content: String::new(),
+                thinking: None,
                 tool_calls: Some(vec![
                     ToolCall {
                         id: "a".into(),
@@ -995,7 +1141,22 @@ mod tests {
         let parts = response_to_events(&response, &mut |e| events.push(e));
         assert_eq!(parts.finish_reason, FinishReason::Stop);
         assert!(matches!(&events[0], ChunkPayload::Thinking { .. }));
-        assert!(matches!(&events[1], ChunkPayload::Text { .. }));
+        // M23: the block's passback payload follows the display delta — the
+        // text plus the signature that makes it re-sendable.
+        match &events[1] {
+            ChunkPayload::ThinkingBlock { block } => {
+                assert_eq!(block.kind, clanky_protocol::ThinkingBlockKind::Thinking);
+                assert!(block.signature.as_deref().is_some_and(|s| s.len() > 100));
+                assert!(
+                    block
+                        .text
+                        .as_deref()
+                        .is_some_and(|t| t.starts_with("The user"))
+                );
+            }
+            other => panic!("expected the block payload, got {other:?}"),
+        }
+        assert!(matches!(&events[2], ChunkPayload::Text { .. }));
     }
 
     #[test]
@@ -1138,6 +1299,173 @@ mod tests {
         assert_eq!(text, "17 × 23 = 391");
         assert_eq!(parts.finish_reason, FinishReason::Stop);
         assert_eq!(parts.usage.as_ref().unwrap().completion_tokens, Some(95));
+
+        // M23: the block's passback payload rides its own terminal chunk —
+        // the captured signature verbatim, plus the thinking text.
+        let blocks: Vec<&clanky_protocol::ThinkingBlock> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::ThinkingBlock { block } => Some(block),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blocks.len(), 1, "one block, emitted once");
+        let block = blocks[0];
+        assert_eq!(block.kind, clanky_protocol::ThinkingBlockKind::Thinking);
+        assert_eq!(block.text.as_deref(), Some(thinking.as_str()));
+        assert!(
+            block
+                .signature
+                .as_deref()
+                .is_some_and(|s| s.starts_with("EvUDCrgBCBIYAipA1VbPUptbMjuV22EODvAckD3Q")),
+            "the captured signature verbatim: {:?}",
+            block.signature
+        );
+    }
+
+    /// A live-capture-shaped event stream for the M23 wire shapes (finding
+    /// 7): `content_block_start` for a thinking block carries
+    /// `"signature":""`; the signature arrives as one `signature_delta`; a
+    /// `redacted_thinking` block arrives whole on its start event with no
+    /// deltas at all.
+    fn run_raw_stream(events: &[&str]) -> Vec<ChunkPayload> {
+        let mut chunks = Vec::new();
+        let mut state = StreamState::default();
+        for raw in events {
+            let event: StreamEvent = serde_json::from_str(raw).expect("valid event");
+            if state.ingest(&event, &mut |c| chunks.push(c)) {
+                break;
+            }
+        }
+        chunks
+    }
+
+    fn blocks_of(chunks: &[ChunkPayload]) -> Vec<clanky_protocol::ThinkingBlock> {
+        chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::ThinkingBlock { block } => Some(block.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_text_signed_block_is_emitted() {
+        // The `display: "omitted"` mainline (finding 3): the thinking text
+        // is empty and the signature is the whole payload. It must be
+        // emitted, with the empty text kept rather than dropped.
+        let chunks = run_raw_stream(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-only"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let blocks = blocks_of(&chunks);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, clanky_protocol::ThinkingBlockKind::Thinking);
+        assert_eq!(blocks[0].text.as_deref(), Some(""), "empty text is kept");
+        assert_eq!(blocks[0].signature.as_deref(), Some("sig-only"));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| !matches!(c, ChunkPayload::Thinking { .. })),
+            "an empty thinking delta emits no display chunk"
+        );
+    }
+
+    #[test]
+    fn a_redacted_thinking_block_arrives_whole_on_its_start_event() {
+        let chunks = run_raw_stream(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-blob"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let blocks = blocks_of(&chunks);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0],
+            clanky_protocol::ThinkingBlock::redacted("opaque-blob")
+        );
+        assert_eq!(blocks[0].text, None, "a redacted block has no text");
+    }
+
+    #[test]
+    fn several_blocks_keep_wire_order() {
+        let chunks = run_raw_stream(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-a"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"blob-b"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"third"}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"sig-c"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let blocks = blocks_of(&chunks);
+        assert_eq!(
+            blocks,
+            [
+                clanky_protocol::ThinkingBlock::thinking("", Some("sig-a".into())),
+                clanky_protocol::ThinkingBlock::redacted("blob-b"),
+                clanky_protocol::ThinkingBlock::thinking("third", Some("sig-c".into())),
+            ],
+            "consecutive thinking blocks keep the order the model generated"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_block_is_not_emitted() {
+        // Constraint 2 ("signature or nothing"): a block whose signature
+        // never arrived — a round cut short mid-stream — is dropped rather
+        // than sent back unsigned (a 400 on Anthropic).
+        let chunks = run_raw_stream(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"half a thought"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        assert!(blocks_of(&chunks).is_empty(), "no forged block: {chunks:?}");
+        // The display text still streamed.
+        assert!(matches!(&chunks[0], ChunkPayload::Thinking { text } if text == "half a thought"));
+    }
+
+    #[test]
+    fn a_block_without_a_content_block_stop_still_closes_at_message_stop() {
+        let chunks = run_raw_stream(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let blocks = blocks_of(&chunks);
+        assert_eq!(blocks.len(), 1, "closed by the terminal sweep, once");
+        assert_eq!(blocks[0].signature.as_deref(), Some("sig"));
+    }
+
+    #[test]
+    fn non_streaming_responses_carry_signature_and_redacted_data() {
+        // The non-streaming path (`stream = false`) puts `signature` and
+        // `data` directly on the content block (finding 7).
+        let body = r#"{"content":[
+            {"type":"thinking","thinking":"","signature":"sig-ns"},
+            {"type":"redacted_thinking","data":"blob-ns"},
+            {"type":"text","text":"hi"}
+        ],"stop_reason":"end_turn"}"#;
+        let response: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let mut events = Vec::new();
+        response_to_events(&response, &mut |e| events.push(e));
+        assert_eq!(
+            blocks_of(&events),
+            [
+                clanky_protocol::ThinkingBlock::thinking("", Some("sig-ns".into())),
+                clanky_protocol::ThinkingBlock::redacted("blob-ns"),
+            ]
+        );
     }
 
     #[test]

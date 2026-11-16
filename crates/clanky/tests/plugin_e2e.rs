@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use clanky::tools;
 use clanky::turn::{Interrupt, TurnConfig, TurnEvent, run_turn_with};
 use clanky_protocol::{
-    ChatMessage, FinishReason, ProcessOptions, ProcessTransport, ProviderClient,
+    ChatMessage, FinishReason, ProcessOptions, ProcessTransport, ProviderClient, ThinkingBlock,
 };
 
 fn example_plugin() -> PathBuf {
@@ -120,6 +120,120 @@ fn hello_world_plugin_handshakes_and_answers() {
         messages.last(),
         Some(ChatMessage::Assistant { content, .. }) if content == "Hello from a plugin!"
     ));
+}
+
+/// A plugin that emits M23 reasoning blocks (a signed one and a redacted
+/// one) beside its text, then finishes.
+const BLOCKS_PLUGIN: &str = r#"#!/usr/bin/env python3
+import json, sys
+
+def emit(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+emit({"type": "hello", "protocolVersion": 2, "name": "blocks",
+      "capabilities": {"listModels": False, "tools": False, "thinking": True},
+      "defaultModel": "blocks/model"})
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("type") != "chat":
+        continue
+    rid = message["id"]
+    emit({"type": "chunk", "requestId": rid,
+          "payload": {"kind": "thinking", "text": "weighing it"}})
+    emit({"type": "chunk", "requestId": rid,
+          "payload": {"kind": "thinkingBlock",
+                      "block": {"kind": "thinking", "text": "weighing it",
+                                "signature": "sig-from-plugin"}}})
+    emit({"type": "chunk", "requestId": rid,
+          "payload": {"kind": "thinkingBlock",
+                      "block": {"kind": "redacted", "data": "blob-from-plugin"}}})
+    emit({"type": "chunk", "requestId": rid,
+          "payload": {"kind": "text", "text": "done"}})
+    emit({"type": "done", "requestId": rid, "finishReason": "stop"})
+"#;
+
+/// Write the blocks plugin to a scratch path and spawn it.
+fn spawn_blocks_plugin() -> Option<(ProcessTransport, PathBuf)> {
+    if !python3_available() {
+        eprintln!("skipping: python3 not available");
+        return None;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "clanky-blocks-plugin-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("clanky-provider-blocks");
+    std::fs::write(&script, BLOCKS_PLUGIN).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    Some((
+        ProcessTransport::spawn(ProcessOptions::new(script.to_string_lossy()))
+            .expect("spawn blocks plugin"),
+        dir,
+    ))
+}
+
+#[test]
+fn thinking_blocks_survive_a_real_plugin_round_trip() {
+    // M23 through the process transport: the plugin's finished blocks reach
+    // the turn, ride `TurnEvent::Round`, and land on the assistant message
+    // the conversation keeps — unmodified, in wire order.
+    let Some((transport, dir)) = spawn_blocks_plugin() else {
+        return;
+    };
+    let mut client = ProviderClient::new(transport);
+    client.handshake().expect("handshake");
+
+    let config = TurnConfig {
+        model: Some("blocks/model".into()),
+        sampling: None,
+        thinking: None,
+        max_tool_rounds: None,
+        max_retries: Some(0),
+        retry_sleep: Some(|_| {}),
+        interrupt: None,
+    };
+    let mut messages = vec![ChatMessage::user("think")];
+    let rounds = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = std::rc::Rc::clone(&rounds);
+    let output = run_turn_with(
+        &mut client,
+        &tools::default_tools(None),
+        &mut messages,
+        &config,
+        &mut |event| {
+            if let TurnEvent::Round {
+                thinking_blocks, ..
+            } = &event
+            {
+                sink.borrow_mut().push(thinking_blocks.clone());
+            }
+        },
+    )
+    .expect("turn");
+    assert_eq!(output.text, "done");
+
+    let expected = vec![
+        ThinkingBlock::thinking("weighing it", Some("sig-from-plugin".into())),
+        ThinkingBlock::redacted("blob-from-plugin"),
+    ];
+    assert_eq!(rounds.borrow().len(), 1);
+    assert_eq!(rounds.borrow()[0], expected, "round event carries them");
+    let assistant = messages
+        .iter()
+        .find(|m| matches!(m, ChatMessage::Assistant { .. }))
+        .expect("assistant message kept");
+    assert_eq!(assistant.thinking(), Some(expected.as_slice()));
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// A plugin that streams slowly and honors `cancel` (spec §7): it stops at
@@ -246,7 +360,7 @@ fn esc_stops_a_real_plugin_and_keeps_what_streamed() {
     );
     assert!(matches!(
         messages.last(),
-        Some(ChatMessage::Assistant { content, tool_calls: None }) if content == "first "
+        Some(ChatMessage::Assistant { content, tool_calls: None, .. }) if content == "first "
     ));
     std::fs::remove_dir_all(dir).ok();
 }

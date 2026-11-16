@@ -146,6 +146,32 @@ Field rules:
 - Assistant messages may carry `toolCalls` with **parsed** `arguments` (an
   object, not a JSON string — avoids double-encoding bugs in plugin authors'
   adapters).
+- Assistant messages may additionally carry `thinking` — the round's
+  reasoning blocks, in the order the model produced them (M23, additive):
+
+  ```json
+  {"role": "assistant", "content": "", "thinking": [
+     {"kind": "thinking", "text": "", "signature": "EuUDCrgB…"},
+     {"kind": "redacted", "data": "EmwKAh…"}
+  ], "toolCalls": [...]}
+  ```
+
+  `kind` is `thinking` (a readable block) or `redacted` (an encrypted
+  `redacted_thinking` block). The payload fields are all optional so one
+  shape serves every provider: Anthropic sends `signature` and often no
+  text at all (`display: "omitted"` models), DeepInfra/DeepSeek send `text`
+  and no signature, and a redacted block sends `data`. Absent when the
+  round reasoned nothing — so a plugin that ignores the field, and every
+  message written before it existed, is unchanged.
+
+  **The payload is opaque and must be passed back unmodified.** A plugin
+  sends the blocks back exactly as received — never trimmed, re-wrapped,
+  reordered or deduplicated — because the provider verifies them: Anthropic
+  answers an altered `signature` or `data` with a 400, and a block with no
+  signature must be omitted rather than sent unsigned (a missing block is
+  documented as allowed; a forged one is not). On Anthropic the blocks go
+  before the text block; DeepInfra/LiteLLM use the concatenated text as
+  `reasoning_content`. A plugin with no such concept ignores the field.
 - Tool results are `role: "tool"` messages with `toolCallId` + `content`.
   A tool result may additionally carry `images` — an optional, additive
   list of `{"dataBase64": …, "mediaType": "jpeg|png|gif|webp|heic|heif|avif"}`
@@ -214,6 +240,21 @@ Plugin → client, terminal:
 Rules:
 - `kind: "text"` deltas append to the assistant text; `kind: "thinking"`
   deltas append to the thinking text (shown in the TUI, stored in the session).
+- `kind: "thinkingBlock"` (M23) carries one **finished** reasoning block,
+  emitted when the provider closes it — the payload that has no delta form
+  (the signature, or a redacted block's data):
+
+  ```json
+  {"type": "chunk", "requestId": 42,
+   "payload": {"kind": "thinkingBlock",
+               "block": {"kind": "thinking", "text": "", "signature": "EuUD…"}}}
+  ```
+
+  It rides beside the `thinking` deltas, which keep streaming the display
+  text exactly as before; the client assembles the blocks, in arrival order,
+  into the assistant message's `thinking` field. A block whose payload never
+  arrived (a round cut short mid-signature) is not emitted at all — see §5's
+  "signature or nothing" rule.
 - `toolCallStart` announces a tool call by `index`; `toolCallArgs` appends a
   fragment of that call's JSON arguments string, which the client assembles and
   parses on `done`. `index` is a 0-based counter per response (maps directly to
@@ -314,6 +355,13 @@ Plugin → client:
     (M20: inline image parts on a `tool` message, absent when there are
     none; see §5 field rules). No version bump: additive and optional, and
     the three provider plugins in the repo were updated in the same change.
+  - **v2, additive** — reasoning passback (M23): `ChatMessage::Assistant`
+    may carry `thinking` (the round's opaque reasoning blocks, §5), and a
+    plugin may emit the finished blocks as `thinkingBlock` chunks (§6). No
+    version bump: both are optional and absent when unused, a peer that
+    never emits or never reads them changes nothing, and the field is
+    `skip_serializing_if = "Option::is_none"` so every pre-M23 request is
+    byte-identical.
   - **v2, additive** — a new `finishReason` value `continuable`
     (Anthropic's `pause_turn`: the turn was interrupted server-side; the
     client sends the partial response back and requests again — see §6).

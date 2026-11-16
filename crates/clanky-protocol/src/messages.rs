@@ -238,7 +238,9 @@ pub struct ModelInfo {
 
 /// One conversation message. `content` is the text (always a plain
 /// string); a `tool` message may additionally carry inline images the
-/// backend request builds into multimodal parts (additive in v2).
+/// backend request builds into multimodal parts (additive in v2), and an
+/// `assistant` message may carry the round's reasoning blocks so a later
+/// request can pass them back verbatim (additive in v2, M23).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "role",
@@ -257,6 +259,16 @@ pub enum ChatMessage {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
+        /// The round's reasoning blocks in the order the model produced
+        /// them, as the provider emitted them (M23). Absent when the round
+        /// reasoned nothing, when the provider reports no blocks, and on
+        /// every message written before this field existed.
+        ///
+        /// The blocks are opaque payloads: a plugin that sends them back
+        /// must do so *unmodified* (spec §5, M23 constraint 1). Providers
+        /// that have no such concept ignore the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<Vec<ThinkingBlock>>,
     },
     Tool {
         tool_call_id: String,
@@ -286,6 +298,7 @@ impl ChatMessage {
         Self::Assistant {
             content: content.into(),
             tool_calls: None,
+            thinking: None,
         }
     }
 
@@ -327,6 +340,15 @@ impl ChatMessage {
             | Self::Tool { content, .. } => content,
         }
     }
+
+    /// The assistant round's reasoning blocks, if any (`assistant` messages
+    /// only; every other role has none).
+    pub fn thinking(&self) -> Option<&[ThinkingBlock]> {
+        match self {
+            Self::Assistant { thinking, .. } => thinking.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// A tool call as recorded in an assistant message. `arguments` is a parsed
@@ -337,6 +359,71 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+}
+
+/// Which kind of reasoning block this is (spec §5, M23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThinkingBlockKind {
+    /// A readable reasoning block. On Anthropic the `signature` is the
+    /// payload and `text` is a display convenience (often empty); on
+    /// OpenAI-compatible providers the text *is* the payload and there is
+    /// no signature.
+    Thinking,
+    /// An encrypted reasoning block (`redacted_thinking`): the `data` field
+    /// is the whole payload and there is no text.
+    Redacted,
+}
+
+/// One reasoning block of an assistant round, carried on the assistant
+/// message so a later request can pass it back (M23).
+///
+/// The payload is opaque: `signature` (Anthropic) or `data` (a
+/// `redacted_thinking` block) is what the provider verifies, and a block
+/// must be sent back exactly as received — never trimmed, re-wrapped,
+/// reordered or deduplicated (spec §5; Anthropic answers an altered block
+/// with a 400). Both payload fields are optional so one type serves every
+/// provider: DeepInfra/DeepSeek send text and no signature, Anthropic
+/// sends a signature (and often no text), and a redacted block sends
+/// `data`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingBlock {
+    pub kind: ThinkingBlockKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
+impl ThinkingBlock {
+    /// A readable reasoning block: the text, plus the signature when the
+    /// provider signed it.
+    pub fn thinking(text: impl Into<String>, signature: Option<String>) -> Self {
+        Self {
+            kind: ThinkingBlockKind::Thinking,
+            text: Some(text.into()),
+            signature,
+            data: None,
+        }
+    }
+
+    /// An encrypted (`redacted_thinking`) block: the opaque data payload.
+    pub fn redacted(data: impl Into<String>) -> Self {
+        Self {
+            kind: ThinkingBlockKind::Redacted,
+            text: None,
+            signature: None,
+            data: Some(data.into()),
+        }
+    }
+
+    /// The block's display text, if it has any (a redacted block does not).
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
 }
 
 /// A tool definition offered to the model; `parameters` is JSON Schema.
@@ -403,6 +490,18 @@ pub enum ChunkPayload {
     Text { text: String },
     /// Delta for the assistant's thinking text.
     Thinking { text: String },
+    /// One finished reasoning block, emitted when the provider closes it
+    /// (M23). `thinking` deltas keep streaming the display text exactly as
+    /// before; this chunk carries the *payload* a later request has to pass
+    /// back verbatim — the signature (Anthropic) or the redacted block's
+    /// data — which has no delta form.
+    ///
+    /// Emitted once per block, in the order the blocks were generated, so
+    /// an assembler can collect them into the assistant message's
+    /// `thinking` list. A block whose payload never arrived (a round cut
+    /// short mid-signature) is not emitted at all (spec §5: signature or
+    /// nothing).
+    ThinkingBlock { block: ThinkingBlock },
     /// Announces a tool call by `index`; arguments follow via
     /// [`ChunkPayload::ToolCallArgs`].
     ToolCallStart {
@@ -640,6 +739,7 @@ mod tests {
                 ChatMessage::user("count files in /tmp"),
                 ChatMessage::Assistant {
                     content: String::new(),
+                    thinking: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "call_1".into(),
                         name: "bash".into(),
@@ -672,6 +772,54 @@ mod tests {
         assert!(line.contains("\"top_p\""));
         assert!(line.contains("\"seed\":42"));
         assert!(line.contains("\"budgetTokens\""));
+    }
+
+    #[test]
+    fn thinking_blocks_are_additive_and_optional() {
+        // M23: the field is absent when a round reasoned nothing, so every
+        // pre-M23 message serializes byte-identically (the goldens rely on
+        // this).
+        let plain = ChatMessage::assistant("hi");
+        let json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(json, json!({"role": "assistant", "content": "hi"}));
+        assert_eq!(plain.thinking(), None);
+
+        // A message without the field parses as `None` — the ignore-when-
+        // absent direction every provider plugin needs.
+        let parsed: ChatMessage =
+            serde_json::from_str(r#"{"role": "assistant", "content": "hi"}"#).unwrap();
+        assert_eq!(parsed, plain);
+
+        // Present blocks round-trip unchanged, in wire order, with only the
+        // fields the block actually carries (the payload shapes are
+        // asymmetric between providers: Anthropic signs, DeepInfra does not).
+        let message = ChatMessage::Assistant {
+            content: "answer".into(),
+            tool_calls: None,
+            thinking: Some(vec![
+                ThinkingBlock::thinking("", Some("sig-abc".into())),
+                ThinkingBlock::redacted("opaque-data"),
+                ThinkingBlock::thinking("readable reasoning", None),
+            ]),
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "role": "assistant",
+                "content": "answer",
+                "thinking": [
+                    {"kind": "thinking", "text": "", "signature": "sig-abc"},
+                    {"kind": "redacted", "data": "opaque-data"},
+                    {"kind": "thinking", "text": "readable reasoning"},
+                ],
+            })
+        );
+        let line = serde_json::to_string(&message).unwrap();
+        assert_eq!(serde_json::from_str::<ChatMessage>(&line).unwrap(), message);
+        assert_eq!(message.thinking().unwrap().len(), 3);
+        // Every other role reports no blocks.
+        assert_eq!(ChatMessage::user("hi").thinking(), None);
     }
 
     #[test]

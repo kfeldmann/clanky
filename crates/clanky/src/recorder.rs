@@ -376,6 +376,8 @@ pub fn record_turn_event(recorder: &mut Recorder, errors: &mut dyn ErrorSink, ev
             text,
             thinking,
             calls,
+            // Session fidelity for the passback payload is M23 session 3.
+            thinking_blocks: _,
         } => {
             // The records written below supersede the deltas accumulated
             // for this round.
@@ -752,6 +754,7 @@ mod tests {
                 text: "done".into(),
                 thinking: String::new(),
                 calls: vec![],
+                thinking_blocks: Vec::new(),
             },
             TurnEvent::ToolResult {
                 name: "bash".into(),

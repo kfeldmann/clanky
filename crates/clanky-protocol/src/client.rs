@@ -402,6 +402,60 @@ mod tests {
     }
 
     #[test]
+    fn thinking_blocks_stream_through_the_loopback_transport() {
+        // M23, the in-process half of "both transports": the finished block
+        // chunks reach the caller's sink beside the display deltas, and the
+        // assembler collects them into the round's passback payload.
+        struct Blocks;
+        impl Handler for Blocks {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "blocks".into(),
+                    capabilities: Capabilities::default(),
+                    default_model: None,
+                }
+            }
+            fn list_models(&mut self) -> Result<Vec<ModelInfo>, Error> {
+                Ok(Vec::new())
+            }
+            fn chat(
+                &mut self,
+                _request: &ChatRequest,
+                sink: &mut dyn FnMut(ChunkPayload),
+            ) -> Result<ChatDone, Error> {
+                sink(ChunkPayload::Thinking { text: "hmm".into() });
+                sink(ChunkPayload::ThinkingBlock {
+                    block: crate::messages::ThinkingBlock::thinking("hmm", Some("sig".into())),
+                });
+                sink(ChunkPayload::ThinkingBlock {
+                    block: crate::messages::ThinkingBlock::redacted("blob"),
+                });
+                Ok(ChatDone {
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                })
+            }
+        }
+
+        let mut client = ProviderClient::new(crate::transport::LoopbackTransport::new(Blocks));
+        client.handshake().unwrap();
+        let mut assembler = crate::stream::StreamAssembler::default();
+        client
+            .chat(request("blocks/m", "hi"), &mut |payload| {
+                assembler.ingest(payload)
+            })
+            .unwrap();
+        assert_eq!(assembler.thinking(), "hmm");
+        assert_eq!(
+            assembler.thinking_blocks(),
+            [
+                crate::messages::ThinkingBlock::thinking("hmm", Some("sig".into())),
+                crate::messages::ThinkingBlock::redacted("blob"),
+            ]
+        );
+    }
+
+    #[test]
     fn chat_with_publishes_the_id_the_chat_is_sent_under() {
         // A cancel names a request id, so a caller that cancels from another
         // thread needs the id *before* the chat blocks. The hook is called

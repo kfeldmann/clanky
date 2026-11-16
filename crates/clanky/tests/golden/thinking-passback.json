@@ -1,0 +1,140 @@
+{
+  "history": [
+    {
+      "content": "use the tool on hello",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "thinking": [
+        {
+          "kind": "thinking",
+          "signature": "sig-round-1",
+          "text": ""
+        },
+        {
+          "data": "opaque-redacted-blob",
+          "kind": "redacted"
+        }
+      ],
+      "toolCalls": [
+        {
+          "arguments": {
+            "input": "hello"
+          },
+          "id": "call_1",
+          "name": "fake"
+        }
+      ]
+    },
+    {
+      "content": "fake ran with input=hello",
+      "role": "tool",
+      "toolCallId": "call_1"
+    },
+    {
+      "content": "The tool said: fake ran with input=hello",
+      "role": "assistant"
+    }
+  ],
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "use the tool on hello",
+          "role": "user"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "A fake tool for tests",
+          "name": "fake",
+          "parameters": {
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "content": "use the tool on hello",
+          "role": "user"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "thinking": [
+            {
+              "kind": "thinking",
+              "signature": "sig-round-1",
+              "text": ""
+            },
+            {
+              "data": "opaque-redacted-blob",
+              "kind": "redacted"
+            }
+          ],
+          "toolCalls": [
+            {
+              "arguments": {
+                "input": "hello"
+              },
+              "id": "call_1",
+              "name": "fake"
+            }
+          ]
+        },
+        {
+          "content": "fake ran with input=hello",
+          "role": "tool",
+          "toolCallId": "call_1"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "A fake tool for tests",
+          "name": "fake",
+          "parameters": {
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

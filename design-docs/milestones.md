@@ -1551,6 +1551,12 @@ As built:
 
 ## ☐ M23 — Thinking passback: send reasoning back to the model
 
+**Session 1 of 4 done: the payload is captured and carried (nothing is
+sent back yet — the wire is unchanged, so the existing goldens pass
+verbatim). Sessions 2–4 are the passback itself, session fidelity, and the
+knob/cost docs; see `design-docs/m23-sessions.md` and this section's
+"As built (session 1)" note.**
+
 Clanky never sends an assistant round's thinking back to the provider. The
 protocol's assistant message is `{content, tool_calls}` and nothing else
 (`crates/clanky-protocol/src/messages.rs:255`), every `ChatMessage::Assistant`
@@ -2046,7 +2052,69 @@ user-supplied value the project invariants say to pass through, not correct.
    `thinking = "32000"` in a settings file reads as a cap and is not one
    on the configured model.
 
-1. **Capture the signature (both transports).** `AnthropicBlock` gains
+   **As built (session 1, 2026-11).** The payload is captured and carried
+   end to end; nothing is sent back yet, so the wire is byte-identical to
+   before and every existing golden passes unchanged.
+
+   - **Anthropic capture** (`crates/clanky-provider-anthropic/src/adapter.rs`).
+     `AnthropicBlock` gained `signature`/`data`; `StreamDelta` gained
+     `signature` and a `signature_delta` arm; `StreamState.blocks` grew from
+     `HashMap<u32, String>` into a per-block `StreamBlock { kind, text,
+     signature, data, closed }`. `redacted_thinking` takes its `data` off
+     the `content_block_start` (the wire sends no deltas for it). One
+     terminal `ChunkPayload::ThinkingBlock` is emitted per reasoning block,
+     in generation order, on `content_block_stop`; a stream that reaches
+     `message_stop` without that event still closes its open blocks (a
+     sweep in wire order) so nothing is dropped. The non-streaming path
+     (`stream = false`) emits the same chunk from the block's own fields.
+     **Payload rule enforced at the source:** a `thinking` block whose
+     signature never arrived is not emitted (constraint 2, "signature or
+     nothing"), and a `redacted_thinking` block without `data` likewise.
+     An empty-text block is emitted with `text: ""` kept — that is the
+     `display: "omitted"` mainline, not an edge case.
+   - **Protocol** (`crates/clanky-protocol/src/messages.rs`).
+     `ChatMessage::Assistant.thinking: Option<Vec<ThinkingBlock>>`
+     (`#[serde(default, skip_serializing_if = "Option::is_none")]`) with
+     `ThinkingBlock { kind, text?, signature?, data? }` and
+     `ThinkingBlockKind::{Thinking, Redacted}`; a `ChatMessage::thinking()`
+     accessor mirrors `images()`. `ChunkPayload::ThinkingBlock { block }`
+     carries the finished block. `StreamAssembler` collects them
+     (`thinking_blocks()`), keeping the `thinking` display string exactly as
+     before. All additive and optional: an absent field stays absent, so
+     every pre-M23 request is byte-identical (the untouched goldens prove
+     it). No version bump — spec §9 records it as a v2 additive change.
+   - **Turn loop** (`crates/clanky/src/turn.rs`). `TurnEvent::Round` gained
+     `thinking_blocks: Vec<ThinkingBlock>`, and `run_turn_with` attaches
+     `blocks_or_none(..)` to the assistant messages it pushes for a
+     tool-call round, a `Continuable` resume, and a final plain-text round.
+     A cancelled round and an error-flushed partial round attach none (a
+     cut-short signature is unusable, the same rule their tool calls
+     follow), and a round with no blocks passes `None`, never an empty list.
+     This is the attachment session 2's provider arms read; the plugins
+     themselves still ignore the field (`thinking: _`), so no wire changed.
+   - **Tests.** Protocol: `messages.rs` (the field is absent when unused,
+     present blocks round-trip, `thinking()` on every role), `stream.rs`
+     (blocks collect in order beside the display text; a blockless round
+     reports none), `client.rs` (loopback transport), `serve.rs` (both
+     directions over JSONL: request blocks arrive intact, chunk blocks go
+     out with only the fields each carries). Anthropic: the captured
+     streaming fixture now asserts the signature verbatim; raw-event tests
+     for the empty-text-signed case, a whole `redacted_thinking`, three
+     blocks keeping wire order, an unsigned block being dropped, a block
+     closed by the `message_stop` sweep, and the non-streaming path.
+     DeepInfra/LiteLLM: a test each that an assistant message's blocks leave
+     their request body byte-identical (the ignore-when-absent direction).
+     Turn loop: blocks ride the right assistant messages (tool round,
+     continuation, plain answer) and a cancelled round sends none. Golden:
+     one new `thinking-passback.json` pins the request field (the second
+     round's assistant message carries the blocks, the first carries
+     none); the eight existing goldens are untouched.
+   - **Docs.** `provider-protocol.md` §5 (the assistant `thinking` field and
+     the opaque-payload/unmodified rule), §6 (the `thinkingBlock` chunk),
+     §9 (the additive v2 entry); README's plugin-authoring bullet and the
+     Anthropic notes.
+
+1. **[x] Capture the signature (both transports).** `AnthropicBlock` gains
    `signature: Option<String>` and `data: Option<String>` (the
    `redacted_thinking` payload); `StreamDelta` gains `signature:
    Option<String>` and the `signature_delta` arm joins the match
@@ -2057,7 +2125,7 @@ user-supplied value the project invariants say to pass through, not correct.
    `response_to_events` reads them off the block. `redacted_thinking` must
    reach the client too, not be dropped.
 
-2. **Carry it through the protocol.** `ChatMessage::Assistant` gains
+2. **[x] Carry it through the protocol.** `ChatMessage::Assistant` gains
    `#[serde(default, skip_serializing_if = "Option::is_none")] thinking:
    Option<Vec<ThinkingBlock>>`, with `ThinkingBlock { kind: thinking |
    redacted, text: Option<String>, signature: Option<String>, data:
@@ -2068,7 +2136,7 @@ user-supplied value the project invariants say to pass through, not correct.
    `images`/`continuable` precedents in the version history. Providers that
    do not use it ignore it.
 
-3. **Stream it into the assembler.** `ChunkPayload` gains
+3. **[x] Stream it into the assembler.** `ChunkPayload` gains
    `ThinkingBlockStart { index, kind }` / `ThinkingBlockEnd { index,
    signature?, data? }`, or — simpler and preferred — one terminal
    `ThinkingBlock { kind, text, signature, data }` chunk emitted when the
@@ -2148,15 +2216,15 @@ user-supplied value the project invariants say to pass through, not correct.
 
    - **Intra-turn passback (the tool loop)** is *correctness*. Anthropic and
      DeepSeek require it; omitting it is the silent-degradation bug this
-     milestone exists to fix. It must not be switchable off — `off` here
-     would mean "run Anthropic in a documented-degraded mode".
+     milestone exists to fix. Keep the same functionality regardless of provider
+     or model. No magic override of the provided settings. If a user selects
+     "off" for Anthropic, honor it.
    - **Cross-turn passback** is a *cost* decision, and the measured numbers
      say it is the cheap half: the immediately-previous-round policy costs
      **+1%** and the previous-turn policy **+14%**, against the +56% already
-     spent intra-turn. Recommendation: default to **previous turn** on the
-     OpenAI-compatible providers (captures the measured continuity benefit
-     and the whole tool-loop story for +14% rather than +73%), and ignore
-     the knob on Anthropic (send everything; the server filters).
+     spent intra-turn. Recommendation: default to **previous turn** (captures
+     the measured continuity benefit and the whole tool-loop story for +14%
+     rather than +73%).
 
    **Model it as a window, not an on/off.** Anthropic documents that you may
    "leave out the oldest blocks, the newest, or all of them, but none in
@@ -2164,8 +2232,7 @@ user-supplied value the project invariants say to pass through, not correct.
    trimming is a prefix drop. Use
    `thinking_passback = "off" | "previous-turn" | "all"` (default
    `previous-turn`) and, whatever is chosen, keep the emitted sequence an
-   unbroken run: never drop a block from the middle, and never drop one whose
-   `tool_use` is still in the conversation. The setting must appear in the
+   unbroken run: never drop a block from the middle. The setting must appear in the
    effective-settings dump, the session `settings` records, and README, like
    every other knob — and `off` must be a real off (send no blocks at all,
    not an empty field).
@@ -2193,10 +2260,6 @@ user-supplied value the project invariants say to pass through, not correct.
 4. **The conversation stays valid.** Item 5 must not produce an assistant
    message whose blocks disagree with its text/calls, and the existing
    synthetic-result repair for interrupted tool calls must keep working.
-   With a window policy (item 8) this gains a second edge: a dropped block
-   must never orphan a `tool_use` that is still in the conversation, and the
-   remaining blocks must stay an unbroken run — Anthropic allows dropping
-   the oldest, the newest, or all of them, but not one in between.
 5. **Additive protocol change.** Optional field, no version bump, both
    directions ignore it when absent; update `provider-protocol.md` §5 field
    rules and §9 version history in the same change, per the spec's own

@@ -241,6 +241,10 @@ fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
             ChatMessage::Assistant {
                 content,
                 tool_calls,
+                // The round's reasoning blocks (M23): captured and carried
+                // end to end; sending them back is the passback session's
+                // change.
+                thinking: _,
             } => {
                 let mut msg = json!({ "role": "assistant" });
                 let obj = msg.as_object_mut().unwrap();
@@ -684,6 +688,39 @@ mod tests {
             ])),
             thinking: None,
         }
+    }
+
+    #[test]
+    fn reasoning_blocks_are_ignored_on_the_request_side() {
+        // M23, the ignore-when-absent direction: DeepInfra's wire carries
+        // `reasoning_content` (session 2), so today an assistant message's
+        // blocks must change nothing at all — the request is byte-identical
+        // to one whose message carries none.
+        let with_blocks = ChatRequest {
+            messages: vec![
+                ChatMessage::user("hi"),
+                ChatMessage::Assistant {
+                    content: "answer".into(),
+                    tool_calls: None,
+                    thinking: Some(vec![
+                        clanky_protocol::ThinkingBlock::thinking("", Some("sig".into())),
+                        clanky_protocol::ThinkingBlock::redacted("blob"),
+                    ]),
+                },
+            ],
+            ..simple_request()
+        };
+        let without_blocks = ChatRequest {
+            messages: vec![ChatMessage::user("hi"), ChatMessage::assistant("answer")],
+            ..simple_request()
+        };
+        let provider =
+            DeepInfraProvider::new(MockBackend::new(Vec::new(), "[]"), "https://x.invalid");
+        assert_eq!(
+            provider.build_request_body(&with_blocks).unwrap(),
+            provider.build_request_body(&without_blocks).unwrap(),
+            "the blocks must not leak onto this provider's wire yet"
+        );
     }
 
     /// Run a canned SSE conversation and collect the chunks.

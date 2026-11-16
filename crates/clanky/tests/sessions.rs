@@ -169,6 +169,7 @@ impl Recorder {
                 text,
                 thinking,
                 calls,
+                thinking_blocks: _,
             } => {
                 let mut records = Vec::new();
                 if !thinking.is_empty() {

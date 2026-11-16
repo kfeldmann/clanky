@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use clanky_protocol::{
     CancelHandle, ChatMessage, ChatRequest, ChunkPayload, Error as ProtocolError, FinishReason,
-    Handler, LoopbackTransport, ProviderClient, Sampling, StreamAssembler, Thinking, ToolCall,
-    Transport, Usage,
+    Handler, LoopbackTransport, ProviderClient, Sampling, StreamAssembler, Thinking, ThinkingBlock,
+    ToolCall, Transport, Usage,
 };
 
 use crate::error::{Error, Result};
@@ -236,10 +236,16 @@ pub enum TurnEvent {
     /// one record (see `session::Record::Assistant`). A round cut short by
     /// an error is flushed the same way with whatever it streamed before
     /// the failure (`calls` empty), so nothing shown to the user is lost.
+    ///
+    /// `thinking_blocks` are the round's finished reasoning blocks in
+    /// generation order — the opaque payloads (signature / redacted data)
+    /// a later request passes back verbatim (M23). Empty when the provider
+    /// reports none, which is every provider without that concept.
     Round {
         text: String,
         thinking: String,
         calls: Vec<ToolCall>,
+        thinking_blocks: Vec<ThinkingBlock>,
     },
     /// The model asked to call a tool; `arguments` is compact JSON.
     ToolCall { name: String, arguments: String },
@@ -464,10 +470,19 @@ pub fn run_turn_with<T: Transport>(
         } else {
             assembler.tool_calls()
         };
+        let thinking_blocks = if round_cancelled {
+            // A stopped round's signatures may be incomplete, and nothing
+            // downstream will re-send them (M23 item 4 / M22's rule for
+            // calls: a cut-short round contributes no passback payload).
+            Vec::new()
+        } else {
+            assembler.thinking_blocks().to_vec()
+        };
         on_event(TurnEvent::Round {
             text: round_text.clone(),
             thinking: round_thinking,
             calls: calls.clone(),
+            thinking_blocks: thinking_blocks.clone(),
         });
         // A `Continuable` round's usage is not billed: its tokens ride the
         // next request (the partial response is sent back) and the provider
@@ -492,6 +507,7 @@ pub fn run_turn_with<T: Transport>(
                 messages.push(ChatMessage::Assistant {
                     content: round_text,
                     tool_calls: None,
+                    thinking: None,
                 });
             }
             return Ok(cancelled(text, usage_seen.then_some(usage_total)));
@@ -511,6 +527,7 @@ pub fn run_turn_with<T: Transport>(
                     messages.push(ChatMessage::Assistant {
                         content: round_text,
                         tool_calls: None,
+                        thinking: blocks_or_none(&thinking_blocks),
                     });
                 }
                 continue;
@@ -519,6 +536,7 @@ pub fn run_turn_with<T: Transport>(
             messages.push(ChatMessage::Assistant {
                 content: round_text,
                 tool_calls: None,
+                thinking: blocks_or_none(&thinking_blocks),
             });
             return Ok(TurnOutput {
                 text,
@@ -531,6 +549,7 @@ pub fn run_turn_with<T: Transport>(
         messages.push(ChatMessage::Assistant {
             content: assembler.text().to_string(),
             tool_calls: Some(calls.clone()),
+            thinking: blocks_or_none(&thinking_blocks),
         });
         let mut stop_after_tool = false;
         for call in &calls {
@@ -565,6 +584,14 @@ pub fn run_turn_with<T: Transport>(
     }
 }
 
+/// The `thinking` field of an assistant message: `Some` only when the round
+/// actually carried blocks, so an absent payload stays absent on the wire
+/// (`skip_serializing_if = "Option::is_none"`) instead of becoming an empty
+/// list (M23: `off` and "nothing to send" must be byte-identical).
+fn blocks_or_none(blocks: &[ThinkingBlock]) -> Option<Vec<ThinkingBlock>> {
+    (!blocks.is_empty()).then(|| blocks.to_vec())
+}
+
 /// A turn that ended because the user stopped it: everything it produced is
 /// kept, and the finish reason says why it ended.
 fn cancelled(text: String, usage: Option<Usage>) -> TurnOutput {
@@ -596,11 +623,15 @@ fn flush_partial_round(
         text: text.clone(),
         thinking,
         calls: Vec::new(),
+        // A round cut short by an error has no complete signature, so it
+        // contributes no passback payload (M23 constraint 2).
+        thinking_blocks: Vec::new(),
     });
     if !text.is_empty() {
         messages.push(ChatMessage::Assistant {
             content: text,
             tool_calls: None,
+            thinking: None,
         });
     }
 }
@@ -1052,7 +1083,8 @@ mod tests {
                 TurnEvent::Round {
                     text: "echo".into(),
                     thinking: "".into(),
-                    calls: vec![]
+                    calls: vec![],
+                    thinking_blocks: Vec::new(),
                 },
                 usage_event(3, 2),
             ]
@@ -1147,9 +1179,122 @@ mod tests {
             "system, user, continuation round, final round"
         );
         assert!(
-            matches!(&messages[2], ChatMessage::Assistant { content, tool_calls: None } if content == "half"),
+            matches!(&messages[2], ChatMessage::Assistant { content, tool_calls: None, .. } if content == "half"),
             "the partial response went back as an assistant message: {messages:?}"
         );
+    }
+
+    #[test]
+    fn a_rounds_thinking_blocks_ride_the_assistant_message_it_pushes() {
+        // M23 item 4: the blocks attach to the message the *next* round
+        // sends, for both a tool-call round and a `Continuable` resume. A
+        // round that emitted none leaves the field absent, not empty.
+        let signature = ThinkingBlock::thinking("", Some("sig-1".into()));
+        let handler = Box::new(MockHandler::scripted(vec![
+            ScriptedTurn {
+                chunks: [
+                    vec![ChunkPayload::ThinkingBlock {
+                        block: signature.clone(),
+                    }],
+                    vec![
+                        ChunkPayload::ToolCallStart {
+                            index: 0,
+                            id: "call_1".into(),
+                            name: "echo_tool".into(),
+                        },
+                        ChunkPayload::ToolCallArgs {
+                            index: 0,
+                            args_chunk: r#"{"input":"hi"}"#.into(),
+                        },
+                    ],
+                ]
+                .concat(),
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+            },
+            // A continuation round carrying its own block.
+            ScriptedTurn {
+                chunks: vec![
+                    ChunkPayload::ThinkingBlock {
+                        block: ThinkingBlock::redacted("blob-2"),
+                    },
+                    ChunkPayload::Text {
+                        text: "half".into(),
+                    },
+                ],
+                finish_reason: FinishReason::Continuable,
+                usage: None,
+            },
+            text_turn("rest"),
+        ]));
+        let mut messages = vec![ChatMessage::user("go")];
+        run_turn(
+            handler,
+            &toolset(),
+            &mut messages,
+            &config("mock/model"),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let assistants: Vec<&ChatMessage> = messages
+            .iter()
+            .filter(|m| matches!(m, ChatMessage::Assistant { .. }))
+            .collect();
+        assert_eq!(assistants.len(), 3, "tool round, continuation, answer");
+        assert_eq!(
+            assistants[0].thinking(),
+            Some([signature].as_slice()),
+            "the tool-call round's block goes back with its message"
+        );
+        assert_eq!(
+            assistants[1].thinking(),
+            Some([ThinkingBlock::redacted("blob-2")].as_slice()),
+            "a resumed round's blocks go back too"
+        );
+        assert_eq!(
+            assistants[2].thinking(),
+            None,
+            "a round that reasoned nothing sends no field at all"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_or_failed_round_sends_no_blocks() {
+        // M23 item 4: a round cut short contributes no passback payload —
+        // its signatures may be incomplete, and nothing downstream re-sends
+        // them (the same rule the round's tool calls follow).
+        let handler = Box::new(MockHandler::scripted(vec![ScriptedTurn {
+            chunks: vec![
+                ChunkPayload::ThinkingBlock {
+                    block: ThinkingBlock::thinking("", Some("sig-1".into())),
+                },
+                ChunkPayload::Text {
+                    text: "half".into(),
+                },
+            ],
+            finish_reason: FinishReason::Cancelled,
+            usage: None,
+        }]));
+        let mut messages = vec![ChatMessage::user("go")];
+        let rounds = std::cell::RefCell::new(Vec::new());
+        run_turn(
+            handler,
+            &toolset(),
+            &mut messages,
+            &config("mock/model"),
+            &mut |event| {
+                if let TurnEvent::Round {
+                    thinking_blocks, ..
+                } = &event
+                {
+                    rounds.borrow_mut().push(thinking_blocks.clone());
+                }
+            },
+        )
+        .unwrap();
+        assert!(rounds.borrow()[0].is_empty(), "the event carries none");
+        assert_eq!(messages[1].thinking(), None, "and the message keeps none");
     }
 
     #[test]
@@ -1275,6 +1420,7 @@ mod tests {
                         name: "echo_tool".into(),
                         arguments: serde_json::json!({"input": "hello"}),
                     }],
+                    thinking_blocks: Vec::new(),
                 },
                 usage_event(5, 4),
                 TurnEvent::ToolCall {
@@ -1292,7 +1438,8 @@ mod tests {
                 TurnEvent::Round {
                     text: "done".into(),
                     thinking: "".into(),
-                    calls: vec![]
+                    calls: vec![],
+                    thinking_blocks: Vec::new(),
                 },
                 usage_event(3, 2),
             ]
@@ -1369,7 +1516,8 @@ mod tests {
                 TurnEvent::Round {
                     text: "plain".into(),
                     thinking: "".into(),
-                    calls: vec![]
+                    calls: vec![],
+                    thinking_blocks: Vec::new(),
                 },
                 usage_event(3, 2),
             ]
@@ -1923,6 +2071,7 @@ mod tests {
                 text: "half an ans".into(),
                 thinking: String::new(),
                 calls: vec![],
+                thinking_blocks: Vec::new(),
             })
         );
         assert!(
@@ -1940,6 +2089,7 @@ mod tests {
             ChatMessage::Assistant {
                 content,
                 tool_calls: None,
+                ..
             } if content == "half an ans"
         ));
     }
@@ -2316,6 +2466,7 @@ mod tests {
             ChatMessage::Assistant {
                 content,
                 tool_calls: None,
+                ..
             } if content == "thinking about it"
         ));
         assert!(
@@ -2333,6 +2484,7 @@ mod tests {
                 text: "thinking about it".into(),
                 thinking: String::new(),
                 calls: vec![],
+                thinking_blocks: Vec::new(),
             })
         );
     }
@@ -2397,6 +2549,7 @@ mod tests {
                 text: "partial".into(),
                 thinking: "reason".into(),
                 calls: vec![],
+                thinking_blocks: Vec::new(),
             })
         );
         // The partial text joined the conversation; the half tool call did not.
@@ -2406,6 +2559,7 @@ mod tests {
             ChatMessage::Assistant {
                 content,
                 tool_calls: None,
+                ..
             } if content == "partial"
         ));
     }

@@ -8,13 +8,14 @@
 
 use serde_json::Value;
 
-use crate::messages::{ChunkPayload, ToolCall};
+use crate::messages::{ChunkPayload, ThinkingBlock, ToolCall};
 
 /// Accumulates one chat turn's stream events.
 #[derive(Debug, Default)]
 pub struct StreamAssembler {
     text: String,
     thinking: String,
+    blocks: Vec<ThinkingBlock>,
     calls: Vec<AssembledCall>,
 }
 
@@ -31,9 +32,11 @@ impl StreamAssembler {
     pub fn ingest(&mut self, payload: &ChunkPayload) {
         match payload {
             ChunkPayload::Text { text } => self.text.push_str(text),
-            // Thinking deltas are assembled for display/session storage;
-            // they are not part of the assistant message sent back.
+            // Thinking deltas are the display text of the round's reasoning;
+            // the passback payload arrives separately as a finished block
+            // (M23).
             ChunkPayload::Thinking { text } => self.thinking.push_str(text),
+            ChunkPayload::ThinkingBlock { block } => self.blocks.push(block.clone()),
             ChunkPayload::ToolCallStart { index, id, name } => {
                 let slot = self.slot(*index);
                 slot.id = id.clone();
@@ -61,6 +64,15 @@ impl StreamAssembler {
     /// The assistant's thinking text, assembled from `thinking` deltas.
     pub fn thinking(&self) -> &str {
         &self.thinking
+    }
+
+    /// The round's finished reasoning blocks in generation order, each
+    /// carrying the payload a later request passes back verbatim (M23).
+    /// Empty when the provider emitted none — which is every provider
+    /// without a reasoning-block concept, and a round that reasoned
+    /// nothing.
+    pub fn thinking_blocks(&self) -> &[ThinkingBlock] {
+        &self.blocks
     }
 
     /// The tool calls announced during the turn, with argument strings
@@ -142,6 +154,47 @@ mod tests {
         );
         assert_eq!(assembler.text(), "hi");
         assert_eq!(assembler.thinking(), "need to check");
+    }
+
+    #[test]
+    fn thinking_blocks_collect_in_order_beside_the_display_text() {
+        // M23: `thinking` deltas stay exactly what they were (display and
+        // session storage); the finished blocks arrive as their own chunks
+        // and are collected in generation order.
+        let mut assembler = StreamAssembler::default();
+        ingest_all(
+            &mut assembler,
+            &[
+                ChunkPayload::Thinking { text: "hmm".into() },
+                ChunkPayload::ThinkingBlock {
+                    block: ThinkingBlock::thinking("hmm", Some("sig-1".into())),
+                },
+                ChunkPayload::Text {
+                    text: "answer".into(),
+                },
+                ChunkPayload::ThinkingBlock {
+                    block: ThinkingBlock::redacted("data-2"),
+                },
+            ],
+        );
+        assert_eq!(assembler.thinking(), "hmm");
+        assert_eq!(assembler.text(), "answer");
+        assert_eq!(
+            assembler.thinking_blocks(),
+            [
+                ThinkingBlock::thinking("hmm", Some("sig-1".into())),
+                ThinkingBlock::redacted("data-2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_round_without_blocks_reports_none() {
+        // Every provider without a reasoning-block concept, and every round
+        // that reasoned nothing: an empty slice, never a synthesized block.
+        let mut assembler = StreamAssembler::default();
+        assembler.ingest(&ChunkPayload::Text { text: "hi".into() });
+        assert!(assembler.thinking_blocks().is_empty());
     }
 
     #[test]

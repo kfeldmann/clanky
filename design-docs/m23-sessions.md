@@ -1,4 +1,4 @@
-### Session 1 — Carry the payload (items 1–3, constraint 5)
+### ✔ Session 1 — Carry the payload (items 1–3, constraint 5) — **done** (see M23's "As built (session 1)")
 Capture and transport, **no behavior change on the wire** — nothing is sent back yet, so this session is fully offline-testable and safe to leave half-verified.
 
 - `AnthropicBlock` + `StreamDelta` gain `signature`/`data`; `signature_delta` arm joins the match; per-block struct replaces `HashMap<u32, String>` (finding 7's exact wire shapes: `content_block_start` carries `"signature":""`, `redacted_thinking` arrives whole on the start event).

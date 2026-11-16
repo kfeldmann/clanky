@@ -365,7 +365,8 @@ pub fn serve_stdio(handler: &mut dyn Handler) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::handler::PluginInfo;
-    use crate::messages::{Capabilities, FinishReason, ModelInfo};
+    use crate::messages::{Capabilities, FinishReason, ModelInfo, ThinkingBlock};
+    use serde_json::json;
     use std::io::Cursor;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -575,6 +576,107 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn thinking_blocks_cross_the_wire_both_directions() {
+        // M23: an assistant message's reasoning blocks survive the JSONL
+        // round trip on the request side, and a plugin can hand a finished
+        // block back as a chunk — the two directions a passback needs.
+        // `Fake` echoes the request it received; a second scripted chat
+        // checks the chunk shape a real plugin emits.
+        struct Blocks {
+            chats: Mutex<Vec<ChatRequest>>,
+        }
+        impl Handler for Blocks {
+            fn info(&self) -> PluginInfo {
+                PluginInfo {
+                    name: "blocks".into(),
+                    capabilities: Capabilities {
+                        list_models: false,
+                        thinking: true,
+                        tools: true,
+                    },
+                    default_model: None,
+                }
+            }
+            fn list_models(&mut self) -> Result<Vec<ModelInfo>, Error> {
+                Ok(Vec::new())
+            }
+            fn chat(
+                &mut self,
+                request: &ChatRequest,
+                sink: &mut dyn FnMut(ChunkPayload),
+            ) -> Result<ChatDone, Error> {
+                self.chats.lock().unwrap().push(request.clone());
+                sink(ChunkPayload::Thinking { text: "hmm".into() });
+                sink(ChunkPayload::ThinkingBlock {
+                    block: ThinkingBlock::thinking("hmm", Some("sig".into())),
+                });
+                sink(ChunkPayload::ThinkingBlock {
+                    block: ThinkingBlock::redacted("blob"),
+                });
+                Ok(ChatDone {
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                })
+            }
+        }
+
+        let mut handler = Blocks {
+            chats: Mutex::new(Vec::new()),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        serve(
+            &mut handler,
+            Cursor::new(
+                r#"{"type":"chat","id":3,"model":"m","messages":[{"role":"assistant","content":"a","thinking":[{"kind":"thinking","text":"","signature":"s1"},{"kind":"redacted","data":"d2"}]}]}"#
+                    .to_string(),
+            ),
+            &mut out,
+        )
+        .unwrap();
+
+        // Request direction: the blocks arrived intact and unmodified.
+        let chats = handler.chats.lock().unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(
+            chats[0].messages[0].thinking().unwrap(),
+            [
+                ThinkingBlock::thinking("", Some("s1".into())),
+                ThinkingBlock::redacted("d2"),
+            ]
+        );
+
+        // Chunk direction: the finished blocks went out as their own events,
+        // with only the fields each block carries.
+        let lines: Vec<Message> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| crate::messages::parse_message(l).unwrap().unwrap())
+            .collect();
+        let payloads: Vec<&ChunkPayload> = lines
+            .iter()
+            .filter_map(|m| match m {
+                Message::Chunk { payload, .. } => Some(payload),
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(payloads[0], ChunkPayload::Thinking { text } if text == "hmm"));
+        match payloads[1] {
+            ChunkPayload::ThinkingBlock { block } => assert_eq!(
+                serde_json::to_value(block).unwrap(),
+                json!({"kind": "thinking", "text": "hmm", "signature": "sig"})
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match payloads[2] {
+            ChunkPayload::ThinkingBlock { block } => assert_eq!(
+                serde_json::to_value(block).unwrap(),
+                json!({"kind": "redacted", "data": "blob"})
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

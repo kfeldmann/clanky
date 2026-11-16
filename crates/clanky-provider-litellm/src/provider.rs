@@ -317,6 +317,10 @@ fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
             ChatMessage::Assistant {
                 content,
                 tool_calls,
+                // The round's reasoning blocks (M23): captured and carried
+                // end to end; sending them back is the passback session's
+                // change.
+                thinking: _,
             } => {
                 let mut msg = json!({ "role": "assistant" });
                 let obj = msg.as_object_mut().expect("object literal");
@@ -902,6 +906,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reasoning_blocks_are_ignored_on_the_request_side() {
+        // M23, the ignore-when-absent direction: the proxy's
+        // `thinking_blocks` passback is session 2, so an assistant message's
+        // blocks must change nothing on the wire yet — byte-identical to the
+        // same message without them.
+        let provider = provider(CATALOG, MODEL_INFO, Vec::new());
+        let with_blocks = ChatRequest {
+            messages: vec![
+                ChatMessage::user("hi"),
+                ChatMessage::Assistant {
+                    content: "answer".into(),
+                    tool_calls: None,
+                    thinking: Some(vec![
+                        clanky_protocol::ThinkingBlock::thinking("", Some("sig".into())),
+                        clanky_protocol::ThinkingBlock::redacted("blob"),
+                    ]),
+                },
+            ],
+            ..request("openai/gpt-4o")
+        };
+        let without_blocks = ChatRequest {
+            messages: vec![ChatMessage::user("hi"), ChatMessage::assistant("answer")],
+            ..request("openai/gpt-4o")
+        };
+        assert_eq!(
+            provider.build_request_body(&with_blocks).unwrap(),
+            provider.build_request_body(&without_blocks).unwrap(),
+            "the blocks must not leak onto this provider's wire yet"
+        );
+    }
+
     fn run_chat(
         provider: &mut LiteLlmProvider<MockBackend>,
         request: &ChatRequest,
@@ -1274,6 +1310,7 @@ mod tests {
                 ChatMessage::user("list /tmp"),
                 ChatMessage::Assistant {
                     content: String::new(),
+                    thinking: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "call_1".into(),
                         name: "bash".into(),
@@ -1320,6 +1357,7 @@ mod tests {
                 ChatMessage::user("show me the screenshot"),
                 ChatMessage::Assistant {
                     content: String::new(),
+                    thinking: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "call_1".into(),
                         name: "view-image".into(),

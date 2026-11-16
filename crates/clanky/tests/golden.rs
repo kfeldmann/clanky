@@ -18,7 +18,7 @@ use clanky::tools::{Tool, ToolError, ToolOutput, ToolSet};
 use clanky::turn::{TurnConfig, run_turn};
 use clanky_protocol::{
     Capabilities, ChatDone, ChatMessage, ChatRequest, ChunkPayload, Error as ProtocolError,
-    FinishReason, Handler, PluginInfo, Usage,
+    FinishReason, Handler, PluginInfo, ThinkingBlock, Usage,
 };
 use serde_json::{Value, json};
 
@@ -471,6 +471,82 @@ fn cancelled_round_transcript_matches_golden() {
     });
     std::fs::remove_dir_all(dir).ok();
     compare_or_update("cancelled-round", &transcript);
+}
+
+/// M23: a round that emits reasoning blocks puts them on the assistant
+/// message the *next* request sends, verbatim — and a round that emits none
+/// leaves the field off entirely, so every pre-M23 golden is unchanged.
+///
+/// Regenerate with: `CLANKY_UPDATE_GOLDEN=1 cargo test --test golden`
+#[test]
+fn thinking_block_passback_transcript_matches_golden() {
+    let blocks = vec![
+        // The `display: "omitted"` shape: empty text, signature payload.
+        ThinkingBlock::thinking("", Some("sig-round-1".into())),
+        ThinkingBlock::redacted("opaque-redacted-blob"),
+    ];
+    let script = vec![
+        ScriptedTurn {
+            chunks: [
+                vec![ChunkPayload::ThinkingBlock {
+                    block: blocks[0].clone(),
+                }],
+                vec![ChunkPayload::ThinkingBlock {
+                    block: blocks[1].clone(),
+                }],
+                tool_call_chunks("call_1", "fake", r#"{"input": "hello"}"#),
+            ]
+            .concat(),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                prompt_tokens: Some(12),
+                completion_tokens: Some(9),
+                cached_tokens: None,
+            }),
+        },
+        // The final round reasons nothing: no blocks, so no field.
+        text_turn("The tool said: fake ran with input=hello"),
+    ];
+    let (provider, requests) = ScriptedProvider::new(script);
+    let mut messages = vec![ChatMessage::user("use the tool on hello")];
+    run_turn(
+        Box::new(provider),
+        &fake_tools(),
+        &mut messages,
+        &config(),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    // Round 2's request carries the assistant message with the blocks; round
+    // 1's carries only the user prompt (nothing to pass back yet).
+    let requests = requests.borrow();
+    let round2 = &requests[1]["messages"].as_array().unwrap();
+    let assistant = round2
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .expect("assistant message in round 2");
+    assert_eq!(
+        assistant["thinking"],
+        serde_json::to_value(&blocks).unwrap()
+    );
+    let round1 = &requests[0]["messages"].as_array().unwrap();
+    assert!(
+        round1.iter().all(|m| m.get("thinking").is_none()),
+        "nothing to pass back before the first round: {round1:?}"
+    );
+
+    // The final answer's message carries no field at all (absent, not empty).
+    let last = messages.last().expect("final assistant message");
+    assert_eq!(last.thinking(), None);
+
+    let transcript = json!({
+        "requests": *requests,
+        // What the conversation holds after the turn: the passback payload
+        // rides the tool-call round, and the plain answer carries none.
+        "history": messages,
+    });
+    compare_or_update("thinking-passback", &transcript);
 }
 
 #[test]

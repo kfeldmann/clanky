@@ -630,6 +630,9 @@ pub fn history_from_records(records: &[Record]) -> Vec<ChatMessage> {
                 messages.push(ChatMessage::Assistant {
                     content: text.clone(),
                     tool_calls: (!calls.is_empty()).then(|| calls.clone()),
+                    // Session fidelity for the passback payload is M23
+                    // session 3; until then a resumed session sends none.
+                    thinking: None,
                 });
             }
             Record::ToolResult { output, images, .. } => {

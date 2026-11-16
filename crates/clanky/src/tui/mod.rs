@@ -3185,7 +3185,7 @@ mod tests {
                 },
                 session::Record::Assistant {
                     text: "The answer".into(),
-                    calls: vec![]
+                    calls: vec![],
                 },
             ]
         );
@@ -3211,6 +3211,7 @@ mod tests {
                 text: "done".into(),
                 thinking: String::new(),
                 calls: vec![],
+                thinking_blocks: Vec::new(),
             },
         );
         state.flush_partial(&mut NoErrors);
@@ -3221,7 +3222,7 @@ mod tests {
                 leading_settings_record(),
                 session::Record::Assistant {
                     text: "done".into(),
-                    calls: vec![]
+                    calls: vec![],
                 },
             ]
         );
@@ -3254,7 +3255,7 @@ mod tests {
                 leading_settings_record(),
                 session::Record::Assistant {
                     text: "partial".into(),
-                    calls: vec![]
+                    calls: vec![],
                 },
                 session::Record::Error {
                     message: "provider error: backend: timed out reading response".into()
@@ -3431,6 +3432,7 @@ mod tests {
             text: "first".into(),
             thinking: String::new(),
             calls: vec![],
+            thinking_blocks: Vec::new(),
         }))
         .unwrap();
         tx.send(WorkerEvent::Turn(TurnEvent::Text {
@@ -3457,11 +3459,11 @@ mod tests {
                 leading_settings_record(),
                 session::Record::Assistant {
                     text: "first".into(),
-                    calls: vec![]
+                    calls: vec![],
                 },
                 session::Record::Assistant {
                     text: "second".into(),
-                    calls: vec![]
+                    calls: vec![],
                 },
             ],
             "the un-displayed error must not reach the resumed transcript"

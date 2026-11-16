@@ -616,6 +616,13 @@ Notes:
   overridable with `model` in settings or `--model`).
 - The model list comes from `GET /v1/models` on the authenticated account.
 - `ANTHROPIC_BASE_URL` overrides `https://api.anthropic.com`.
+- Thinking blocks are captured whole, signature included, and carried on
+  the round's assistant message. Anthropic verifies that signature, so the
+  block is never rewritten; on the models whose `display` defaults to
+  `"omitted"` the thinking text is empty and the signature *is* the
+  reasoning. Sending the blocks back on the next request is the
+  thinking-passback work (M23); until then the payload is captured and
+  carried but not yet re-sent.
 
 ### Writing a provider plugin
 
@@ -627,6 +634,14 @@ A plugin is a program that:
 3. Answers `listModels` with its catalog.
 4. Answers `chat` with `chunk` events and exactly one terminal `done`/`error`.
 5. Exits when stdin closes.
+
+Reasoning models may hand a round's reasoning blocks back to the client as
+`thinkingBlock` chunks (the opaque payload a later request must pass back —
+a signature, or a redacted block's data); the client then puts them on the
+assistant message's `thinking` field, and a plugin that understands them
+sends them back **unmodified**. Both are optional and additive: a plugin
+that emits none, and a plugin that ignores the field, behaves exactly as
+before. The spec's §5 and §6 have the shapes.
 
 See `design-docs/provider-protocol.md` for the full spec and
 [`examples/hello-world-provider/clanky-provider-hello-world`](examples/hello-world-provider/clanky-provider-hello-world)
