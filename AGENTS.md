@@ -81,6 +81,8 @@ decisions made during implementation. Check them before redesigning something.
 - `contrib/skills/` — optional ready-made agent skills (copy into
   `~/.clanky/skills/` or `.clanky/skills/`); currently just
   `parallel-subagents`
+- `session-cost.py` — standalone (stdlib-only) cost/usage reporter for
+  saved session files; see README "Cost reports for saved sessions"
 - `crates/clanky/tests/` — integration tests: golden session transcripts
   (tests/golden/), plugin e2e and pipe tests
 - `target/replay`, `target/tmp` — scratch space; never commit

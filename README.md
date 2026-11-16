@@ -15,6 +15,7 @@ An AI coding agent/harness for the terminal, written in Rust.
 - Full control over sampling parameters
 - Export sessions as Markdown
 - Resume previous sessions; can name session files for easy identification
+- Report per-session token usage and cost (`session-cost.py`)
 
 To get started, read the [QUICKSTART.md](QUICKSTART.md).
 
@@ -344,6 +345,10 @@ cost far above what the same session showed before it was quit.
 the cost continues from the same number. Records written before the field
 existed (absent, not null) load fine and simply carry no cached share.
 
+The same `usage` records let you price finished sessions offline, in more
+detail than the status line shows — see
+[`session-cost.py`](#cost-reports-for-saved-sessions-session-costpy) below.
+
 Sessions autosave as the conversation happens. When a turn is cut short —
 a provider error mid-stream, `Esc` stopping the turn in the TUI, or
 `ctrl+c` quitting while the answer is still streaming — the partially
@@ -361,6 +366,74 @@ screen, no mouse capture — so scrolling and copy/paste are your
 terminal's own (native scrollbar or wheel, native text selection), and
 the conversation stays in the terminal after clanky quits. `ctrl+l`
 erases the visible screen (scrollback is kept).
+
+### Cost reports for saved sessions (`session-cost.py`)
+
+`session-cost.py` (in the repository root; needs only `python3`) reads
+session files and reports their usage — and, given prices, their cost —
+broken down by where the tokens went:
+
+```sh
+./session-cost.py                                   # tokens, ./.clanky/sessions
+./session-cost.py --pricing "$0.03 cached, $0.15 in, $0.50 out" tmp/*.jsonl
+```
+
+With no FILE arguments it reads `./.clanky/sessions`. Arguments are
+session files or directories of them (`tmp/` reads `tmp/*.jsonl`).
+Without `--pricing` the report is token counts; with it, dollar costs.
+
+`--pricing` takes the prices exactly as DeepInfra's model page lists
+them — `$0.03 cached, $0.15 in, $0.50 out / 1M` is accepted verbatim
+(the `/ 1M` is understood; the labels `in`, `out` and `cached` are what
+matter, in any order and any case). Prices are per million tokens. `in`
+and `out` are required; `cached` may be omitted, in which case cached
+prompt tokens are priced at the input rate — the same fallback the TUI's
+status line uses when the catalog does not separate the two.
+
+The report attributes billed usage to four categories:
+
+- **Thinking** — the assistant's reasoning blocks.
+- **Tools** — tool calls (their arguments) and tool results.
+- **User** — the prompts you typed.
+- **Agent** — the assistant's visible answers.
+
+The session file records one `usage` record per chat round, which gives
+prompt, completion and cached totals but not how they split by content
+type. So `session-cost.py` splits each round's tokens by character count:
+completion tokens go to the categories of that round's own output
+(thinking, answer, tool-call arguments), and prompt tokens go to the
+categories of everything recorded before it — so context is billed where
+it was made. Thinking is completion-side only: it is billed as output
+when the model produces it, but it is never sent back, so it costs once
+and never inflates a later prompt.
+
+Shares are by characters, not tokens, so a category row is an estimate.
+The rows always add up to the billed usage exactly, so the **Total** is
+the real total — the same number as the session's `usage` records priced
+at the given rates, which is what a provider bills. The system prompt
+(AGENTS.md, skills, …) is not in the session file at all and is spread
+across the categories in the same proportion. Images a tool result
+carried are left out of the character counts, since their base64 length
+says nothing about what the model was billed for them.
+
+```text
+summarize-ch-04-n5p2
+====================
+  Thinking:  $0.004891
+  Tools:     $0.009124
+  User:      $0.000183
+  Agent:     $0.000237
+  -------------------
+  Total:       $0.0144
+
+  zai-org/GLM-5.3-Flash · in 175,435 · out 12,212 · cached 149,888 · 12 rounds
+```
+
+The footer restates the billed totals and the round count. With more
+than one session, a grand total follows the reports. A session that used
+several models is priced entirely at the one `--pricing` given, with a
+note on stderr. `--selftest` checks the attribution math against a
+built-in session and exits.
 
 ## Skills
 
