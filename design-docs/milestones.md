@@ -1737,7 +1737,7 @@ user-supplied value the project invariants say to pass through, not correct.
 
 ### Implementation
 
-0. **Spike first, live.** With real Anthropic credentials and
+0. **[x] Spike first, live.** With real Anthropic credentials and
    `thinking` enabled, drive one tool loop and capture the follow-up request
    clanky sends. Confirm (a) no 400 today, (b) what the API does with the
    thinking-less history — `message_delta` stop reason and the round's
@@ -1774,6 +1774,277 @@ user-supplied value the project invariants say to pass through, not correct.
      `prefix_mismatch_behavior: "drop_block"`, both useful, but it is a
      second behavioral change riding on a correctness fix. Note it as a
      follow-up; keep this milestone to passback.
+
+   **As built (spike, 2026-11-16, live against `api.anthropic.com` with the
+   stored OAuth credentials).** Method: a logging reverse proxy on
+   `127.0.0.1` in front of `api.anthropic.com` (`ANTHROPIC_BASE_URL`), so
+   the follow-up request is captured byte-for-byte from an unmodified
+   `clanky -p`; plus ~200 direct `curl`/Python probes against the API for
+   the questions a single clanky run cannot answer. The proxy and captures
+   are throwaway (`target/tmp/m23/`); no repository code was changed.
+
+   **Headline: item 0's premise is half right, and the half that is wrong
+   changes the milestone's shape.** There is no 400 today, and — on the
+   configured model — there is also no silent degradation. But on the
+   whole `4-5`/`4-6` family the degradation is real, reproducible, and
+   total (thinking is silently off for every follow-up round of every tool
+   loop). So the milestone is **a correctness fix for users on the `4-x`
+   models and a fidelity/cost optimization on the configured
+   `claude-haiku-5-5`** — not one or the other. Both are worth doing;
+   which one a given user gets depends on their model.
+
+   1. **`claude-haiku-5-5` + `thinking = "32000"` is accepted (200) and
+      thinking really runs.** The per-model table's "400 on Haiku 5.5"
+      is wrong as stated: `{type:"enabled",budget_tokens:32000}` returns
+      200, produces thinking blocks, and reports
+      `output_tokens_details.thinking_tokens > 0`. The `/v1/models`
+      catalog does advertise `enabled.supported: false` /
+      `adaptive.supported: true` for this model — the catalog is the
+      unreliable one, the Messages endpoint is the truth. Per the project
+      invariants nothing should "fix" `settings.toml`: **the configured
+      pair works and must be left alone.**
+      *Caveat found while probing:* `budget_tokens` is a much weaker
+      control on `5-5` than on `4-x`. Same prompt, 5 reps per budget,
+      median `thinking_tokens`: on `haiku-4-5` **244 at budget 1024 vs
+      4,539 at 32000** (~19×, a clear effect); on `haiku-5-5` **2,286 vs
+      3,112** (~1.4×, barely above the spread of the runs themselves —
+      single observations ranged 2,102–3,689 and 2,396–3,689). Note also
+      that even on `haiku-4-5` the budget is not a hard cap: budget 1024
+      produced 3,849 and 7,618 thinking tokens in individual runs. So on
+      the configured model the user's `thinking = "32000"` is a soft hint
+      at best, not a cap. That is provider-side behavior on a value we
+      pass through verbatim — under the invariants we pass it through and
+      surface what happens; it is **not** this milestone's job to
+      translate `enabled` into `adaptive` or vice versa. Recorded as a
+      follow-up below.
+
+   2. **`enabled` mode has a hard 1024-token floor and a `max_tokens`
+      ceiling**, both live 400s with actionable messages:
+      `thinking.enabled.budget_tokens: Input should be greater than or
+      equal to 1024` (512 and 1023 reject; 1024 accepts) and
+      ``` `max_tokens` must be greater than `thinking.budget_tokens` ```
+      (verified on `haiku-4-5`: `max_tokens:1024` + budget 2048 400s;
+      `haiku-5-5` accepts that pair, another sign its budget is not
+      enforced). `clanky`'s `parse_thinking` accepts any non-negative
+      integer, so `--thinking 512` reaches the wire and the user sees the
+      provider's error — exactly what the invariants ask for. **No local
+      pre-validation to add.**
+
+   3. **`display` is a per-model default, and on this deployment the text
+      is simply not there.** `haiku-5-5` returns `thinking: ""` with a
+      populated `signature` under `enabled` with no `display`, with
+      `display:"omitted"`, and — notably — with
+      `display:"summarized"` too (5/5 reps). Only `adaptive` +
+      `display:"summarized"` produces text on `haiku-5-5` (923–1,288
+      chars, 3/3). `haiku-4-5` and `sonnet-4-5` return real text by
+      default. **So constraint 3 is confirmed as the mainline for the
+      configured model: the signature is the payload, the text is a
+      display convenience that `enabled` mode does not even offer.**
+      `clanky` currently captures neither — it streams the (empty) text
+      and drops the signature on the floor.
+
+   4. **The signature is genuinely the payload, and the thinking *text* is
+      display-only.** All on `haiku-4-5`, the one current model that
+      returns readable text, so both halves are testable:
+      - *Tampering, signature:* altering any byte of `signature` (last 4
+        chars, the whole thing, emptying it, deleting the field) is an
+        immediate `` 400 invalid_request_error: Invalid `signature` in
+        `thinking` block ``. *Tampering, text:* truncating, appending to,
+        or emptying the thinking text is accepted with **200**. The API
+        verifies the signature and ignores the text.
+      - *The text is not sent as context.* `input_tokens` is
+        **byte-identical** for the same history with the text left
+        original, emptied to `""`, and padded with **+8,000 characters**
+        (1,332 in all three cases in one run, 1,379 in another, on both a
+        tool-loop and a cross-turn history). Sixteen kilobytes of text
+        costing zero tokens is conclusive: the text never reaches the
+        prompt. (A behavioural injection probe through the text was also
+        run and was **inconclusive/noisy** — a single non-reproducing
+        answer change across 6 trials, most likely ordinary sampling
+        variance. The token measurement is the reliable evidence and it
+        is unambiguous, so **do not cite the injection probe as proof of
+        anything**; the milestone's earlier DeepInfra injection
+        experiment does not transfer to Anthropic.)
+      - *Cost tracks the signature.* Added prompt tokens on the tool-loop
+        follow-up were +75/+104/+78/+220/+76/+169 for signatures of
+        588/688/592/1100/584/1136 chars — **0.13–0.20 tokens per
+        signature char (mean 0.15)**, with **+0** for any change to the
+        text. Signatures ran **2–4× the text length** (mean 3.1×).
+      **This confirms the milestone's own framing outright: on Anthropic
+      the encrypted signature *is* the reasoning and the text is a
+      display convenience.** It also means the `display: "omitted"`
+      models lose nothing by passing back an empty-text block — the
+      payload is intact.
+      **Consequence for item 7's cost model:** the "+56% intra-turn /
+      +73% all-turns" arithmetic in the milestone above was computed from
+      *thinking text* at 4.49 chars/token. On Anthropic that is the wrong
+      base: the text is free and the signature is billed at ~0.15
+      tok/char over a longer string, so the per-block cost lands in a
+      similar order of magnitude for an entirely different reason. The
+      DeepInfra numbers (where `reasoning_content` *is* the payload)
+      stand as measured. **Item 7 must state the two providers' cost
+      models separately, not reuse one ratio.** A practical corollary:
+      passback cost on Anthropic is roughly `0.15 × signature_chars`
+      per block per later round, and signature length grows with thinking
+      effort (588 chars at 44 thinking tokens → 1,136 chars at 137), so the
+      expensive rounds are the ones that reasoned hardest.
+
+   5. **A thinking-less tool-loop history silently disables thinking —
+      on the models where `enabled` is the working mode.** This is the
+      degradation item 0 predicted, and it is clean and reproducible.
+      The signal is `output_tokens_details` in `message_delta`:
+      **absent** when thinking was disabled for the request, **present**
+      when it ran. Tool-loop trials per model (`haiku-4-5` and the `5-5`
+      pair got 5 reps; the others 2, because each was unanimous on the
+      first):
+
+      | model | `enabled`/`adaptive` | R1 thinking | R2 history without blocks | R2 history with blocks |
+      |---|---|---|---|---|
+      | `claude-haiku-4-5-20251001` | enabled | 44–278 tok | `output_tokens_details` **absent** ×5 | **present** ×5 |
+      | `claude-sonnet-4-5-20250929` | enabled | 323 tok | **absent** ×2 | **present** ×2 |
+      | `claude-opus-4-5-20251101` | enabled | 40 tok | **absent** ×2 | **present** ×2 |
+      | `claude-sonnet-4-6` | enabled | 45 tok | **absent** ×2 | **present** ×2 |
+      | `claude-opus-4-6` | enabled | 26 tok | **absent** ×2 | **present** ×2 |
+      | `claude-haiku-5-5` | enabled | 184–629 tok | **present** ×5 | **present** ×5 |
+      | `claude-sonnet-5-5` | adaptive | 155–187 tok | **present** ×5 | **present** ×5 |
+      | `claude-opus-5-5` | adaptive | (no block emitted) | **present** ×2 | **present** ×2 |
+
+      **So the configured deployment is in the lucky group**: `haiku-5-5`
+      keeps thinking on across a blockless tool loop, which is why the
+      maintainer has never seen a problem. The `4-x`/`4-6` family is in
+      the unlucky group, where today's clanky runs every follow-up round
+      with thinking silently off. That is a real, measurable quality bug
+      for any user on those models, and it is the strongest argument for
+      item 4.
+      **Also confirmed:** the degradation is triggered by a **tool-loop**
+      history specifically. A cross-turn (no `tool_use`) history missing
+      its thinking block does *not* degrade on `haiku-4-5` (thinking
+      stays `present` in 3/3 trials). The API is matching the documented
+      rule — "thinking blocks are required within a tool-use turn,
+      optional outside it" — rather than the cruder "any blockless
+      assistant message disables thinking". **Item 8's split (intra-turn
+      mandatory, cross-turn optional) is exactly right, and is now
+      measured rather than inferred.**
+
+   6. **Block placement and run integrity are enforced, and the rules are
+      stricter than the milestone assumed.** On `haiku-4-5`, with 57–70
+      thinking blocks in one round (the magic redaction string produces
+      dozens):
+      - **Blocks must come first**, before the text and `tool_use`
+        blocks. Blocks *after* `tool_use` → thinking silently disabled
+        (no error, `output_tokens_details` absent). So the milestone's
+        "before the text block, exactly as received" is load-bearing.
+      - **Only a trailing truncation is legal.** Keeping a *prefix* of
+        the run (dropping the newest blocks) → 200. Keeping a *suffix*
+        (dropping the oldest) → `400: thinking or redacted_thinking
+        blocks in the latest assistant message cannot be modified. These
+        blocks must remain as they were in the original response.`
+        Dropping from the middle (a hole) → same 400. **This inverts
+        item 8's "Anthropic allows dropping the oldest, the newest, or
+        all of them, but not one in between": in the *latest* assistant
+        message only a prefix survives.** Dropping *all* of them is fine
+        (200, thinking just goes off), and older messages can have their
+        blocks dropped freely — the rule is scoped to the latest
+        assistant message, exactly as the error text says.
+      - **`redacted_thinking` data is verified the same way**: any
+        alteration (last 8 chars, emptied, reversed) →
+        `400: Invalid `data` in `redacted_thinking` block`.
+      - **Signatures are not bound to a conversation on this deployment.**
+        Transplanting conversation B's thinking block into conversation
+        A's tool loop returned **200** in 3/3 reps — the documented
+        `Invalid signature in thinking block. The block is bound to a
+        different conversation` never fired. Constraint 1's "never
+        modify" rule still holds absolutely (any byte change 400s), but
+        the "bound to a conversation" clause is not observable here, so
+        don't design a cross-conversation validity check around it.
+
+   7. **Streaming shape for `redacted_thinking`** (for item 1):
+      `content_block_start` carries the **whole** `{"type":"redacted_thinking","data":"…"}`
+      block in one event — there are **no deltas** for it. A normal
+      `thinking` block streams as `content_block_start {type:"thinking",
+      thinking:""}` + N `thinking_delta`s + **one `signature_delta`** +
+      `content_block_stop`. So the accumulator needs a per-block slot
+      for the signature (joined `signature_delta`s) and must take
+      `redacted_thinking`'s `data` off the start event — the milestone's
+      item 1 describes exactly this, and the wire confirms it. Note
+      `content_block_start` for `thinking` carries `"signature":""`, not
+      an absent field, so "empty" and "absent" both need handling.
+      The non-streaming path (`stream=false`) puts `signature` and
+      `data` directly on the content block, as expected.
+
+   8. **Side observation, not a milestone item: the OAuth identity block is
+      load-bearing for the newer models.** On the OAuth surface, a
+      Messages request **without** the Claude Code identity system block
+      returns `429 rate_limit_error` — not a 401 or 403 — on
+      `haiku-5-5`, `sonnet-5-5`, `sonnet-4-5` and the other `4-5`/`4-6`
+      models; the same request *with* it returns 200. `haiku-4-5` does not
+      care. Interleaved, 3 cycles each way, so it is not real rate
+      limiting. clanky already sends the identity block on the OAuth path
+      (M11c), so nothing needs to change — but it explains any future
+      "why does a bare request 429?" confusion, and it is worth knowing
+      that a 429 from this deployment can mean "you did not identify as
+      Claude Code", not "you are going too fast".
+
+   9. **Error strings to reproduce in tests** (all
+      `400 invalid_request_error`, all surfaced verbatim by clanky):
+      - `thinking.enabled.budget_tokens: Input should be greater than or equal to 1024`
+      - ``` `max_tokens` must be greater than `thinking.budget_tokens`. ```
+      - `adaptive thinking is not supported on this model`
+      - ``` `temperature` may only be set to 1 when thinking is enabled. ```
+      - `thinking: Input tag 'bogus' found using 'type' does not match any of the expected tags: 'adaptive', 'between_tools', 'disabled', 'enabled'`
+      - `` Invalid `signature` in `thinking` block ``
+      - `` Invalid `data` in `redacted_thinking` block ``
+      - `` `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response. ``
+
+   **Two findings that change the plan, beyond item 0's questions:**
+
+   - **Item 8's window policy cannot drop "the oldest" on the latest
+     assistant message.** Only a trailing truncation is accepted there
+     (finding 6). Since intra-turn passback is mandatory and must not be
+     switchable, the only window that matters is *cross-turn*, where
+     older messages may lose their blocks freely — so `previous-turn`
+     (keep the current turn's blocks in full, drop older turns') is not
+     just the recommended default, it is the only shape the API accepts
+     without truncating the newest run. **The policy description in item
+     8 should be rewritten to say "drop whole older turns, never a
+     partial run in the latest message".**
+   - **`redacted_thinking` blocks are part of the same run, so the prefix
+     rule covers them too.** Dropping *all* of them is legal (200,
+     thinking silently off — 3/3 reps at 21–94 redacted blocks), and so
+     is keeping any *prefix*; keeping a *suffix* or punching a hole 400s
+     exactly as it does for plain thinking blocks. So a partially
+     truncated redacted run is a hard failure, and a window policy that
+     keeps the newest blocks instead of the oldest would turn a redacted
+     tool loop into a 400. Item 1's "must reach the client too" is what
+     keeps the run intact.
+     *(Correction: an earlier probe in this spike reported that dropping
+     all redacted blocks 400'd. That was a bug in the probe — it
+     duplicated the `tool_use` block, and the API's real complaint was
+     `` `tool_use` ids must be unique ``. Re-run correctly, dropping all
+     of them is fine. The rule is the prefix rule, not "redacted blocks
+     are mandatory".)*
+
+   **What this settles, item by item:** items 1–5 are confirmed as
+   written (capture the signature and `data` on both transports, carry an
+   ordered block vector through the protocol, emit a terminal per-block
+   chunk when the block closes, attach blocks to the pushed assistant
+   message, and replay them from session records) — findings 7, 4 and 3
+   pin the exact wire shapes they must handle. **Item 6's Anthropic arm
+   is confirmed and its "send everything" instruction is safe** (the API
+   filters, and cross-turn blocks are optional, so over-sending costs
+   nothing it does not choose to keep). **Item 8 needs the window-policy
+   rewrite above.** **Item 7 needs the two-provider cost split above.**
+   Nothing here argues for changing `settings.toml`, `parse_thinking`, or
+   the thinking-mode mapping: the configured pair works.
+
+   **Not tested / deferred:** the `thinking-binding-controls-2026-08-01`
+   beta header (per the amendment, deliberately not added); the
+   `between_tools` thinking type (`sonnet-5-5` advertises it — a third
+   thinking mode this milestone does not touch); and the `enabled`-mode
+   budget being a soft hint on `5-5` models — worth a follow-up README
+   note (not a code change, per the invariants), since
+   `thinking = "32000"` in a settings file reads as a cap and is not one
+   on the configured model.
 
 1. **Capture the signature (both transports).** `AnthropicBlock` gains
    `signature: Option<String>` and `data: Option<String>` (the
