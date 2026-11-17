@@ -53,7 +53,7 @@ chmod 755 docker/binaries/clanky \
 
 if [ -f extra-binaries ]
 then
-    . extra-binaries
+    /bin/sh extra-binaries
 fi
 
 if [ -f ~/.vimrc ]
