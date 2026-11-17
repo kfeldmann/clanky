@@ -6,7 +6,7 @@ Capture and transport, **no behavior change on the wire** — nothing is sent ba
 - One terminal `ThinkingBlock` chunk on close (the doc's preferred shape), `StreamAssembler` returns finished blocks, `TurnEvent::Round` carries them.
 - **Exit:** protocol unit tests for both transports incl. redacted + empty-text-signed; existing goldens pass *unchanged*; one new golden with blocks pins the request field.
 
-### Session 2 — Send it back (items 4, 6)
+### ✔ Session 2 — Send it back (items 4, 6) — **done** (see M23's "As built (session 2)")
 The only session that touches the wire, and the one where the milestone's headline win lands.
 
 - Turn loop attaches blocks to the pushed assistant message (`turn.rs:531`) and to `Continuable` resumes (`:511`); interrupted/cancelled rounds send none.

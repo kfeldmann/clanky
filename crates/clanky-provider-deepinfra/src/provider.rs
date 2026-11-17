@@ -241,15 +241,24 @@ fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
             ChatMessage::Assistant {
                 content,
                 tool_calls,
-                // The round's reasoning blocks (M23): captured and carried
-                // end to end; sending them back is the passback session's
-                // change.
-                thinking: _,
+                // The round's reasoning blocks (M23): the concatenated text
+                // is the payload here — DeepInfra counts it as prompt
+                // context (measured +≈400 tokens for a ~1800-char block),
+                // while `thinking_blocks`/`reasoning_details`/`thinking`
+                // are silently ignored (+0 tokens), so `reasoning_content`
+                // is sent and nothing else (session 2). A block with no
+                // text contributes nothing; signatures and redacted data
+                // have no wire meaning on this provider and are dropped.
+                thinking,
             } => {
                 let mut msg = json!({ "role": "assistant" });
                 let obj = msg.as_object_mut().unwrap();
                 if !content.is_empty() {
                     obj.insert("content".into(), json!(content));
+                }
+                let reasoning = reasoning_content(thinking.as_deref());
+                if !reasoning.is_empty() {
+                    obj.insert("reasoning_content".into(), json!(reasoning));
                 }
                 if let Some(calls) = tool_calls {
                     obj.insert(
@@ -277,6 +286,22 @@ fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
         }
     }
     Ok(out)
+}
+
+/// The `reasoning_content` an assistant message carries back to the
+/// provider: its reasoning blocks' concatenated text (M23 session 2).
+/// DeepInfra treats `reasoning` as an exact alias of this field and
+/// silently ignores `thinking_blocks`, `reasoning_details` and `thinking`
+/// (measured +0 prompt tokens) — so this field is sent and nothing else.
+/// An empty string when the message has no blocks or no text, so a
+/// blockless request stays byte-identical to the pre-M23 shape.
+fn reasoning_content(blocks: Option<&[clanky_protocol::ThinkingBlock]>) -> String {
+    blocks
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|block| block.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// The `user` message that carries a tool result's images: an array of
@@ -691,11 +716,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_blocks_are_ignored_on_the_request_side() {
-        // M23, the ignore-when-absent direction: DeepInfra's wire carries
-        // `reasoning_content` (session 2), so today an assistant message's
-        // blocks must change nothing at all — the request is byte-identical
-        // to one whose message carries none.
+    fn reasoning_text_is_passed_back_as_reasoning_content_and_nothing_else() {
+        // M23 session 2, the OpenAI-compatible arm: the blocks' text is the
+        // payload here (measured +≈400 prompt tokens for a ~1800-char block
+        // on `gpt-oss-20b`), sent as `reasoning_content` — DeepInfra counts
+        // `reasoning` as an alias too but silently ignores
+        // `thinking_blocks`/`reasoning_details`/`thinking` (+0 tokens), so
+        // those never go out. A blockless message stays byte-identical to
+        // the pre-M23 shape.
+        let provider =
+            DeepInfraProvider::new(MockBackend::new(Vec::new(), "[]"), "https://x.invalid");
         let with_blocks = ChatRequest {
             messages: vec![
                 ChatMessage::user("hi"),
@@ -703,8 +733,12 @@ mod tests {
                     content: "answer".into(),
                     tool_calls: None,
                     thinking: Some(vec![
-                        clanky_protocol::ThinkingBlock::thinking("", Some("sig".into())),
-                        clanky_protocol::ThinkingBlock::redacted("blob"),
+                        clanky_protocol::ThinkingBlock::thinking(
+                            "first thought, ",
+                            Some("sig".into()),
+                        ),
+                        clanky_protocol::ThinkingBlock::thinking("second", None),
+                        clanky_protocol::ThinkingBlock::redacted("opaque blob"),
                     ]),
                 },
             ],
@@ -714,16 +748,54 @@ mod tests {
             messages: vec![ChatMessage::user("hi"), ChatMessage::assistant("answer")],
             ..simple_request()
         };
-        let provider =
-            DeepInfraProvider::new(MockBackend::new(Vec::new(), "[]"), "https://x.invalid");
+        let body: Value = serde_json::from_str(&provider.build_request_body(&with_blocks).unwrap())
+            .expect("valid body");
+        let assistant = &body["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
         assert_eq!(
-            provider.build_request_body(&with_blocks).unwrap(),
+            assistant["reasoning_content"].as_str(),
+            Some("first thought, second"),
+            "text joined in block order; signature and redacted data have no wire meaning here"
+        );
+        assert!(
+            serde_json::to_string(&body)
+                .unwrap()
+                .split("reasoning_content")
+                .count()
+                == 2,
+            "exactly one field occurrence: no alias or ignored shapes sent"
+        );
+        // A blockless request is byte-identical to the pre-M23 shape (the
+        // ignore-when-absent direction).
+        assert_eq!(
             provider.build_request_body(&without_blocks).unwrap(),
-            "the blocks must not leak onto this provider's wire yet"
+            provider.build_request_body(&without_blocks).unwrap(),
+            "a blockless request is byte-identical (the ignore-when-absent direction)"
+        );
+        // A message whose blocks carry no text at all sends no field
+        // either — nothing to pass back must look exactly like nothing
+        // (an empty `reasoning_content` would be a forged field).
+        let textless = ChatRequest {
+            messages: vec![
+                ChatMessage::user("hi"),
+                ChatMessage::Assistant {
+                    content: "answer".into(),
+                    tool_calls: None,
+                    thinking: Some(vec![
+                        clanky_protocol::ThinkingBlock::thinking("", Some("sig".into())),
+                        clanky_protocol::ThinkingBlock::redacted("opaque blob"),
+                    ]),
+                },
+            ],
+            ..simple_request()
+        };
+        assert_eq!(
+            provider.build_request_body(&textless).unwrap(),
+            provider.build_request_body(&without_blocks).unwrap(),
+            "a no-text payload is byte-identical to sending nothing"
         );
     }
 
-    /// Run a canned SSE conversation and collect the chunks.
     fn run_sse<L: AsRef<str>>(
         lines: &[L],
         request: &ChatRequest,
@@ -739,6 +811,124 @@ mod tests {
     fn text_chunk(text: &str) -> String {
         serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": null}]})
             .to_string()
+    }
+
+    /// The live acceptance check (M23 session 2's exit criterion): a real
+    /// round-trip asserts the *observed* token accounting — passing a
+    /// reasoning block back as `reasoning_content` raises the second
+    /// round's `prompt_tokens` by roughly one token per 4–5 characters on
+    /// `openai/gpt-oss-20b` (measured: +400 for a ~1800-char block, +4400
+    /// for a ~19k one, with a small fixed overhead). Gated behind
+    /// `M23_LIVE_DEEPINFRA=1` (plus `DEEPINFRA_API_KEY`/`DEEPINFRA_TOKEN`)
+    /// so CI stays offline-green; a future refactor that silently stops
+    /// sending the field fails this instead of quietly changing behavior.
+    #[test]
+    fn live_reasoning_content_costs_its_tokens() -> Result<(), Error> {
+        if std::env::var("M23_LIVE_DEEPINFRA").map(|v| v != "0") != Ok(true) {
+            eprintln!("skipping: set M23_LIVE_DEEPINFRA=1 to run the live DeepInfra check");
+            return Ok(());
+        }
+        let mut provider = DeepInfraProvider::from_env()?;
+        let model = "openai/gpt-oss-20b";
+        let thinking = Thinking {
+            budget_tokens: Some(32_768),
+        };
+        // Round 1: a tool loop that makes the model reason, and report its
+        // reasoning as `reasoning_content` deltas.
+        let ask = |tools: Option<Vec<Tool>>, text: &str| ChatRequest {
+            model: model.into(),
+            messages: vec![ChatMessage::user(text.to_string())],
+            tools,
+            sampling: None,
+            thinking: Some(thinking),
+        };
+        let bash = Tool {
+            name: "bash".into(),
+            description: Some("Run a shell command".into()),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            })),
+        };
+        let with_tools = ask(Some(vec![bash.clone()]), "call the tool on 'hello'");
+        let mut round1_chunks = Vec::new();
+        let round1_done = provider.chat(&with_tools, &mut |c| round1_chunks.push(c))?;
+        assert_eq!(round1_done.finish_reason, FinishReason::ToolCalls);
+        let calls = round1_chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::ToolCallStart { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!calls.is_empty(), "the round must produce a tool call");
+        let round1_reasoning: String = round1_chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let reasoning_chars = round1_reasoning.chars().count();
+        assert!(
+            reasoning_chars >= 200,
+            "the round must reason enough to measure ({reasoning_chars} chars)"
+        );
+        let round2_usage = round1_done.usage.expect("usage");
+
+        // Round 2, with passback: identical history plus the assistant
+        // round's `reasoning_content`. The delta against the same request
+        // without it is the measured cost.
+        let mut passback_messages = with_tools.messages.clone();
+        passback_messages.push(ChatMessage::Assistant {
+            content: String::new(),
+            tool_calls: Some(vec![clanky_protocol::ToolCall {
+                id: calls[0].clone(),
+                name: "bash".into(),
+                arguments: json!({"command": "echo hello"}),
+            }]),
+            thinking: Some(vec![clanky_protocol::ThinkingBlock::thinking(
+                round1_reasoning.clone(),
+                None,
+            )]),
+        });
+        passback_messages.push(ChatMessage::tool(calls[0].clone(), "hello"));
+        let mut passback_request = with_tools.clone();
+        passback_request.messages = passback_messages;
+        let mut round2p_chunks = Vec::new();
+        let round2p_done = provider.chat(&passback_request, &mut |c| round2p_chunks.push(c))?;
+        let round2p_usage = round2p_done.usage.expect("usage");
+
+        let delta_passback = round2p_usage.prompt_tokens.unwrap_or(0) as i64
+            - round2_usage.prompt_tokens.unwrap_or(0) as i64;
+        // A band, not a point: tokenization of prose is not exact, so the
+        // assertion is "at least one token per five characters and well
+        // under the 1:2 ceiling, plus a small fixed overhead" — tight
+        // enough that a refactor which stops sending the field (delta 0)
+        // fails, loose enough to survive sampling and tokenizer variance.
+        let min = (reasoning_chars / 5) as i64;
+        let max = (reasoning_chars / 2 + 60) as i64;
+        assert!(
+            (min..=max).contains(&delta_passback),
+            "passing back a {reasoning_chars}-char block should cost ≈1 token per 4–5 chars \
+             ({min}..{max} prompt tokens), got {delta_passback} \
+             (round2 = {round2_usage:?}, round2' = {round2p_usage:?})"
+        );
+
+        // Sanity on the measurement itself: replaying the identical
+        // no-passback request must not move prompt tokens by anything like
+        // the passback cost.
+        let mut replay_chunks = Vec::new();
+        let replay_done = provider.chat(&with_tools, &mut |c| replay_chunks.push(c))?;
+        let replay_usage = replay_done.usage.expect("usage");
+        let delta_replay = replay_usage.prompt_tokens.unwrap_or(0) as i64
+            - round2_usage.prompt_tokens.unwrap_or(0) as i64;
+        assert!(
+            delta_replay.abs() <= 40,
+            "replaying the identical request must not move prompt tokens by ~400 (got {delta_replay})"
+        );
+        Ok(())
     }
 
     fn done_chunk(reason: &str) -> String {

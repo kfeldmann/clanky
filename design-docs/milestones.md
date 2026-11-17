@@ -1551,11 +1551,10 @@ As built:
 
 ## ☐ M23 — Thinking passback: send reasoning back to the model
 
-**Session 1 of 4 done: the payload is captured and carried (nothing is
-sent back yet — the wire is unchanged, so the existing goldens pass
-verbatim). Sessions 2–4 are the passback itself, session fidelity, and the
-knob/cost docs; see `design-docs/m23-sessions.md` and this section's
-"As built (session 1)" note.**
+**Sessions 1–2 of 4 done: the payload is captured, carried, and now sent
+back — the passback itself is live on all three providers (session 2's
+"As built" note below). Sessions 3–4 are session fidelity and the
+knob/cost docs; see `design-docs/m23-sessions.md`.**
 
 Clanky never sends an assistant round's thinking back to the provider. The
 protocol's assistant message is `{content, tool_calls}` and nothing else
@@ -2114,6 +2113,55 @@ user-supplied value the project invariants say to pass through, not correct.
      §9 (the additive v2 entry); README's plugin-authoring bullet and the
      Anthropic notes.
 
+   **As built (session 2, 2026-11).** The passback is live on all three
+   providers; the wire changed and the existing goldens still pass
+   unchanged (their requests carry no blocks, and the ignore-when-absent
+   direction is byte-identical everywhere).
+
+   - **Anthropic arm** (`adapter.rs`). `build_request_body` now emits an
+     assistant message's `thinking` blocks as content blocks, in wire
+     order, **before** the text and `tool_use` blocks — the spike's
+     finding 6 (blocks after `tool_use` silently disable thinking) is
+     load-bearing here. The mapping is identity: a `thinking` block goes
+     out as `{"type":"thinking","thinking":<text>,"signature":<sig>}` with
+     the empty text kept (the `display: "omitted"` mainline) and a
+     `redacted` block as `{"type":"redacted_thinking","data":<data>}`.
+     Nothing is filtered, reordered, or rewritten: Anthropic bills and
+     keeps only what it chooses, so over-sending is free (item 6).
+   - **DeepInfra arm** (`provider.rs`). `openai_messages` emits the
+     blocks' concatenated text as `reasoning_content` on the assistant
+     message, and nothing else — the re-measurement showed
+     `thinking_blocks`/`reasoning_details`/`thinking` are silently
+     ignored (+0 prompt tokens) there, and `reasoning` is an exact alias,
+     so one field carries everything. A message with no text-bearing
+     blocks (signature-only, redacted-only) emits no field at all: an
+     empty `reasoning_content` would be a forged field, and nothing to
+     send must be byte-identical to nothing.
+   - **LiteLLM arm** (`provider.rs`). Same `reasoning_content` text, plus
+     `thinking_blocks` — the finished blocks in LiteLLM's documented
+     request shape (`{"type":"thinking","thinking":…,"signature":…}` /
+     `{"type":"redacted_thinking","data":…}`) — because an
+     Anthropic-backed model through the proxy is the case LiteLLM
+     documents as a 400 without it. A proxy fronting anything else
+     ignores unknown fields, so sending both is safe.
+   - **Live acceptance checks**, both gated behind an env var so CI stays
+     offline-green (`M23_LIVE_DEEPINFRA=1`, `M23_LIVE_ANTHROPIC=1`):
+     DeepInfra asserts the observed accounting (passing a block back
+     raises the follow-up's `prompt_tokens` by ≈1 token per 4–5
+     characters — measured +221 for a 781-char block, +4400 for a ~19k
+     one — with a same-request replay proving the delta is the passback
+     and not noise); Anthropic drives a real tool loop and asserts the
+     spike's degradation signal inverts: round 2's `message_delta`
+     carries `output_tokens_details` (present) when the history had its
+     blocks, and the field is absent when the same history is sent
+     blockless — the silent-degradation bug closed on the wire.
+   - **Docs.** `provider-protocol.md` §5's passback paragraph now records
+     the per-plugin wire behavior as built; README's DeepInfra, LiteLLM
+     and Anthropic notes describe what each provider now sends back, and
+     the cost-report paragraph that promised "thinking never inflates a
+     later prompt" is replaced by a pointer to the measured cost models
+     (the full item-7 rewrite is session 4's job).
+
 1. **[x] Capture the signature (both transports).** `AnthropicBlock` gains
    `signature: Option<String>` and `data: Option<String>` (the
    `redacted_thinking` payload); `StreamDelta` gains `signature:
@@ -2163,7 +2211,7 @@ user-supplied value the project invariants say to pass through, not correct.
    must reconstruct exactly what the model saw, the same standard the
    `ToolResult.images` field is held to.
 
-6. **Provider behavior, per plugin.**
+6. **[x] Provider behavior, per plugin.**
    - **Anthropic — send everything.** Emit the blocks as content blocks in
      wire order, before the text block, exactly as received. Never
      reconstruct, reorder, or rewrite them. Send *all* prior turns' blocks,

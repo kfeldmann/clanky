@@ -79,13 +79,21 @@ pub fn build_request_body(
             ChatMessage::Assistant {
                 content,
                 tool_calls,
-                // The round's reasoning blocks (M23). Captured and carried
-                // end to end; sending them back is the passback session's
-                // change, not this one.
-                thinking: _,
+                // The round's reasoning blocks (M23): passed back verbatim,
+                // in wire order, *before* the text and tool_use blocks —
+                // the spike measured that blocks placed after `tool_use`
+                // silently disable thinking (finding 6). They are sent
+                // exactly as received: no reordering, rewriting, or
+                // dropping (an altered signature or data is a live 400).
+                // Anthropic filters and bills only the blocks it keeps, so
+                // over-sending is free; under-sending is what costs
+                // quality (item 6).
+                thinking,
             } => {
-                // Blocks: text first (if any), then one tool_use per call.
-                let mut blocks = Vec::new();
+                let mut blocks: Vec<Value> =
+                    thinking.iter().flatten().map(thinking_block_wire).collect();
+                // Blocks: thinking first (if any), then text (if any), then
+                // one tool_use per call.
                 if !content.is_empty() {
                     blocks.push(json!({"type": "text", "text": content}));
                 }
@@ -185,6 +193,33 @@ pub fn build_request_body(
 
     serde_json::to_string(&body)
         .map_err(|e| clanky_protocol::Error::Protocol(format!("cannot serialize request: {e}")))
+}
+
+/// An assistant message's reasoning block on the request wire, exactly as
+/// it was received (M23 constraint 1: the only correct transformation is
+/// identity — Anthropic answers any alteration of the `signature` or the
+/// `data` with a 400). A `thinking` block always carries its `thinking`
+/// text field (possibly empty — the `display: "omitted"` mainline); a
+/// `redacted` block carries `data` instead and has no text.
+fn thinking_block_wire(block: &clanky_protocol::ThinkingBlock) -> Value {
+    match block.kind {
+        clanky_protocol::ThinkingBlockKind::Thinking => {
+            let mut wire = json!({
+                "type": "thinking",
+                "thinking": block.text.as_deref().unwrap_or(""),
+            });
+            if let Some(signature) = block.signature.as_deref() {
+                wire["signature"] = json!(signature);
+            }
+            wire
+        }
+        clanky_protocol::ThinkingBlockKind::Redacted => {
+            json!({
+                "type": "redacted_thinking",
+                "data": block.data.as_deref().unwrap_or(""),
+            })
+        }
+    }
 }
 
 fn anthropic_tool(tool: &Tool) -> Value {
@@ -1600,5 +1635,126 @@ mod tests {
             user_wins["stream"], false,
             "the user's value is authoritative"
         );
+    }
+
+    /// A tool-loop round with reasoning blocks, shaped like the live spike
+    /// capture: assistant (thinking + tool_use), tool result, and a new
+    /// user prompt — the history whose missing thinking blocks silently
+    /// disabled thinking on the `4-x`/`4-6` models (finding 5).
+    fn passback_messages() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("count the files in /tmp using the bash tool"),
+            ChatMessage::Assistant {
+                content: String::new(),
+                thinking: Some(vec![
+                    clanky_protocol::ThinkingBlock::thinking(
+                        "",
+                        Some("EuUDCrgBCBIYAipAKS6N…".into()),
+                    ),
+                    clanky_protocol::ThinkingBlock::redacted("EmwKAh…".to_string()),
+                ]),
+                tool_calls: Some(vec![ToolCall {
+                    id: "toolu_01BhVetyfKsqmX56rNskCQuh".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "ls -1 /tmp | wc -l"}),
+                }]),
+            },
+            ChatMessage::tool("toolu_01BhVetyfKsqmX56rNskCQuh", "42"),
+        ]
+    }
+
+    #[test]
+    fn reasoning_blocks_are_passed_back_verbatim_before_the_text() {
+        // M23 session 2, the Anthropic arm: the round's blocks ride the
+        // assistant message as content blocks — first in the block list
+        // (the spike measured that blocks after `tool_use` silently
+        // disable thinking — finding 6), in wire order, unmodified.
+        let body: Value = serde_json::from_str(
+            &build_request_body(
+                "m",
+                &passback_messages(),
+                None,
+                None,
+                None,
+                false,
+                Identity::Plain,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let assistant = &body["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        let blocks = assistant["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        // Thinking blocks, in the order the model produced them, before the
+        // tool_use block.
+        assert_eq!(
+            blocks[0],
+            json!({"type": "thinking", "thinking": "", "signature": "EuUDCrgBCBIYAipAKS6N…"}),
+            "empty text kept: the display-omitted mainline"
+        );
+        assert_eq!(
+            blocks[1],
+            json!({"type": "redacted_thinking", "data": "EmwKAh…"})
+        );
+        assert_eq!(blocks[2]["type"], "tool_use");
+        assert_eq!(blocks[2]["id"], "toolu_01BhVetyfKsqmX56rNskCQuh");
+    }
+
+    #[test]
+    fn a_readable_thinking_block_rides_back_with_its_text() {
+        // On models that return real text (`haiku-4-5` et al.) the block
+        // carries both halves; the text is sent unmodified (the API
+        // verifies only the signature and ignores the text — spike finding
+        // 4), but sending it costs nothing and nothing may be altered.
+        let messages = vec![
+            ChatMessage::user("17*23"),
+            ChatMessage::Assistant {
+                content: "391".into(),
+                thinking: Some(vec![clanky_protocol::ThinkingBlock::thinking(
+                    "17*23 = 391",
+                    Some("sig-1".into()),
+                )]),
+                tool_calls: None,
+            },
+        ];
+        let body: Value = serde_json::from_str(
+            &build_request_body("m", &messages, None, None, None, false, Identity::Plain).unwrap(),
+        )
+        .unwrap();
+        let blocks = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "thinking block first, then the text");
+        assert_eq!(
+            blocks[0],
+            json!({"type": "thinking", "thinking": "17*23 = 391", "signature": "sig-1"})
+        );
+        assert_eq!(blocks[1], json!({"type": "text", "text": "391"}));
+    }
+
+    #[test]
+    fn a_message_without_blocks_is_byte_identical_to_the_old_shape() {
+        // The ignore-when-absent direction: every pre-M23 request (and
+        // every provider without blocks) is unchanged.
+        let without = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("answer with a call"),
+        ];
+        let with = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::Assistant {
+                content: "answer with a call".into(),
+                thinking: None,
+                tool_calls: None,
+            },
+        ];
+        let a: Value = serde_json::from_str(
+            &build_request_body("m", &without, None, None, None, false, Identity::Plain).unwrap(),
+        )
+        .unwrap();
+        let b: Value = serde_json::from_str(
+            &build_request_body("m", &with, None, None, None, false, Identity::Plain).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(a, b);
     }
 }

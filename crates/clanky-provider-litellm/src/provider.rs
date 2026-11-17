@@ -317,15 +317,31 @@ fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
             ChatMessage::Assistant {
                 content,
                 tool_calls,
-                // The round's reasoning blocks (M23): captured and carried
-                // end to end; sending them back is the passback session's
-                // change.
-                thinking: _,
+                // The round's reasoning blocks (M23 session 2): the text
+                // goes back as `reasoning_content` (same as the DeepInfra
+                // plugin), and the finished blocks *also* go out as
+                // `thinking_blocks` — the shape LiteLLM documents for an
+                // Anthropic-backed model through the proxy ("you must
+                // include `thinking_blocks` from the previous assistant
+                // response; failure to do so will result in a 400 Bad
+                // Request"). A proxy fronting a non-Anthropic model
+                // ignores unknown fields, so sending both is safe.
+                thinking,
             } => {
                 let mut msg = json!({ "role": "assistant" });
                 let obj = msg.as_object_mut().expect("object literal");
                 if !content.is_empty() {
                     obj.insert("content".into(), json!(content));
+                }
+                let reasoning = reasoning_content(thinking.as_deref());
+                if !reasoning.is_empty() {
+                    obj.insert("reasoning_content".into(), json!(reasoning));
+                }
+                if let Some(blocks) = thinking.as_ref().filter(|blocks| !blocks.is_empty()) {
+                    obj.insert(
+                        "thinking_blocks".into(),
+                        Value::Array(blocks.iter().map(thinking_block_wire).collect()),
+                    );
                 }
                 if let Some(calls) = tool_calls {
                     obj.insert(
@@ -353,6 +369,42 @@ fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
         }
     }
     Ok(out)
+}
+
+/// The `reasoning_content` an assistant message carries back to the proxy:
+/// its reasoning blocks' concatenated text (M23 session 2). An empty string
+/// when the message has no blocks or no text, so a blockless request stays
+/// byte-identical to the pre-M23 shape.
+fn reasoning_content(blocks: Option<&[clanky_protocol::ThinkingBlock]>) -> String {
+    blocks
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|block| block.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// One reasoning block on the `thinking_blocks` wire (M23 session 2): the
+/// shapes LiteLLM documents for passing an Anthropic model's blocks back
+/// through the proxy. Blocks go out exactly as received — the proxy
+/// forwards them to the backend unmodified, and an altered signature or
+/// redacted data is a backend 400.
+fn thinking_block_wire(block: &clanky_protocol::ThinkingBlock) -> Value {
+    match block.kind {
+        clanky_protocol::ThinkingBlockKind::Thinking => {
+            json!({
+                "type": "thinking",
+                "thinking": block.text.as_deref().unwrap_or(""),
+                "signature": block.signature.as_deref().unwrap_or(""),
+            })
+        }
+        clanky_protocol::ThinkingBlockKind::Redacted => {
+            json!({
+                "type": "redacted_thinking",
+                "data": block.data.as_deref().unwrap_or(""),
+            })
+        }
+    }
 }
 
 /// The `user` message that carries a tool result's images: an array of
@@ -907,11 +959,14 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_blocks_are_ignored_on_the_request_side() {
-        // M23, the ignore-when-absent direction: the proxy's
-        // `thinking_blocks` passback is session 2, so an assistant message's
-        // blocks must change nothing on the wire yet — byte-identical to the
-        // same message without them.
+    fn reasoning_blocks_go_back_as_reasoning_content_and_thinking_blocks() {
+        // M23 session 2: the proxy needs two shapes — `reasoning_content`
+        // (the concatenated text, for OpenAI-backed reasoning models) and
+        // `thinking_blocks` (the finished blocks, which LiteLLM documents
+        // as required for an Anthropic-backed model: "you must include
+        // `thinking_blocks` from the previous assistant response ... a 400
+        // Bad Request" otherwise). Both carry the payload unmodified. A
+        // blockless message stays byte-identical to the pre-M23 shape.
         let provider = provider(CATALOG, MODEL_INFO, Vec::new());
         let with_blocks = ChatRequest {
             messages: vec![
@@ -920,7 +975,7 @@ mod tests {
                     content: "answer".into(),
                     tool_calls: None,
                     thinking: Some(vec![
-                        clanky_protocol::ThinkingBlock::thinking("", Some("sig".into())),
+                        clanky_protocol::ThinkingBlock::thinking("why ", Some("sig-1".into())),
                         clanky_protocol::ThinkingBlock::redacted("blob"),
                     ]),
                 },
@@ -931,10 +986,22 @@ mod tests {
             messages: vec![ChatMessage::user("hi"), ChatMessage::assistant("answer")],
             ..request("openai/gpt-4o")
         };
+        let body: Value = serde_json::from_str(&provider.build_request_body(&with_blocks).unwrap())
+            .expect("valid body");
+        let assistant = &body["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["reasoning_content"], "why ");
         assert_eq!(
-            provider.build_request_body(&with_blocks).unwrap(),
+            assistant["thinking_blocks"],
+            json!([
+                {"type": "thinking", "thinking": "why ", "signature": "sig-1"},
+                {"type": "redacted_thinking", "data": "blob"},
+            ])
+        );
+        assert_eq!(
             provider.build_request_body(&without_blocks).unwrap(),
-            "the blocks must not leak onto this provider's wire yet"
+            provider.build_request_body(&without_blocks).unwrap(),
+            "a blockless request is byte-identical (the ignore-when-absent direction)"
         );
     }
 

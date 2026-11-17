@@ -403,9 +403,14 @@ type. So `session-cost.py` splits each round's tokens by character count:
 completion tokens go to the categories of that round's own output
 (thinking, answer, tool-call arguments), and prompt tokens go to the
 categories of everything recorded before it — so context is billed where
-it was made. Thinking is completion-side only: it is billed as output
-when the model produces it, but it is never sent back, so it costs once
-and never inflates a later prompt.
+it was made. Thinking is billed as output when the model produces it, but
+it is also passed back: from M23 on, a round's reasoning rides the next
+request's prompt (verbatim on Anthropic, as `reasoning_content` on the
+OpenAI-compatible providers), so a later prompt can be larger than the
+records alone suggest. The measured magnitudes and the per-provider cost
+models are documented in the thinking-passback notes (M23); session cost
+attribution for passed-back thinking is the cost reporter's session-4
+work.
 
 Shares are by characters, not tokens, so a category row is an estimate.
 The rows always add up to the billed usage exactly, so the **Total** is
@@ -501,6 +506,13 @@ still documents only a subset): `0`→`none`, `<500`→`minimal`, `<1682`→`low
 `<5661`→`medium`, `<19051`→`high`, `<64107`→`xhigh`, else `max`. A
 `reasoning_effort` set in `[sampling]` wins over the derived value.
 
+The reasoning is also passed back: each round's reasoning text goes back on
+the next request as `reasoning_content` (measured live at ≈1 prompt token
+per 4–5 characters — real context, not decoration, and prompt-cached like
+the rest of the prefix). DeepInfra treats `reasoning` as an alias of that
+field but silently ignores `thinking_blocks`, `reasoning_details` and
+`thinking`, so Clanky sends `reasoning_content` and nothing else.
+
 ### Built-in providers
 
 | Provider | Binary | Credentials |
@@ -562,6 +574,11 @@ Notes:
   `merge_reasoning_content_in_choices: true`, reasoning is instead merged into
   the visible content and cannot be separated — the plugin does not attempt
   to split it.)
+- **Reasoning is passed back.** Each round's reasoning goes back on the
+  next request as both `reasoning_content` (the concatenated text) and
+  `thinking_blocks` (the finished blocks, the shape LiteLLM documents as
+  required for an Anthropic-backed model through the proxy). A proxy
+  fronting a model with no use for either ignores them.
 
 ### Anthropic
 
@@ -616,13 +633,16 @@ Notes:
   overridable with `model` in settings or `--model`).
 - The model list comes from `GET /v1/models` on the authenticated account.
 - `ANTHROPIC_BASE_URL` overrides `https://api.anthropic.com`.
-- Thinking blocks are captured whole, signature included, and carried on
-  the round's assistant message. Anthropic verifies that signature, so the
-  block is never rewritten; on the models whose `display` defaults to
+- Thinking blocks are captured whole, signature included, and passed back
+  verbatim on the next request: the round's blocks ride its assistant
+  message as content blocks, first in the block list and unmodified (the
+  API verifies the signature and answers any alteration with a 400). This
+  keeps thinking enabled through tool loops — a history whose assistant
+  messages lack their thinking blocks silently disables thinking on the
+  `4-x`/`4-6` models, so the passback is a correctness fix there and a
+  fidelity win elsewhere. On the models whose `display` defaults to
   `"omitted"` the thinking text is empty and the signature *is* the
-  reasoning. Sending the blocks back on the next request is the
-  thinking-passback work (M23); until then the payload is captured and
-  carried but not yet re-sent.
+  reasoning; an empty-text block is the normal case, not an error.
 
 ### Writing a provider plugin
 
@@ -641,7 +661,10 @@ a signature, or a redacted block's data); the client then puts them on the
 assistant message's `thinking` field, and a plugin that understands them
 sends them back **unmodified**. Both are optional and additive: a plugin
 that emits none, and a plugin that ignores the field, behaves exactly as
-before. The spec's §5 and §6 have the shapes.
+before. The in-repo providers pass them back — Anthropic as content blocks
+before the text, DeepInfra as `reasoning_content`, LiteLLM as both
+`reasoning_content` and `thinking_blocks` — which is a working reference
+for a new plugin's passback arm. The spec's §5 and §6 have the shapes.
 
 See `design-docs/provider-protocol.md` for the full spec and
 [`examples/hello-world-provider/clanky-provider-hello-world`](examples/hello-world-provider/clanky-provider-hello-world)

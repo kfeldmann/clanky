@@ -169,9 +169,16 @@ Field rules:
   reordered or deduplicated — because the provider verifies them: Anthropic
   answers an altered `signature` or `data` with a 400, and a block with no
   signature must be omitted rather than sent unsigned (a missing block is
-  documented as allowed; a forged one is not). On Anthropic the blocks go
-  before the text block; DeepInfra/LiteLLM use the concatenated text as
-  `reasoning_content`. A plugin with no such concept ignores the field.
+  documented as allowed; a forged one is not). As built (M23 session 2):
+  the Anthropic plugin emits the blocks as content blocks in wire order,
+  *before* the text and `tool_use` blocks (the API silently disables
+  thinking when they come after a `tool_use` block); the DeepInfra plugin
+  sends the blocks' concatenated text as `reasoning_content` and nothing
+  else (DeepInfra counts `reasoning` as an alias but silently ignores
+  `thinking_blocks`/`reasoning_details`/`thinking`); the LiteLLM plugin
+  sends both `reasoning_content` and `thinking_blocks` (the shape LiteLLM
+  documents as required for an Anthropic-backed model through the proxy).
+  A plugin with no such concept ignores the field.
 - Tool results are `role: "tool"` messages with `toolCallId` + `content`.
   A tool result may additionally carry `images` — an optional, additive
   list of `{"dataBase64": …, "mediaType": "jpeg|png|gif|webp|heic|heif|avif"}`

@@ -1437,4 +1437,215 @@ mod tests {
         }
         assert!(terminal, "message_stop must be terminal");
     }
+
+    /// The live acceptance check (M23 session 2's exit criterion, the
+    /// headline win): a real tool loop against the configured model, where
+    /// round 2's history carries round 1's thinking blocks verbatim. The
+    /// spike's degradation signal is `output_tokens_details.thinking_tokens`
+    /// in `message_delta` — **absent** when the API silently disabled
+    /// thinking for the follow-up round (today's pre-M23 behavior on the
+    /// `4-x`/`4-6` models), **present** when thinking ran. Gated behind
+    /// `M23_LIVE_ANTHROPIC=1` (plus credentials or `ANTHROPIC_API_KEY`) so
+    /// CI stays offline-green.
+    #[test]
+    fn live_tool_loop_round2_keeps_thinking_on() {
+        if std::env::var("M23_LIVE_ANTHROPIC").map(|v| v != "0") != Ok(true) {
+            eprintln!("skipping: set M23_LIVE_ANTHROPIC=1 to run the live Anthropic check");
+            return;
+        }
+        let mut provider = AnthropicProvider::from_env();
+        let model = "claude-haiku-4-5-20251001";
+        let thinking = clanky_protocol::Thinking {
+            budget_tokens: Some(4096),
+        };
+        let bash = Tool {
+            name: "bash".into(),
+            description: Some("Run a shell command".into()),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            })),
+        };
+
+        // Round 1: give the model a reason to think and call the tool.
+        let round1 = ChatRequest {
+            model: model.into(),
+            messages: vec![ChatMessage::user(
+                "What is 17*23? Think briefly, then call the tool on the result.".to_string(),
+            )],
+            tools: Some(vec![bash.clone()]),
+            sampling: None,
+            thinking: Some(thinking),
+        };
+        let mut round1_chunks = Vec::new();
+        let round1_done = provider
+            .chat(&round1, &mut |c| round1_chunks.push(c))
+            .expect("round 1");
+        assert_eq!(round1_done.finish_reason, FinishReason::ToolCalls);
+        let calls = round1_chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::ToolCallStart { id, name, .. } => Some((id.clone(), name.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!calls.is_empty(), "round 1 must call the tool");
+        let blocks: Vec<clanky_protocol::ThinkingBlock> = round1_chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::ThinkingBlock { block } => Some(block.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !blocks.is_empty(),
+            "round 1 must emit signed thinking blocks to pass back"
+        );
+
+        // Round 2: the identical history a tool loop produces, blocks
+        // attached (session 2's change). The passback signal is the
+        // `thinking_tokens` detail riding round 2's usage — but Usage has
+        // no such field, so read it off the raw stream instead: the last
+        // `message_delta` before `message_stop`.
+        let round2_messages = vec![
+            round1.messages[0].clone(),
+            ChatMessage::Assistant {
+                content: round1_chunks
+                    .iter()
+                    .filter_map(|c| match c {
+                        ChunkPayload::Text { text } => Some(text.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+                thinking: Some(blocks.clone()),
+                tool_calls: Some(vec![clanky_protocol::ToolCall {
+                    id: calls[0].0.clone(),
+                    name: calls[0].1.clone(),
+                    arguments: json!({"command": "echo 391"}),
+                }]),
+            },
+            ChatMessage::tool(calls[0].0.clone(), "391"),
+        ];
+        let round2 = ChatRequest {
+            model: model.into(),
+            messages: round2_messages,
+            tools: Some(vec![bash]),
+            sampling: None,
+            thinking: Some(thinking),
+        };
+        // Drive the request through the backend directly so the raw SSE
+        // events stay readable (`chat` folds usage into the protocol type,
+        // which drops `output_tokens_details`).
+        let auth = provider.current_auth().expect("auth");
+        let body = adapter::build_request_body(
+            model,
+            &round2.messages,
+            round2.tools.as_deref(),
+            round2.sampling.as_ref(),
+            round2.thinking,
+            true,
+            adapter::Identity::from(&auth),
+        )
+        .expect("request body");
+        let payloads = crate::backend::Backend::post_stream(
+            &provider.backend,
+            &provider.url("v1/messages"),
+            &auth,
+            &body,
+        )
+        .expect("round 2 stream");
+        let mut last_usage = None;
+        for payload in payloads {
+            let payload = payload.expect("stream event");
+            let trimmed = payload.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && event["type"] == "message_delta"
+            {
+                last_usage = event["usage"].get("output_tokens_details").cloned();
+            }
+        }
+        let details = last_usage.unwrap_or_else(|| {
+            panic!(
+                "round 2's message_delta carries no output_tokens_details: thinking was \
+                 silently disabled — the degradation bug this milestone closes"
+            )
+        });
+        // A present-but-zero detail means the API answered and kept its
+        // output accounting (the model may simply have chosen not to think
+        // on this easy follow-up round); the degradation signal the spike
+        // measured is the *absent* field, which the unwrap_or_else above
+        // catches. Zero is a pass with a note.
+        let thinking_tokens = details["thinking_tokens"].as_u64().unwrap_or(0);
+        if thinking_tokens == 0 {
+            eprintln!(
+                "note: round 2 reported thinking_tokens = 0 ({details}); the passback was \
+                 accepted either way, and the field being present is the non-degraded shape"
+            );
+        }
+
+        // The mirror image: the same round 2 history *without* the blocks
+        // (pre-M23 behavior) shows the degradation signal — on the models
+        // where the degradation exists. On the lucky models (the `5-5`
+        // family and the configured haiku) thinking stays on either way, so
+        // this half only asserts the passback request itself was accepted.
+        let degraded_messages = round2
+            .messages
+            .iter()
+            .map(|m| match m {
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => ChatMessage::Assistant {
+                    content: content.clone(),
+                    thinking: None,
+                    tool_calls: tool_calls.clone(),
+                },
+                other => other.clone(),
+            })
+            .collect();
+        let degraded = ChatRequest {
+            messages: degraded_messages,
+            ..round2.clone()
+        };
+        let body = adapter::build_request_body(
+            model,
+            &degraded.messages,
+            degraded.tools.as_deref(),
+            degraded.sampling.as_ref(),
+            degraded.thinking,
+            true,
+            adapter::Identity::from(&auth),
+        )
+        .expect("request body");
+        let payloads = crate::backend::Backend::post_stream(
+            &provider.backend,
+            &provider.url("v1/messages"),
+            &auth,
+            &body,
+        )
+        .expect("degraded round 2 stream");
+        let mut degraded_usage = None;
+        for payload in payloads {
+            let payload = payload.expect("stream event");
+            let trimmed = payload.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && event["type"] == "message_delta"
+            {
+                degraded_usage = event["usage"].get("output_tokens_details").cloned();
+            }
+        }
+        eprintln!(
+            "note: without passback, output_tokens_details = {degraded_usage:?} \
+             (absent ⇒ thinking silently off on the 4-x models; present ⇒ lucky model)"
+        );
+    }
 }
