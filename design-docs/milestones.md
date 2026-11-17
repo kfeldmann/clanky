@@ -1549,13 +1549,14 @@ As built:
   it (the 2-second kill fallback ends the turn cancelled instead of
   surfacing an error).
 
-## ☐ M23 — Thinking passback: send reasoning back to the model
+## ✔ M23 — Thinking passback: send reasoning back to the model
 
-**Sessions 1–3 of 4 done: the payload is captured, carried, sent back —
-live on all three providers (session 2) — and now survives a quit, so a
-resumed session replays the identical message list a live one held
-(session 3's "As built" note below). Session 4 is the knob and the honest
-cost docs; see `design-docs/m23-sessions.md`.**
+**All four sessions done: the payload is captured, carried, sent back —
+live on all three providers (session 2) — survives a quit, so a resumed
+session replays the identical message list a live one held (session 3),
+and is now a knob (`thinking_passback`) with cost docs that state the
+measured magnitudes per provider (session 4; see the "As built" notes
+below and `design-docs/m23-sessions.md`).**
 
 Clanky never sends an assistant round's thinking back to the provider. The
 protocol's assistant message is `{content, tool_calls}` and nothing else
@@ -2222,6 +2223,90 @@ user-supplied value the project invariants say to pass through, not correct.
      channel (constraint 6). `provider-protocol.md` §5 records persistence
      as part of the field's contract.
 
+   **As built (session 4, 2026-11).** The knob and the honest cost docs.
+   The passback window is one decision made in one place — the turn loop,
+   before each request is built — so no plugin filters and the wire is a
+   faithful picture of it.
+
+   - **`thinking_passback = "off" | "previous-turn" | "all"`**
+     (`settings.rs`), defaulting to `previous-turn` via
+     `DEFAULT_THINKING_PASSBACK`. It goes through the full settings
+     machinery: layered per field like every other key, validated when a
+     settings file is read (a fixed vocabulary, so a typo is a load error
+     naming the accepted spellings rather than a silently ignored value),
+     carried in `SessionSettings` and therefore in the startup dump
+     (`thinking_passback previous-turn`) and the session `settings`
+     records, and exposed on the CLI as `--thinking-passback` plus the
+     TUI's `/thinking-passback` (no argument reports the value; the doc
+     asked for no picker, and a four-value vocabulary does not need one).
+   - **The window is a prefix drop of whole turns, enforced in
+     `turn::passback_window`.** `turn_start` is captured once before the
+     loop, so "this turn" is known however many rounds the turn takes.
+     `previous-turn` keeps the current turn's rounds in full and drops
+     earlier turns'; `all` sends everything; `off` clears every message's
+     blocks, which makes the request byte-identical to a blockless one
+     (no empty `thinking` field — pinned by a test that greps the
+     serialized messages). Trimming happens on a copy: `messages` keeps
+     the full payload, so the records and a later `/resume` still see it.
+     **This inverts the original item 8 text, as the spike's finding 6
+     required**: dropping "the oldest blocks" of the *latest* assistant
+     message is a 400, so there is no such thing as a per-message window —
+     only whole turns may go, and the intra-turn run is never touched.
+     That is also why intra-turn passback is not switchable: it is the
+     correctness half. **Corollary worth stating plainly (the docs do):**
+     of item 8's four measured rows, only two are reachable — "previous
+     turn only" would drop the tool loop's own rounds and "immediately
+     previous round only" would trim the newest run, so the knob offers
+     `previous-turn` (the default, which *is* the measured "current turn
+     only" policy, +56%) and `all` (+73%), with `off` at zero. The +14%
+     row is a policy the API will not accept, not a cheaper default.
+   - **`off` on Anthropic is honored, not overridden.** It means thinking
+     degrades after the first tool round of a turn; the invariants say a
+     user's setting wins over the program's opinion, and the README says
+     what the trade is. A settings-file typo is likewise a load error
+     naming the accepted spellings, and an unknown `--thinking-passback`
+     value is a clap usage error — verified by hand end to end (the dump
+     reads `… · thinking_passback previous-turn` for a settings file and
+     `all` for the flag).
+   - **Tests.** `turn.rs`: the default keeps a turn's rounds and drops an
+     earlier turn's; `all` keeps both; `off` sends none while the history
+     keeps all three rounds; `off` leaves the request otherwise identical
+     (no `thinking` key anywhere); a multi-round turn emits an unbroken
+     run. `settings.rs`: parse + default, a bad value is a load error,
+     per-field layering, and the value reaching the dump and the record
+     view. `cli.rs`: the flag maps to settings and rejects an unknown
+     value. TUI: `/thinking-passback` sets, reports and rejects, and the
+     palette lists it. Golden: a new `thinking-passback-off.json` pins the
+     whole path — the dump, the session `settings` record with
+     `thinkingPassback: "off"`, no `thinking` key on any request, and the
+     history keeping the blocks. `tests/sessions.rs`'s resume test now
+     asserts both sides: the default drops a resumed earlier turn's blocks
+     from the next request, `all` replays them verbatim.
+   - **`session-cost.py` (item 7).** The "never inflates a later prompt"
+     rule is gone. The reporter now attributes passed-back thinking to the
+     prompt, with **the two providers' cost models stated separately**:
+     a block carrying a `signature` (or a redacted block's `data`) is the
+     Anthropic shape — text free (measured identical `input_tokens` with
+     it emptied or padded), signature at ~0.15 tok/char, expressed as
+     0.15 × 4.49 ≈ 0.67 character-equivalents; a text-only block is the
+     DeepInfra/DeepSeek shape at the measured 4.49 chars/token. Which
+     rounds' payload reaches a given prompt follows the session's own
+     recorded policy (with `--thinking-passback` as a what-if override),
+     and a round's own blocks never inflate its own prompt — they join the
+     carried set when its `usage` record lands. The docstring, worked
+     example and README paragraph were rewritten with the measured
+     magnitudes, the two unreachable rows marked as such, and cache-read
+     pricing plus Anthropic's server-side filter named as the two things
+     that keep the cost affordable. The selftest gained a regression
+     fixture: `selftest_passback` hand-checks all three policies round by
+     round and fails if passback stops adding prompt tokens, so the old
+     claim cannot creep back.
+   - **Docs.** README: the `settings.toml` table row and a note on the
+     knob, a `/thinking-passback` section, and the cost-report section
+     rewritten around the measured table. `provider-protocol.md` §5
+     records that the client owns the window and that a run inside one
+     message is never trimmed.
+
 1. **[x] Capture the signature (both transports).** `AnthropicBlock` gains
    `signature: Option<String>` and `data: Option<String>` (the
    `redacted_thinking` payload); `StreamDelta` gains `signature:
@@ -2297,7 +2382,7 @@ user-supplied value the project invariants say to pass through, not correct.
      the field is not gated on `tools` being absent.
    - Providers that ignore unknown fields lose nothing.
 
-7. **Budget accounting must stay honest.** `session-cost.py` and the README
+7. **[x] Budget accounting must stay honest.** `session-cost.py` and the README
    section it documents currently state, as a fact, that "Thinking is
    completion-side only... it is never sent back, so it costs once and never
    inflates a later prompt" (`README.md:403-407`, `session-cost.py:33-38`).
@@ -2318,7 +2403,7 @@ user-supplied value the project invariants say to pass through, not correct.
    the project invariants exist to prevent; a doc that says "it may cost
    more" without the factor is only marginally better.
 
-8. **Make it controllable, because it costs money — and split the knob.**
+8. **[x] Make it controllable, because it costs money — and split the knob.**
    The re-measurement shows one boolean would conflate two different
    questions:
 

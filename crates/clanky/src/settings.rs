@@ -32,6 +32,81 @@ use crate::error::{Error, Result};
 /// `temperature = "0.7"` and `temperature = 0.7` mean the same thing.
 pub type SamplingParams = BTreeMap<String, serde_json::Value>;
 
+/// How much of a conversation's reasoning is sent back to the provider on
+/// later requests (M23 item 8).
+///
+/// The knob exists because passback costs prompt tokens, but its two halves
+/// are different problems. *Intra-turn* passback (the tool loop) is
+/// correctness: Anthropic and DeepSeek require it, and omitting it silently
+/// disables thinking for the rest of the turn. *Cross-turn* passback is
+/// optional context — the only part a window may drop, and the only part
+/// the setting decides. So the window is over *turns*, never over rounds
+/// within a turn.
+///
+/// The trimming is always a **prefix drop of whole turns**: Anthropic accepts
+/// only a prefix of the newest assistant message's run and requires that once
+/// a block is out it stays out, so no policy may punch a hole in a run or
+/// keep a suffix. `previous-turn` (the default) keeps the current turn's
+/// blocks in full and drops every earlier turn's; `off` sends none at all;
+/// `all` sends everything.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThinkingPassback {
+    /// Send no reasoning back at all. On Anthropic this is a real off (no
+    /// blocks on the wire) and it is honored as given, even though thinking
+    /// then degrades for the follow-up rounds of a tool loop.
+    Off,
+    /// Keep the current turn's blocks in full, drop earlier turns'. The
+    /// tool loop's rounds are where the cost is (the measured intra-turn
+    /// share is 76% of an all-turns passback) and where the passback is
+    /// mandatory, so this is the cheap end of what is legal: an earlier
+    /// turn's blocks are pure optional context.
+    #[default]
+    PreviousTurn,
+    /// Send every turn's blocks. Anthropic filters and bills only what it
+    /// keeps, so over-sending there is free; DeepInfra/DeepSeek have no
+    /// server-side filter, so what you send is what you pay for.
+    All,
+}
+
+/// The passback policy when neither the settings nor the CLI set one.
+pub const DEFAULT_THINKING_PASSBACK: ThinkingPassback = ThinkingPassback::PreviousTurn;
+
+impl ThinkingPassback {
+    /// The settings.toml / CLI spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::PreviousTurn => "previous-turn",
+            Self::All => "all",
+        }
+    }
+}
+
+impl std::fmt::Display for ThinkingPassback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ThinkingPassback {
+    type Err = String;
+
+    /// Parse the settings spelling. The value is a fixed vocabulary (unlike
+    /// a sampling value, which the backend validates), so an unknown one is
+    /// rejected here with the accepted spellings named.
+    fn from_str(raw: &str) -> std::result::Result<Self, String> {
+        match raw {
+            "off" => Ok(Self::Off),
+            "previous-turn" => Ok(Self::PreviousTurn),
+            "all" => Ok(Self::All),
+            other => Err(format!(
+                "invalid thinking passback `{other}`: expected `off`, `previous-turn` or `all`"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
@@ -65,6 +140,10 @@ pub struct Settings {
     /// does not pass its own `timeout_seconds`. Unset (default) means
     /// unbounded — unchanged behavior.
     pub timeout_seconds: Option<u64>,
+    /// How much reasoning to send back to the provider (M23):
+    /// `off` | `previous-turn` | `all`. Unset means the built-in default,
+    /// [`DEFAULT_THINKING_PASSBACK`] (`previous-turn`).
+    pub thinking_passback: Option<String>,
     /// Resources this scope takes over from the user scope instead of
     /// adding to it: `["settings", "system", "skills"]`. Written as the
     /// plain strings in the file and validated into [`Override`]s here;
@@ -191,12 +270,12 @@ impl Settings {
                 });
             }
         };
-        toml::from_str(&text)
-            .map(Some)
-            .map_err(|source| Error::ParseSettings {
-                path: path.to_path_buf(),
-                source,
-            })
+        let settings: Settings = toml::from_str(&text).map_err(|source| Error::ParseSettings {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        settings.validate()?;
+        Ok(Some(settings))
     }
 
     /// Overlay `over` on top of `self`: fields set in `over` win.
@@ -236,6 +315,9 @@ impl Settings {
         if over.timeout_seconds.is_some() {
             self.timeout_seconds = over.timeout_seconds;
         }
+        if over.thinking_passback.is_some() {
+            self.thinking_passback = over.thinking_passback;
+        }
         if let Some(over_overrides) = over.r#override {
             // Override lists union: a scope that overrides `skills` cannot
             // un-override a `system` its other scope took over — the
@@ -270,6 +352,30 @@ impl Settings {
     pub fn record_sessions(&self) -> bool {
         self.session.unwrap_or(true)
     }
+
+    /// The reasoning-passback policy in effect: the configured value, or
+    /// [`DEFAULT_THINKING_PASSBACK`] when none was given. An unparseable
+    /// value cannot get this far — the CLI parses it and the settings file
+    /// is validated when it is read (see `Settings::validate`) — so this
+    /// falls back rather than inventing an error path.
+    pub fn thinking_passback(&self) -> ThinkingPassback {
+        self.thinking_passback
+            .as_deref()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(DEFAULT_THINKING_PASSBACK)
+    }
+
+    /// Check the fields whose vocabulary is fixed (rather than validated by
+    /// the provider): today just `thinking_passback`. Called on a settings
+    /// file as it is read, so a typo is an error at load time instead of a
+    /// silently ignored value.
+    fn validate(&self) -> Result<()> {
+        if let Some(raw) = &self.thinking_passback {
+            raw.parse::<ThinkingPassback>()
+                .map_err(Error::InvalidThinkingPassback)?;
+        }
+        Ok(())
+    }
 }
 
 /// The effective settings of one session (M18): the merged values a
@@ -302,6 +408,8 @@ pub struct SessionSettings {
     pub project: Option<String>,
     /// Default tool-call timeout in seconds (`None` = unbounded).
     pub timeout_seconds: Option<u64>,
+    /// Reasoning passback window (`off` | `previous-turn` | `all`).
+    pub thinking_passback: Option<String>,
 }
 
 impl SessionSettings {
@@ -336,6 +444,9 @@ impl SessionSettings {
         }
         if over.timeout_seconds.is_some() {
             self.timeout_seconds = over.timeout_seconds;
+        }
+        if over.thinking_passback.is_some() {
+            self.thinking_passback = over.thinking_passback.clone();
         }
     }
 
@@ -374,6 +485,9 @@ impl SessionSettings {
         if let Some(seconds) = self.timeout_seconds {
             parts.push(format!("timeout {seconds}s"));
         }
+        if let Some(passback) = &self.thinking_passback {
+            parts.push(format!("thinking_passback {passback}"));
+        }
         if parts.is_empty() {
             return "all defaults".into();
         }
@@ -392,6 +506,7 @@ impl From<&Settings> for SessionSettings {
             max_retries: settings.max_retries,
             project: settings.project.clone(),
             timeout_seconds: settings.timeout_seconds,
+            thinking_passback: settings.thinking_passback.clone(),
         }
     }
 }
@@ -584,6 +699,70 @@ mod tests {
         assert!(described.contains("timeout 5s"), "{described}");
         assert!(!described.contains("thinking"), "unset elided: {described}");
         assert!(!described.contains("project"), "unset elided: {described}");
+    }
+
+    #[test]
+    fn thinking_passback_parses_and_defaults_to_previous_turn() {
+        let tmp = std::env::temp_dir().join("clanky-test-passback");
+        let path = write_temp_settings(&tmp, "thinking_passback = \"all\"\n");
+        let merged = Settings::load_scopes(None, &path).unwrap();
+        assert_eq!(merged.thinking_passback(), ThinkingPassback::All);
+        assert_eq!(
+            Settings::default().thinking_passback(),
+            ThinkingPassback::PreviousTurn,
+            "unset means the measured-default window"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_bad_thinking_passback_value_is_a_load_error() {
+        // A fixed vocabulary, so a typo is an error at load time instead of
+        // a silently ignored setting (unlike a sampling value, which the
+        // backend validates).
+        let tmp = std::env::temp_dir().join("clanky-test-passback-bad");
+        let path = write_temp_settings(&tmp, "thinking_passback = \"prev-turn\"\n");
+        let err = Settings::load_scopes(None, &path).unwrap_err().to_string();
+        assert!(err.contains("previous-turn"), "names the choices: {err}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn thinking_passback_layers_like_every_other_field() {
+        let mut merged = Settings {
+            thinking_passback: Some("all".into()),
+            ..Settings::default()
+        };
+        merged.overlay(Settings::default());
+        assert_eq!(merged.thinking_passback.as_deref(), Some("all"));
+        merged.overlay(Settings {
+            thinking_passback: Some("off".into()),
+            ..Settings::default()
+        });
+        assert_eq!(merged.thinking_passback.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn thinking_passback_reaches_the_dump_and_the_record_view() {
+        let settings = Settings {
+            thinking_passback: Some("off".into()),
+            ..Settings::default()
+        };
+        let effective = SessionSettings::from(&settings);
+        assert_eq!(effective.thinking_passback.as_deref(), Some("off"));
+        assert!(
+            effective.describe().contains("thinking_passback off"),
+            "{}",
+            effective.describe()
+        );
+
+        // It folds through the session records like every other field.
+        let mut state = SessionSettings {
+            thinking_passback: Some("all".into()),
+            ..SessionSettings::default()
+        };
+        state.overlay(&effective);
+        assert_eq!(state.thinking_passback.as_deref(), Some("off"));
     }
 
     #[test]

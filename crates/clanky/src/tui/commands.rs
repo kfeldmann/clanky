@@ -19,6 +19,10 @@ pub enum Command {
     Provider(Option<String>),
     /// `/thinking [value]`: set thinking, or open the picker.
     Thinking(Option<String>),
+    /// `/thinking-passback [value]`: set how much reasoning is sent back to
+    /// the provider (`off` | `previous-turn` | `all`), or show the current
+    /// value with no argument.
+    ThinkingPassback(Option<String>),
     /// `/sampling [edits]`.
     Sampling(SamplingEdit),
     /// `/timeout <seconds|off>`: set or clear the default tool timeout.
@@ -87,6 +91,7 @@ pub fn parse_command(
         "model" => Ok(Command::Model(optional_arg())),
         "provider" => Ok(Command::Provider(optional_arg())),
         "thinking" => Ok(Command::Thinking(optional_arg())),
+        "thinking-passback" => Ok(Command::ThinkingPassback(optional_arg())),
         "sampling" => parse_sampling(arg).map(Command::Sampling),
         "timeout" => parse_timeout(arg).map(Command::Timeout),
         "system" => Ok(Command::System),

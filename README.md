@@ -111,6 +111,7 @@ All fields are optional; unknown keys are rejected with a parse error.
 | `session`  | boolean          | `false` disables session recording in every mode (default: on) |
 | `project`  | string           | Label shown at the left of the TUI input prompt (TUI only) |
 | `timeout_seconds` | integer  | Default tool-call timeout in seconds (`bash` calls without their own `timeout_seconds` run unbounded when unset; `edit` ignores it; values past `Instant`'s range are rejected) |
+| `thinking_passback` | string  | How much reasoning is sent back to the provider: `off`, `previous-turn` (default) or `all` |
 
 Example:
 
@@ -139,6 +140,23 @@ Notes:
   that API treats as off). Leaving `thinking` unset is *not* the same thing:
   the backend's default then applies, which on reasoning models (e.g.
   DeepSeek, GLM) means a reasoning trace **is** produced.
+- `thinking_passback` decides how much of the conversation's reasoning rides
+  later requests. The current turn's rounds always keep theirs — inside a
+  tool loop that passback is correctness (Anthropic and DeepSeek require
+  it; omitting it silently disables thinking for the rest of the turn), and
+  the milestone's measurements show the tool loop is where the cost is
+  anyway. The knob is therefore a window over *turns*: `previous-turn` (the
+  default) keeps the current turn's rounds and drops earlier turns',
+  `all` keeps everything, and `off` sends no blocks at all — a real off,
+  byte-identical to a provider that has no such concept (and honored as
+  given even on Anthropic, where it means thinking degrades after the first
+  tool round). Only whole turns are ever dropped, never part of a round:
+  Anthropic accepts only a prefix of the newest assistant message's
+  thinking run, so trimming mid-run is a 400. Set it on the CLI with
+  `--thinking-passback`, or live in the TUI with
+  `/thinking-passback <off|previous-turn|all>`. See
+  [the cost report notes](#cost-reports-for-saved-sessions-session-costpy)
+  for what each window costs.
 - Sampling keys and values are passed to the provider backend **verbatim**:
   any parameter the backend accepts works here (`seed`,
   `repetition_penalty`, `reasoning_effort`, `top_k`, …) and the backend
@@ -308,7 +326,10 @@ block is never repaired, reordered or invented, because the provider
 verifies it and rejects an altered one. A block is an opaque payload (a
 signature is often a kilobyte or two), so sessions that think get somewhat
 larger JSONL lines; a round with no payload keeps the old record shape
-exactly.
+exactly. Whether the restored payload actually rides the next request is
+the [`thinking_passback`](#settings-toml) window's decision, exactly as in
+a live session — the history always holds it; the window decides what is
+sent.
 
 > **A session file is trusted input.** Passed-back reasoning is
 > model-authored text that the model treats as authoritative context, so a
@@ -423,14 +444,57 @@ type. So `session-cost.py` splits each round's tokens by character count:
 completion tokens go to the categories of that round's own output
 (thinking, answer, tool-call arguments), and prompt tokens go to the
 categories of everything recorded before it — so context is billed where
-it was made. Thinking is billed as output when the model produces it, but
-it is also passed back: from M23 on, a round's reasoning rides the next
-request's prompt (verbatim on Anthropic, as `reasoning_content` on the
-OpenAI-compatible providers), so a later prompt can be larger than the
-records alone suggest. The measured magnitudes and the per-provider cost
-models are documented in the thinking-passback notes (M23); session cost
-attribution for passed-back thinking is the cost reporter's session-4
-work.
+it was made.
+
+**Thinking is both output and input.** It is billed as output when the
+model produces it, and since M23 it is also *sent back*: a round's
+reasoning rides the prompts of later rounds, so a later prompt is larger
+than the visible records suggest. The reporter attributes that to
+Thinking, using the cost model of whichever provider shaped the block —
+the two are not the same, and using one ratio for both is wrong:
+
+| provider | what is on the wire | measured input cost |
+| -------- | ------------------- | ------------------- |
+| Anthropic | the opaque `signature` (the text is not billed as input at all — measured identical `input_tokens` with the text emptied or padded by 8,000 chars) | ≈ **0.15 tokens per signature char** (0.13–0.20 over six blocks) |
+| DeepInfra / DeepSeek | `reasoning_content`, i.e. the thinking *text* | ≈ **4.49 chars/token**, like any other text (~1,800 chars = +401 prompt tokens) |
+
+The reporter tells them apart from the block itself: a block with a
+`signature` (or a `redacted` block's `data`) is the Anthropic shape, one
+with text and no signature is the OpenAI-compatible shape. Signature
+characters are converted to the same character-equivalent units the other
+rows use (0.15 × 4.49 ≈ 0.67), so the shares stay comparable.
+
+How much reaches a prompt is the [`thinking_passback`](#settings-toml)
+window, read from the session's own `settings` records. The default,
+`previous-turn`, keeps the current turn's rounds — the tool loop — and
+drops earlier turns'. Measured over the maintainer's own saved sessions
+(73.3M prompt tokens), replaying the passback arithmetic at the measured
+rates gives, per policy:
+
+| policy | added prompt tokens | vs. no passback |
+| ------ | ------------------- | --------------- |
+| immediately previous round only | +0.98M | +1% |
+| current turn only (the tool-loop rounds) | +40.6M | **+56%** |
+| previous turn | +10.4M | +14% |
+| all turns | +53.4M | +73% |
+
+Two of those rows are not reachable by the knob. Only a prefix of whole
+turns may be dropped (Anthropic 400s on a trimmed run), and the current
+turn's rounds must keep theirs — intra-turn passback is correctness on
+Anthropic and DeepSeek. So "immediately previous round only" would trim
+the newest run and "previous turn" would drop the tool loop: what is left
+is `previous-turn` (the default, which *is* "current turn only" —
+**+56%**) and `all` (**+73%**), with `off` at zero. The intra-turn share
+is 76% of the all-turns cost, which is the number that matters: the
+expensive part is the tool loop, and there it is mandatory.
+
+Two things keep that affordable — prompt caching still applies to the
+passed-back prefix (the marginal cost is cache-read priced), and Anthropic
+filters and bills only the blocks it keeps, so over-sending there is free.
+DeepInfra/DeepSeek have no server-side filter: what you send is what you
+pay for, which is why `thinking_passback = "off"` exists.
+`--thinking-passback off|previous-turn|all` re-attributes the report as a
+"what if" without re-running anything.
 
 Shares are by characters, not tokens, so a category row is an estimate.
 The rows always add up to the billed usage exactly, so the **Total** is
@@ -439,7 +503,9 @@ at the given rates, which is what a provider bills. The system prompt
 (AGENTS.md, skills, …) is not in the session file at all and is spread
 across the categories in the same proportion. Images a tool result
 carried are left out of the character counts, since their base64 length
-says nothing about what the model was billed for them.
+says nothing about what the model was billed for them. Sessions recorded
+before M23 carry no blocks, so they attribute nothing to Thinking on the
+prompt side — which is what those sessions actually sent.
 
 ```text
 summarize-ch-04-n5p2
@@ -457,8 +523,9 @@ summarize-ch-04-n5p2
 The footer restates the billed totals and the round count. With more
 than one session, a grand total follows the reports. A session that used
 several models is priced entirely at the one `--pricing` given, with a
-note on stderr. `--selftest` checks the attribution math against a
-built-in session and exits.
+note on stderr. `--selftest` checks the attribution math against
+built-in sessions (one blockless, one with passed-back reasoning) and
+exits.
 
 ## Skills
 
@@ -791,6 +858,18 @@ therefore affects text from that point on:
   streaming ends the block there and prints `Thinking...`; turning it on
   resumes printing from that delta — possibly mid-sentence, as a new
   block below what was already printed.
+
+### `/thinking-passback` — how much reasoning is sent back
+
+`/thinking-passback` with no argument reports the window in effect;
+`/thinking-passback off|previous-turn|all` sets it, exactly like the
+`thinking_passback` setting (it is the same knob, live). The window is
+over *turns*, and only whole turns are ever dropped — a round's own
+thinking run is never trimmed, because Anthropic rejects a modified run.
+`off` is honored even on Anthropic, where it means thinking goes off
+after the first tool round of a turn; that trade is the user's to make.
+The cost of each window is measured in the
+[cost report notes](#cost-reports-for-saved-sessions-session-costpy).
 
 ### `/timeout` — the default tool timeout
 

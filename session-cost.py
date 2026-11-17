@@ -17,34 +17,81 @@ DeepInfra lists them. `cached` may be omitted (cached tokens are then
 priced at the input rate, exactly as Clanky's own status-line estimate
 does), and an optional "/ 1M" suffix is ignored.
 
+`--thinking-passback POLICY` re-attributes the prompt as if clanky had run
+with a different reasoning-passback window (`off`, `previous-turn` or
+`all`); by default the policy recorded in the session's own settings is
+used. `--selftest` checks the attribution math on built-in sessions.
+
 How tokens are attributed
 -------------------------
 Every completed chat round writes one `usage` record: `promptTokens`
 restates the whole prompt that round sent, `completionTokens` is what the
 model wrote, and `cachedTokens` is the part of the prompt the provider
 served from its prompt cache. The file does not split those numbers by
-content type, so this script splits them by character count:
+content type, so this script splits them by content size:
 
   * completion tokens go to the categories of the round's own output:
     thinking text, assistant text, and tool-call arguments;
   * prompt tokens go to the categories of everything recorded *before*
-    the round: user prompts, earlier answers, tool-call arguments and
-    tool results — so context is billed where it was made.
+    the round: user prompts, earlier answers, tool-call arguments, tool
+    results — and passed-back thinking, below — so context is billed
+    where it was made.
 
-Thinking is completion-side only. It is billed as output when the model
-produces it, but it is never sent back: the rebuilt history carries user
-prompts, assistant text, tool calls and tool results, and drops thinking
-(`session::history_from_records`). So a long reasoning block costs once,
-at the output rate, and never inflates later prompts.
+Passed-back thinking (M23)
+--------------------------
+Thinking is billed as output when the model produces it, and since M23 it
+is also *sent back*: a round's reasoning rides the prompts of later
+rounds. A `thinking` record's `blocks` field holds the payload that is
+replayed, so the script attributes part of every later prompt to Thinking.
+
+The cost model is per provider, because what is on the wire differs — and
+the block itself says which case it is:
+
+  * a block with a `signature` (or a `redacted` block's `data`) is the
+    Anthropic shape. There the **signature is the payload and the text is
+    a display convenience** — Anthropic bills no input tokens for the text
+    at all (measured: byte-identical `input_tokens` with the text emptied
+    or padded by 8,000 characters), and ~**0.15 tokens per signature
+    char** for the signature;
+  * a block with `text` and no signature is the OpenAI-compatible
+    (DeepInfra/DeepSeek) shape, where the text *is* the payload, billed
+    like any other text at the measured **4.49 characters/token**.
+
+Both are expressed in the character-equivalent units the other rows use,
+so the shares stay comparable: an Anthropic signature character counts
+`0.15 x 4.49 = 0.67` characters, a DeepInfra thinking character counts
+one.
+
+How much of that reaches a prompt follows clanky's `thinking_passback`
+window, read from the session's `settings` records (`off`,
+`previous-turn` or `all`; `--thinking-passback` overrides it for a "what
+if"). The default, `previous-turn`, keeps the current turn's rounds and
+drops earlier turns': the tool loop's intra-turn passback is mandatory on
+Anthropic and DeepSeek, and only a prefix of whole turns may be dropped,
+so "current turn only" is the cheapest legal window. Measured on clanky's
+own saved sessions, it adds ~56% to the prompt total and `all` ~73%, and
+76% of the all-turns cost is the intra-turn share — the tool loop, not
+cross-turn retention, is what a long reasoning session pays for. Prompt
+caching still applies to the passed-back prefix (the marginal cost is
+cache-read priced), which is what keeps it affordable.
+
+Records written before M23 carry no `blocks`, so they attribute nothing
+to Thinking on the prompt side — exactly what those sessions sent.
 
 The four categories are Thinking, Tools (tool calls and their results),
 User (prompts) and Agent (visible assistant text). Shares are by
-characters, not tokens, so a row is an estimate — but the rows always add
-up to the billed usage exactly, so the total is the real total. The
-system prompt (AGENTS.md, skills, ...) is not in the session file at all;
-it is spread over the categories in the same proportion. Images a tool
-result carried are left out of the character counts (their base64 length
-says nothing about what the model was billed for them).
+character-equivalent size, not tokens, so a row is an estimate — but the
+rows always add up to the billed usage exactly, so the total is the real
+total. The system prompt (AGENTS.md, skills, ...) is not in the session
+file at all; it is spread over the categories in the same proportion.
+Images a tool result carried are left out of the character counts (their
+base64 length says nothing about what the model was billed for them).
+
+A worked example: two rounds, one turn. Round 1's prompt is the user
+prompt; its output is 100 completion tokens split by its own output
+characters. Round 2's prompt is that context *plus* round 1's reasoning
+payload (if the window kept it), and its output is the answer. With
+`off`, round 2's prompt goes to User/Tools/Agent alone.
 """
 
 import argparse
@@ -123,8 +170,60 @@ def parse_pricing(text):
     )
 
 
+# Measured cost of a passed-back reasoning block, in tokens.
+#
+# OpenAI-compatible providers (DeepInfra/DeepSeek) send the thinking *text*
+# as `reasoning_content` and bill it like any other text: 4.49 chars/token
+# (measured against the live API, ~1800 characters = +401 prompt tokens).
+DEEPINFRA_CHARS_PER_TOKEN = 4.49
+# Anthropic sends the opaque *signature*: the text is never billed as input
+# (measured: identical `input_tokens` with it emptied or padded by 8,000
+# chars) and the signature costs ~0.15 tokens/char (measured 0.13-0.20 over
+# six blocks). Expressed in character-equivalents so the shares below stay
+# comparable with the other rows.
+ANTHROPIC_TOKENS_PER_SIGNATURE_CHAR = 0.15
+ANTHROPIC_SIGNATURE_CHAR_EQUIVALENT = (
+    ANTHROPIC_TOKENS_PER_SIGNATURE_CHAR * DEEPINFRA_CHARS_PER_TOKEN
+)
+
+PASSBACK_POLICIES = ("off", "previous-turn", "all")
+DEFAULT_PASSBACK = "previous-turn"
+
+
 def char_len(value):
     return len(value) if isinstance(value, str) else 0
+
+
+def block_weight(block):
+    """One passed-back block's prompt cost, in character-equivalents.
+
+    A block carrying a `signature` (or a `redacted` block's `data`) is the
+    Anthropic shape — the signature/data is the payload and the text is
+    free. Otherwise it is the OpenAI-compatible shape and the text is the
+    payload. Both are converted to the units the other categories use, so
+    the reported shares stay comparable.
+    """
+    if not isinstance(block, dict):
+        return 0
+    payload = block.get("signature") or block.get("data")
+    if isinstance(payload, str) and payload:
+        return len(payload) * ANTHROPIC_SIGNATURE_CHAR_EQUIVALENT
+    return char_len(block.get("text"))
+
+
+def split_turns(records):
+    """Group a session's records into turns.
+
+    A turn starts at a `user` record, so the round records of one turn are
+    the ones after its user record — the unit clanky's passback window
+    (`previous-turn`) drops.
+    """
+    turns = [[]]
+    for record in records:
+        if isinstance(record, dict) and record.get("type") == "user":
+            turns.append([])
+        turns[-1].append(record)
+    return turns
 
 
 def shares(weights):
@@ -137,10 +236,20 @@ def shares(weights):
 
 
 class Session:
-    """One session file, folded into attributed token and cost totals."""
+    """One session file, folded into attributed token and cost totals.
 
-    def __init__(self, pricing=None):
+    The whole file is read before anything is folded, because the prompt
+    side needs to know which round each record belongs to *and* which turn:
+    the passback window is a per-turn decision (see `_passback_context`).
+    """
+
+    def __init__(self, pricing=None, passback=None):
         self.price = pricing
+        # The policy in effect. `None` means "read it from the session's
+        # settings records" (the default: report what the session actually
+        # sent); an explicit value is a "what if".
+        self.passback_override = passback
+        self.passback = DEFAULT_PASSBACK
         # Character counts of the content each category contributed.
         # `context` is what the next request will re-send (user prompts,
         # earlier rounds, tool results); `pending` is the round in flight
@@ -155,8 +264,56 @@ class Session:
         self.rounds = 0
         self.models = []
         self.bad_lines = 0
+        # The passback payload of each `thinking` record, built once by
+        # `prepare`; the display text of a thinking record costs output but
+        # never prompt, so this is the only thinking the prompt side sees.
+        self._blocks = []
 
-    def feed(self, record):
+    def prepare(self, records):
+        """Index the records' passback payloads and resolve the policy."""
+        self._blocks = []
+        configured = None
+        for record in records:
+            blocks = None
+            if isinstance(record, dict) and record.get("type") == "thinking":
+                blocks = record.get("blocks") or ()
+            self._blocks.append(blocks)
+            if isinstance(record, dict) and record.get("type") == "settings":
+                value = (record.get("settings") or {}).get("thinkingPassback")
+                if value in PASSBACK_POLICIES:
+                    configured = value
+        if self.passback_override is not None:
+            self.passback = self.passback_override
+        elif configured is not None:
+            self.passback = configured
+
+    def _passback_weight(self, billed, turn):
+        """The passed-back thinking a round in `turn` carries.
+
+        `billed` is the payload of the rounds that already finished, as
+        `(turn, weight)` pairs: a round's prompt carries the payload of
+        every *earlier* round the window keeps — all of them with `all`,
+        only the same turn's with `previous-turn` (the default, i.e. the
+        tool loop), none with `off`. A round's own blocks are not in its
+        own prompt, which is why only finished rounds count.
+        """
+        if self.passback == "off":
+            return 0.0
+        return sum(
+            weight
+            for earlier_turn, weight in billed
+            if self.passback == "all" or earlier_turn == turn
+        )
+
+    def feed(self, record, passback=0.0):
+        """Fold one record in.
+
+        `context` holds the prompt of the round about to bill: user prompts
+        and tool results join it as they arrive (they are the round's
+        input), while a round's own output waits in `pending` until its
+        `usage` record commits it. `passback` is the passed-back thinking
+        weight the window adds to that prompt.
+        """
         kind = record.get("type")
         if kind == "user":
             self.context["user"] += char_len(record.get("text"))
@@ -172,14 +329,18 @@ class Session:
             # relation to the image tokens the model was billed for.
             self.context["tools"] += char_len(record.get("output"))
         elif kind == "usage":
-            self.fold_usage(record)
+            self.fold_usage(record, passback)
         elif kind == "settings":
             model = (record.get("settings") or {}).get("model")
             if model and model not in self.models:
                 self.models.append(model)
 
-    def fold_usage(self, record):
-        """Attribute one round's billed tokens and fold the round in."""
+    def fold_usage(self, record, passback=0.0):
+        """Attribute one round's billed tokens and fold the round in.
+
+        `passback` is the passed-back thinking weight this round's prompt
+        carried (`fold_records` computes it from the window).
+        """
         prompt = int(record.get("promptTokens") or 0)
         completion = int(record.get("completionTokens") or 0)
         cached = min(int(record.get("cachedTokens") or 0), prompt)
@@ -188,7 +349,9 @@ class Session:
         self.cached_tokens += cached
         self.rounds += 1
 
-        prompt_shares = shares(self.context)
+        context = dict(self.context)
+        context["thinking"] += passback
+        prompt_shares = shares(context)
         # A round that recorded no output of its own (nothing streamed)
         # still has completion tokens; spread those like the prompt.
         if sum(self.pending.values()) > 0:
@@ -206,8 +369,10 @@ class Session:
                     + completion * completion_shares[cat] * self.price.output
                 ) / 1_000_000
 
-        # The round just billed is context for the next one — except
-        # thinking, which no provider sends back (see the module docstring).
+        # The round just billed is context for the next one. Thinking is
+        # *not* added here: what a later prompt carries of it is the
+        # passback window's decision, applied per round in `load_lines`
+        # (the display text itself is never re-sent — only the payload).
         for cat in CATEGORIES:
             if cat != "thinking":
                 self.context[cat] += self.pending[cat]
@@ -220,9 +385,10 @@ class Session:
         return sum(self.tokens.values())
 
 
-def load_lines(lines, pricing=None):
+def load_lines(lines, pricing=None, passback=None):
     """Fold session records (JSONL lines) into one `Session`."""
-    session = Session(pricing)
+    session = Session(pricing, passback)
+    records = []
     for line in lines:
         line = line.strip()
         if not line:
@@ -233,16 +399,52 @@ def load_lines(lines, pricing=None):
             session.bad_lines += 1
             continue
         if isinstance(record, dict):
-            session.feed(record)
+            records.append(record)
         else:
             session.bad_lines += 1
+    return fold_records(records, session)
+
+
+def fold_records(records, session):
+    """Feed prepared records into `session`, with per-round prompt context.
+
+    The prompt-side context of the round ending at record `i` is the sum of
+    every earlier record's contribution — computed as a running total, so
+    one pass over the file is enough — plus the passed-back thinking the
+    window keeps for that round.
+    """
+    session.prepare(records)
+    # Which turn each record belongs to: a turn starts at its `user` record.
+    turn_of = []
+    turn = 0
+    for record in records:
+        if record.get("type") == "user":
+            turn += 1
+        turn_of.append(turn)
+
+    # The payload of the rounds that have already billed, as (turn, weight):
+    # a round's own blocks join it only when its `usage` record arrives, so
+    # they can never inflate its own prompt.
+    billed = []
+    inflight = []
+    for index, record in enumerate(records):
+        kind = record.get("type")
+        if kind == "usage":
+            session.feed(record, session._passback_weight(billed, turn_of[index]))
+            billed.extend((turn_of[index], weight) for weight in inflight)
+            inflight = []
+            continue
+        blocks = session._blocks[index]
+        if blocks:
+            inflight.append(sum(block_weight(block) for block in blocks))
+        session.feed(record)
     return session
 
 
-def load_session(path, pricing=None):
+def load_session(path, pricing=None, passback=None):
     """Read one session file. Unreadable bytes are replaced, not fatal."""
     with open(path, encoding="utf-8", errors="replace") as handle:
-        return load_lines(handle, pricing)
+        return load_lines(handle, pricing, passback)
 
 
 def format_money(value):
@@ -314,15 +516,32 @@ SELFTEST_SESSION = """\
 
 
 def selftest():
-    """Check the attribution on a hand-checkable session.
+    """Check the attribution on hand-checkable sessions.
 
-    Two rounds. Round 1's prompt is the one-character user prompt, so all
-    1000 prompt tokens go to User; its output is thinking "t", text "a"
-    and one tool call, so the 100 completion tokens split by those
-    character counts. Round 2's prompt is that context again — user,
-    answer, tool call and tool result — and thinking is *not* in it,
-    because no provider sends thinking back.
+    First, a blockless session (the pre-M23 shape). Two rounds. Round 1's
+    prompt is the one-character user prompt, so all 1000 prompt tokens go
+    to User; its output is thinking "t", text "a" and one tool call, so the
+    100 completion tokens split by those character counts. Round 2's prompt
+    is that context again — user, answer, tool call and tool result — with
+    no thinking in it, because the round recorded no passback blocks.
+
+    Then the M23 half, which is the regression the milestone's item 7
+    exists for: a session whose `thinking` records carry blocks must
+    attribute part of the later prompt to Thinking — the old "never
+    inflates a later prompt" rule would fail it.
     """
+    failures = selftest_blockless() + selftest_passback()
+
+    for failure in failures:
+        print(f"FAIL {failure}", file=sys.stderr)
+    if failures:
+        return 1
+    print("selftest ok")
+    return 0
+
+
+def selftest_blockless():
+    """The pre-M23 shape: no blocks, so thinking never reaches a prompt."""
     pricing = parse_pricing("$0.30 cached, $1.50 in, $5.00 out")
     session = load_lines(SELFTEST_SESSION.splitlines(), pricing)
 
@@ -362,12 +581,119 @@ def selftest():
             f"cost {session.total_cost():.9f} != {expected_cost:.9f}"
         )
 
-    for failure in failures:
-        print(f"FAIL {failure}", file=sys.stderr)
-    if failures:
-        return 1
-    print("selftest ok")
-    return 0
+    return failures
+
+
+# A session with passed-back reasoning (M23). Two turns, each one tool
+# round then an answer, and every round records a block: an Anthropic-shaped
+# one (signature payload) on the first, a DeepInfra-shaped one (text payload)
+# on the second.
+PASSBACK_SESSION = """\
+{"created":0,"type":"header","version":1}
+{"type":"settings","settings":{"provider":"p","model":"m","thinkingPassback":"previous-turn"}}
+{"type":"user","text":"u"}
+{"type":"thinking","text":"tt","blocks":[{"kind":"thinking","text":"","signature":"0123456789"}]}
+{"type":"assistant","text":"a","calls":[{"id":"1","name":"bash","arguments":{"command":"c"}}]}
+{"type":"usage","promptTokens":1000,"completionTokens":100}
+{"type":"toolResult","name":"bash","output":"r"}
+{"type":"thinking","text":"tt","blocks":[{"kind":"thinking","text":"wwwwwwwwww"}]}
+{"type":"assistant","text":"a","calls":[]}
+{"type":"usage","promptTokens":2000,"completionTokens":100}
+{"type":"user","text":"u"}
+{"type":"thinking","text":"tt","blocks":[{"kind":"thinking","text":"","signature":"0123456789"}]}
+{"type":"assistant","text":"a","calls":[]}
+{"type":"usage","promptTokens":3000,"completionTokens":100}
+"""
+
+
+def selftest_passback():
+    """Passed-back thinking is attributed to the prompt (M23 item 7).
+
+    Three rounds over two turns. Round 1 and round 2 are one turn (a tool
+    call, then the answer), round 3 is the next turn. Round 2's prompt
+    carries round 1's signature block; round 3's carries nothing, because
+    the default `previous-turn` window drops the earlier turn's blocks —
+    the "drop whole older turns, never a partial run" rule.
+    """
+    call_chars = len(json.dumps([{"id": "1", "name": "bash",
+                                  "arguments": {"command": "c"}}]))
+    # One Anthropic-shaped block: 10 signature chars at 0.15 tok/char,
+    # expressed in the character-equivalents the shares use.
+    sig = block_weight({"kind": "thinking", "signature": "0123456789"})
+    text = block_weight({"kind": "thinking", "text": "wwwwwwwwww"})
+
+    def expected(passback):
+        """The attribution, computed round by round by hand."""
+        tokens = dict.fromkeys(CATEGORIES, 0.0)
+        rounds = [
+            # (prompt tokens, prompt context, completion tokens, output chars)
+            # Round 1: just the user prompt; its own output not yet in it.
+            (1000, {"user": 1, "thinking": 0.0}, 100,
+             {"thinking": 2, "agent": 1, "tools": call_chars}),
+            # Round 2: round 1's context plus the tool result, plus round
+            # 1's block when the window keeps it (same turn).
+            (2000,
+             {"user": 1, "agent": 1, "tools": call_chars + 1,
+              "thinking": sig if passback != "off" else 0.0},
+             100, {"thinking": 2, "agent": 1, "tools": 0}),
+            # Round 3: the next turn. Only `all` carries turn 1's blocks.
+            (3000,
+             {"user": 2, "agent": 2, "tools": call_chars + 1,
+              "thinking": (sig + text) if passback == "all" else 0.0},
+             100, {"thinking": 2, "agent": 1, "tools": 0}),
+        ]
+        for prompt, ctx, completion, out in rounds:
+            ctx = {cat: ctx.get(cat, 0.0) for cat in CATEGORIES}
+            ctx_total = sum(ctx.values())
+            out = {cat: out.get(cat, 0.0) for cat in CATEGORIES}
+            out_total = sum(out.values())
+            for cat in CATEGORIES:
+                tokens[cat] += prompt * ctx[cat] / ctx_total
+                tokens[cat] += completion * out[cat] / out_total
+        return tokens
+
+    failures = []
+    for passback in PASSBACK_POLICIES:
+        session = load_lines(PASSBACK_SESSION.splitlines(), passback=passback)
+        want = expected(passback)
+        for cat in CATEGORIES:
+            if abs(session.tokens[cat] - want[cat]) > 1e-6:
+                failures.append(
+                    f"passback {passback} {cat}: "
+                    f"{session.tokens[cat]:.4f} != {want[cat]:.4f}")
+        billed = session.prompt_tokens + session.completion_tokens
+        if abs(session.total_tokens() - billed) > 1e-6:
+            failures.append(
+                f"passback {passback}: total "
+                f"{session.total_tokens():.4f} != billed {billed}")
+
+    # The regression the milestone's item 7 exists for: with passback on, a
+    # later prompt is partly Thinking. The old "thinking never inflates a
+    # later prompt" rule would report the same number for all three.
+    thinking = {
+        passback: load_lines(
+            PASSBACK_SESSION.splitlines(), passback=passback
+        ).tokens["thinking"]
+        for passback in PASSBACK_POLICIES
+    }
+    if not thinking["previous-turn"] > thinking["off"]:
+        failures.append(
+            f"passed-back thinking must add prompt tokens: {thinking}")
+    if not thinking["all"] > thinking["previous-turn"]:
+        failures.append(
+            f"`all` keeps the earlier turn's blocks: {thinking}")
+
+    # The session's own settings record decides the default; an explicit
+    # --thinking-passback overrides it.
+    recorded = load_lines(PASSBACK_SESSION.splitlines())
+    if recorded.passback != "previous-turn":
+        failures.append(
+            f"the settings record's policy must be used: {recorded.passback}")
+    forced = load_lines(PASSBACK_SESSION.splitlines(), passback="all")
+    if forced.passback != "all":
+        failures.append(f"an explicit policy must win: {forced.passback}")
+
+    return failures
 
 
 def main(argv):
@@ -384,6 +710,16 @@ def main(argv):
         "--pricing",
         metavar="PRICING",
         help='prices per million tokens, e.g. "$0.03 cached, $0.15 in, $0.50 out"',
+    )
+    parser.add_argument(
+        "--thinking-passback",
+        choices=PASSBACK_POLICIES,
+        metavar="POLICY",
+        help=(
+            "attribute passed-back reasoning as if this window were in "
+            "effect (off | previous-turn | all); by default the policy "
+            "recorded in the session's settings is used"
+        ),
     )
     parser.add_argument(
         "--selftest",
@@ -417,7 +753,7 @@ def main(argv):
     sessions = []
     for path in paths:
         try:
-            session = load_session(path, pricing)
+            session = load_session(path, pricing, args.thinking_passback)
         except OSError as err:
             print(f"session-cost.py: {path}: {err.strerror}", file=sys.stderr)
             continue

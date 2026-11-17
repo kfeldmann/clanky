@@ -18,7 +18,7 @@ use clanky_protocol::{
 };
 
 use crate::error::{Error, Result};
-use crate::settings::SamplingParams;
+use crate::settings::{DEFAULT_THINKING_PASSBACK, SamplingParams, ThinkingPassback};
 use crate::tools::ToolSet;
 
 /// A stop request from outside the turn loop (M22): the TUI's `Esc`.
@@ -198,6 +198,16 @@ pub struct TurnConfig {
     /// default, and what print mode and every test run with — makes the turn
     /// uninterruptible; the TUI passes the token it also keeps a clone of.
     pub interrupt: Option<Interrupt>,
+    /// How much of the conversation's reasoning to send back to the
+    /// provider (M23 item 8). `None` means the built-in default,
+    /// [`DEFAULT_THINKING_PASSBACK`] (`previous-turn`).
+    ///
+    /// The policy only ever drops *earlier turns'* blocks: the current
+    /// turn's rounds always keep theirs, because intra-turn passback is
+    /// correctness on Anthropic/DeepSeek (omitting it silently disables
+    /// thinking for the rest of the turn) and the measured cost of the
+    /// cross-turn half is the cheap one.
+    pub thinking_passback: Option<ThinkingPassback>,
 }
 
 impl TurnConfig {
@@ -219,6 +229,9 @@ impl TurnConfig {
             max_retries: settings.max_retries,
             retry_sleep: None,
             interrupt: None,
+            // The accessor resolves the default, so an unset setting is
+            // never "no window" but `previous-turn`.
+            thinking_passback: Some(settings.thinking_passback()),
         }
     }
 }
@@ -330,6 +343,14 @@ pub fn run_turn_with<T: Transport>(
     let model = config.model.clone().ok_or(Error::NoModel)?;
     let sampling = sampling_from(&config.sampling);
     let thinking = thinking_from(&config.thinking)?;
+    let passback = config
+        .thinking_passback
+        .unwrap_or(DEFAULT_THINKING_PASSBACK);
+    // The index of this turn's first message: every assistant message before
+    // it belongs to an earlier turn. Recorded once, before the loop appends
+    // anything, so the window policy can tell "this turn" from "before it"
+    // however many rounds the turn ends up taking.
+    let turn_start = messages.len();
 
     let mut text = String::new();
     let mut usage_total = Usage::default();
@@ -356,7 +377,11 @@ pub fn run_turn_with<T: Transport>(
         let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
         let request = ChatRequest {
             model: model.clone(),
-            messages: messages.clone(),
+            // The passback window is applied to a copy, never to the
+            // conversation: what is kept in `messages` is the full history
+            // (a later `/resume` and the session records need it), and only
+            // the request is trimmed.
+            messages: passback_window(messages, turn_start, passback),
             tools: wire_tools.clone(),
             sampling: sampling.clone(),
             thinking,
@@ -592,6 +617,60 @@ fn blocks_or_none(blocks: &[ThinkingBlock]) -> Option<Vec<ThinkingBlock>> {
     (!blocks.is_empty()).then(|| blocks.to_vec())
 }
 
+/// Apply the reasoning-passback window (M23 item 8) to one request's message
+/// list. `turn_start` is the index of the current turn's first message, so
+/// every assistant message before it belongs to an earlier turn.
+///
+/// Only a **prefix drop of whole turns** is legal: Anthropic accepts only a
+/// prefix of the newest assistant message's thinking run, and once a block is
+/// out it must stay out, so trimming must never punch a hole in a run or keep
+/// a suffix (a hole is a 400; keeping a suffix instead of the prefix is a 400
+/// too). That is why the knob is a window over turns and not a per-message
+/// filter, and why the current turn's blocks are never touched here:
+///
+/// * `off` sends no blocks at all — a real off, not an empty field, so the
+///   request is byte-identical to one from a provider without the concept.
+/// * `previous-turn` (the default) keeps the current turn's rounds in full
+///   and drops every earlier turn's.
+/// * `all` sends everything.
+///
+/// Messages are otherwise returned untouched: a block that is sent goes out
+/// exactly as it arrived (constraint 1 — no rewriting, reordering or repair).
+fn passback_window(
+    messages: &[ChatMessage],
+    turn_start: usize,
+    passback: ThinkingPassback,
+) -> Vec<ChatMessage> {
+    if passback == ThinkingPassback::All {
+        return messages.to_vec();
+    }
+    let keeps = |index: usize| -> bool {
+        match passback {
+            // `off`: nothing is sent back, from any turn.
+            ThinkingPassback::Off => false,
+            // `previous-turn`: only this turn's messages keep theirs.
+            ThinkingPassback::PreviousTurn => index >= turn_start,
+            ThinkingPassback::All => true,
+        }
+    };
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| match message {
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+                thinking: Some(_),
+            } if !keeps(index) => ChatMessage::Assistant {
+                content: content.clone(),
+                tool_calls: tool_calls.clone(),
+                thinking: None,
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
 /// A turn that ended because the user stopped it: everything it produced is
 /// kept, and the finish reason says why it ended.
 fn cancelled(text: String, usage: Option<Usage>) -> TurnOutput {
@@ -814,7 +893,7 @@ mod tests {
 
     /// Records the requests it receives and plays back scripted responses.
     struct MockHandler {
-        requests: RefCell<Vec<ChatRequest>>,
+        requests: Rc<RefCell<Vec<ChatRequest>>>,
         script: RefCell<VecDeque<ScriptedTurn>>,
         fail_with: Option<clanky_protocol::Error>,
         /// Errors handed out one per `chat` call before the script is
@@ -879,7 +958,7 @@ mod tests {
     impl MockHandler {
         fn scripted(turns: Vec<ScriptedTurn>) -> Self {
             Self {
-                requests: RefCell::new(Vec::new()),
+                requests: Rc::new(RefCell::new(Vec::new())),
                 script: RefCell::new(turns.into()),
                 fail_with: None,
                 transient: VecDeque::new(),
@@ -932,7 +1011,7 @@ mod tests {
 
         fn failing(err: clanky_protocol::Error) -> Self {
             Self {
-                requests: RefCell::new(Vec::new()),
+                requests: Rc::new(RefCell::new(Vec::new())),
                 script: RefCell::new(VecDeque::new()),
                 fail_with: Some(err),
                 transient: VecDeque::new(),
@@ -1041,6 +1120,7 @@ mod tests {
             max_retries: Some(0),
             retry_sleep: Some(|_| {}),
             interrupt: None,
+            thinking_passback: None,
         }
     }
 
@@ -1256,6 +1336,225 @@ mod tests {
             assistants[2].thinking(),
             None,
             "a round that reasoned nothing sends no field at all"
+        );
+    }
+
+    /// The blocks the requests actually carried, round by round.
+    fn sent_blocks(requests: &[ChatRequest]) -> Vec<Vec<Option<Vec<ThinkingBlock>>>> {
+        requests
+            .iter()
+            .map(|request| {
+                request
+                    .messages
+                    .iter()
+                    .map(|message| message.thinking().map(<[_]>::to_vec))
+                    .filter(Option::is_some)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Two turns over the same conversation: the first takes two rounds
+    /// (a tool call, then the answer), the second one round. Each round
+    /// carries its own signature so the window is identifiable.
+    fn two_turns_with_blocks(
+        passback: Option<ThinkingPassback>,
+    ) -> (Vec<ChatRequest>, Vec<ChatMessage>) {
+        // The handler moves into the turn, so the log it fills is shared
+        // out here.
+        let log: Rc<RefCell<Vec<ChatRequest>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut mock = MockHandler::scripted(vec![
+            ScriptedTurn {
+                chunks: [
+                    vec![ChunkPayload::ThinkingBlock {
+                        block: ThinkingBlock::thinking("", Some("sig-1".into())),
+                    }],
+                    vec![
+                        ChunkPayload::ToolCallStart {
+                            index: 0,
+                            id: "call_1".into(),
+                            name: "echo_tool".into(),
+                        },
+                        ChunkPayload::ToolCallArgs {
+                            index: 0,
+                            args_chunk: r#"{"input":"hi"}"#.into(),
+                        },
+                    ],
+                ]
+                .concat(),
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+            },
+            ScriptedTurn {
+                chunks: vec![
+                    ChunkPayload::ThinkingBlock {
+                        block: ThinkingBlock::thinking("", Some("sig-2".into())),
+                    },
+                    ChunkPayload::Text { text: "one".into() },
+                ],
+                finish_reason: FinishReason::Stop,
+                usage: None,
+            },
+            ScriptedTurn {
+                chunks: vec![
+                    ChunkPayload::ThinkingBlock {
+                        block: ThinkingBlock::thinking("", Some("sig-3".into())),
+                    },
+                    ChunkPayload::Text { text: "two".into() },
+                ],
+                finish_reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]);
+        mock.requests = log.clone();
+        let mut messages = vec![ChatMessage::user("first")];
+        let cfg = TurnConfig {
+            thinking_passback: passback,
+            ..config("mock/model")
+        };
+        run_turn(Box::new(mock), &toolset(), &mut messages, &cfg, &mut |_| {}).unwrap();
+        messages.push(ChatMessage::user("second"));
+        let mut second = MockHandler::scripted(vec![ScriptedTurn {
+            chunks: vec![
+                ChunkPayload::ThinkingBlock {
+                    block: ThinkingBlock::thinking("", Some("sig-3".into())),
+                },
+                ChunkPayload::Text { text: "two".into() },
+            ],
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        }]);
+        second.requests = log.clone();
+        run_turn(
+            Box::new(second),
+            &toolset(),
+            &mut messages,
+            &cfg,
+            &mut |_| {},
+        )
+        .unwrap();
+        let requests = log.borrow().clone();
+        (requests, messages)
+    }
+
+    #[test]
+    fn previous_turn_keeps_this_turns_blocks_and_drops_earlier_ones() {
+        // M23 item 8's default: the current turn's rounds keep their blocks
+        // (intra-turn passback is correctness), every earlier turn's are
+        // dropped — and dropped as a whole, so the emitted run stays an
+        // unbroken prefix.
+        let (requests, _) = two_turns_with_blocks(None);
+        assert_eq!(requests.len(), 3, "two rounds, then one");
+        let sent = sent_blocks(&requests);
+        let sig = |name: &str| Some(vec![ThinkingBlock::thinking("", Some(name.into()))]);
+
+        // Turn 1 round 1: nothing to pass back yet.
+        assert!(sent[0].is_empty());
+        // Turn 1 round 2: the tool round's block.
+        assert_eq!(sent[1], vec![sig("sig-1")]);
+        // Turn 2's single round: the earlier turn's blocks are gone, and the
+        // current turn has produced none yet.
+        assert!(
+            sent[2].is_empty(),
+            "an earlier turn's blocks must not ride along: {:?}",
+            requests[2].messages
+        );
+    }
+
+    #[test]
+    fn all_sends_every_turns_blocks() {
+        let (requests, _) = two_turns_with_blocks(Some(ThinkingPassback::All));
+        assert_eq!(
+            sent_blocks(&requests)[2],
+            vec![
+                Some(vec![ThinkingBlock::thinking("", Some("sig-1".into()))]),
+                Some(vec![ThinkingBlock::thinking("", Some("sig-2".into()))]),
+            ],
+            "`all` keeps both earlier rounds"
+        );
+    }
+
+    #[test]
+    fn off_sends_no_blocks_at_all_but_keeps_the_history() {
+        // `off` is a real off: no blocks on the wire, from any turn, in any
+        // round — while the conversation itself keeps them, so the records
+        // and a later `/resume` still see the full payload.
+        let (requests, messages) = two_turns_with_blocks(Some(ThinkingPassback::Off));
+        for (index, sent) in sent_blocks(&requests).iter().enumerate() {
+            assert!(sent.is_empty(), "round {index} sent blocks with `off` on");
+        }
+        // The message list itself is untouched: the blocks are still there.
+        let kept: Vec<&ChatMessage> = messages.iter().filter(|m| m.thinking().is_some()).collect();
+        assert_eq!(kept.len(), 3, "the history keeps all three rounds' blocks");
+    }
+
+    #[test]
+    fn off_leaves_the_request_otherwise_identical() {
+        // `off` must be byte-identical to a request from a provider that
+        // never had the concept: same messages, no empty `thinking` field.
+        let (requests, _) = two_turns_with_blocks(Some(ThinkingPassback::Off));
+        let second = serde_json::to_value(&requests[1].messages).unwrap();
+        assert!(
+            !second.to_string().contains("thinking"),
+            "no thinking field at all: {second}"
+        );
+        assert_eq!(second.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_multi_round_turn_keeps_an_unbroken_run() {
+        // The current turn's blocks accumulate round by round and are never
+        // trimmed mid-run: round 3 of one turn sends round 1's and round 2's
+        // blocks, in order, even with the cheapest window. A policy that
+        // kept only the newest block would punch a hole in the run, which
+        // Anthropic answers with a 400.
+        let round = |id: &str, sig: &str| ScriptedTurn {
+            chunks: [
+                vec![ChunkPayload::ThinkingBlock {
+                    block: ThinkingBlock::thinking("", Some(sig.into())),
+                }],
+                vec![
+                    ChunkPayload::ToolCallStart {
+                        index: 0,
+                        id: id.into(),
+                        name: "echo_tool".into(),
+                    },
+                    ChunkPayload::ToolCallArgs {
+                        index: 0,
+                        args_chunk: r#"{"input":"hi"}"#.into(),
+                    },
+                ],
+            ]
+            .concat(),
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+        };
+        let log: Rc<RefCell<Vec<ChatRequest>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut handler = MockHandler::scripted(vec![
+            round("call_1", "sig-1"),
+            round("call_2", "sig-2"),
+            text_turn("done"),
+        ]);
+        handler.requests = log.clone();
+        let mut messages = vec![ChatMessage::user("go")];
+        run_turn(
+            Box::new(handler),
+            &toolset(),
+            &mut messages,
+            &config("mock/model"),
+            &mut |_| {},
+        )
+        .unwrap();
+        let requests = log.borrow().clone();
+        assert_eq!(requests.len(), 3);
+        // Both earlier rounds of this turn are in the third request, in
+        // order — the run is unbroken.
+        assert_eq!(
+            sent_blocks(&requests)[2],
+            vec![
+                Some(vec![ThinkingBlock::thinking("", Some("sig-1".into()))]),
+                Some(vec![ThinkingBlock::thinking("", Some("sig-2".into()))]),
+            ]
         );
     }
 

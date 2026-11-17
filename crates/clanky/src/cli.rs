@@ -58,6 +58,13 @@ pub struct Cli {
     #[arg(long, value_name = "SECONDS")]
     pub timeout_seconds: Option<u64>,
 
+    /// How much reasoning to send back to the provider: `off`,
+    /// `previous-turn` (the default) or `all`. Overrides settings.
+    /// The tool loop's passback within a turn is never trimmed; this
+    /// only decides whether earlier turns' reasoning rides along.
+    #[arg(long, value_parser = parse_thinking_passback)]
+    pub thinking_passback: Option<String>,
+
     /// Project label shown at the left of the TUI input prompt (overrides
     /// the `project` setting; display only — print mode ignores it).
     #[arg(long)]
@@ -107,10 +114,19 @@ impl Cli {
             session: self.no_session.then_some(false),
             project: self.project.clone(),
             timeout_seconds: self.timeout_seconds,
+            thinking_passback: self.thinking_passback.clone(),
             // `override` is a settings-file declaration, not a CLI knob.
             r#override: None,
         }
     }
+}
+
+/// Parse `--thinking-passback`: a fixed vocabulary, so an unknown value is
+/// rejected here with the accepted spellings named (unlike a sampling value,
+/// which the provider validates).
+fn parse_thinking_passback(raw: &str) -> Result<String, String> {
+    raw.parse::<crate::settings::ThinkingPassback>()?;
+    Ok(raw.to_string())
 }
 
 /// Parse `key=value,key=value` into an ordered map. Values are kept as
@@ -225,6 +241,23 @@ mod tests {
         let over = cli_with(&["-p", "hi"]).overrides();
         assert_eq!(over.timeout_seconds, None);
         assert_eq!(over.project, None);
+    }
+
+    #[test]
+    fn thinking_passback_flag_maps_to_settings() {
+        let over = cli_with(&["-p", "--thinking-passback", "off", "hi"]).overrides();
+        assert_eq!(over.thinking_passback.as_deref(), Some("off"));
+        // Absent stays unset (the built-in default applies).
+        let over = cli_with(&["-p", "hi"]).overrides();
+        assert_eq!(over.thinking_passback, None);
+    }
+
+    #[test]
+    fn thinking_passback_flag_rejects_unknown_values() {
+        let err = Cli::try_parse_from(["clanky", "-p", "--thinking-passback", "sometimes", "hi"])
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("previous-turn"), "{message}");
     }
 
     #[test]

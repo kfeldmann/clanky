@@ -1,0 +1,188 @@
+{
+  "history": [
+    {
+      "content": "use the tool on hello",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "thinking": [
+        {
+          "kind": "thinking",
+          "signature": "sig-round-1",
+          "text": ""
+        }
+      ],
+      "toolCalls": [
+        {
+          "arguments": {
+            "input": "hello"
+          },
+          "id": "call_1",
+          "name": "fake"
+        }
+      ]
+    },
+    {
+      "content": "fake ran with input=hello",
+      "role": "tool",
+      "toolCallId": "call_1"
+    },
+    {
+      "content": "The tool said: fake ran with input=hello",
+      "role": "assistant"
+    }
+  ],
+  "records": [
+    {
+      "settings": {
+        "model": "mock/model",
+        "provider": "deepinfra",
+        "thinkingPassback": "off"
+      },
+      "type": "settings"
+    },
+    {
+      "text": "use the tool on hello",
+      "type": "user"
+    },
+    {
+      "blocks": [
+        {
+          "kind": "thinking",
+          "signature": "sig-round-1",
+          "text": ""
+        }
+      ],
+      "text": "",
+      "type": "thinking"
+    },
+    {
+      "calls": [
+        {
+          "arguments": {
+            "input": "hello"
+          },
+          "id": "call_1",
+          "name": "fake"
+        }
+      ],
+      "text": "",
+      "type": "assistant"
+    },
+    {
+      "completionTokens": 9,
+      "promptTokens": 12,
+      "type": "usage"
+    },
+    {
+      "name": "fake",
+      "output": "fake ran with input=hello",
+      "type": "toolResult"
+    },
+    {
+      "calls": [],
+      "text": "The tool said: fake ran with input=hello",
+      "type": "assistant"
+    },
+    {
+      "completionTokens": 3,
+      "promptTokens": 7,
+      "type": "usage"
+    },
+    {
+      "reason": "stop",
+      "type": "stopReason"
+    }
+  ],
+  "requests": [
+    {
+      "messages": [
+        {
+          "content": "use the tool on hello",
+          "role": "user"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "A fake tool for tests",
+          "name": "fake",
+          "parameters": {
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    {
+      "messages": [
+        {
+          "content": "use the tool on hello",
+          "role": "user"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "toolCalls": [
+            {
+              "arguments": {
+                "input": "hello"
+              },
+              "id": "call_1",
+              "name": "fake"
+            }
+          ]
+        },
+        {
+          "content": "fake ran with input=hello",
+          "role": "tool",
+          "toolCallId": "call_1"
+        }
+      ],
+      "model": "mock/model",
+      "sampling": {
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "top_p": 0.9
+      },
+      "thinking": {
+        "budgetTokens": 2048
+      },
+      "tools": [
+        {
+          "description": "A fake tool for tests",
+          "name": "fake",
+          "parameters": {
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ],
+  "settings": "provider deepinfra · model mock/model · thinking_passback off"
+}

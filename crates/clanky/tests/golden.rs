@@ -171,6 +171,7 @@ fn config() -> TurnConfig {
         max_retries: Some(0),
         retry_sleep: Some(|_| {}),
         interrupt: None,
+        thinking_passback: None,
     }
 }
 
@@ -547,6 +548,109 @@ fn thinking_block_passback_transcript_matches_golden() {
         "history": messages,
     });
     compare_or_update("thinking-passback", &transcript);
+}
+
+/// M23 session 4: the passback knob is exercised end to end. The setting
+/// appears in the effective-settings dump and the session `settings`
+/// record, and `off` puts no blocks on the wire — with the request
+/// otherwise byte-identical to a run whose rounds carried none (the
+/// ignore-when-absent direction every provider test already pins).
+///
+/// Regenerate with: `CLANKY_UPDATE_GOLDEN=1 cargo test --test golden`
+#[test]
+fn thinking_passback_off_transcript_matches_golden() {
+    use clanky::recorder::{self, Recorder};
+    use clanky::session::Record;
+    use clanky::settings::{SessionSettings, ThinkingPassback};
+
+    let settings = SessionSettings {
+        provider: Some("deepinfra".into()),
+        model: Some("mock/model".into()),
+        thinking_passback: Some(ThinkingPassback::Off.to_string()),
+        ..Default::default()
+    };
+    // The dump is where a user sees the knob; it must name it.
+    assert!(
+        settings.describe().contains("thinking_passback off"),
+        "{}",
+        settings.describe()
+    );
+
+    let dir = temp_session_dir("passback-off");
+    let dump = settings.describe();
+    let mut recorder = Recorder::with_dir(dir.clone(), "session", settings);
+    recorder.record(
+        &mut NoSink,
+        Record::User {
+            text: "use the tool on hello".into(),
+        },
+    );
+
+    // A tool round that *does* carry a signature block: with `off` it must
+    // not reach the second request.
+    let script = vec![
+        ScriptedTurn {
+            chunks: [
+                vec![ChunkPayload::ThinkingBlock {
+                    block: ThinkingBlock::thinking("", Some("sig-round-1".into())),
+                }],
+                tool_call_chunks("call_1", "fake", r#"{"input": "hello"}"#),
+            ]
+            .concat(),
+            finish_reason: FinishReason::ToolCalls,
+            usage: Some(Usage {
+                prompt_tokens: Some(12),
+                completion_tokens: Some(9),
+                cached_tokens: None,
+            }),
+        },
+        text_turn("The tool said: fake ran with input=hello"),
+    ];
+    let (provider, requests) = ScriptedProvider::new(script);
+    let mut messages = vec![ChatMessage::user("use the tool on hello")];
+    let mut cfg = config();
+    cfg.thinking_passback = Some(ThinkingPassback::Off);
+    let output = run_turn(
+        Box::new(provider),
+        &fake_tools(),
+        &mut messages,
+        &cfg,
+        &mut |event| {
+            recorder::record_turn_event(&mut recorder, &mut NoSink, &event);
+        },
+    )
+    .unwrap();
+    recorder.record_done(&mut NoSink, &Ok(output.clone()));
+
+    // No block on any request — and no `thinking` key at all, which is what
+    // makes `off` byte-identical to a blockless run.
+    for (index, request) in requests.borrow().iter().enumerate() {
+        assert!(
+            !request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m.get("thinking").is_some()),
+            "round {index} sent blocks with passback off: {request}"
+        );
+    }
+
+    let data = clanky::session::load(&dir.join("session.jsonl")).unwrap();
+    let records: Vec<Value> = data
+        .records
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap())
+        .collect();
+    let transcript = json!({
+        "settings": dump,
+        "requests": *requests.borrow(),
+        // The conversation keeps the blocks even though the wire dropped
+        // them: the records and a later `/resume` still see the payload.
+        "history": messages,
+        "records": records,
+    });
+    std::fs::remove_dir_all(dir).ok();
+    compare_or_update("thinking-passback-off", &transcript);
 }
 
 #[test]

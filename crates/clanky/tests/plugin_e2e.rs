@@ -96,6 +96,7 @@ fn hello_world_plugin_handshakes_and_answers() {
         max_retries: Some(0),
         retry_sleep: Some(|_| {}),
         interrupt: None,
+        thinking_passback: None,
     };
     let mut streamed = String::new();
     let output = run_turn_with(
@@ -201,6 +202,7 @@ fn thinking_blocks_survive_a_real_plugin_round_trip() {
         max_retries: Some(0),
         retry_sleep: Some(|_| {}),
         interrupt: None,
+        thinking_passback: None,
     };
     let mut messages = vec![ChatMessage::user("think")];
     let rounds = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -331,6 +333,7 @@ fn esc_stops_a_real_plugin_and_keeps_what_streamed() {
         max_retries: Some(0),
         retry_sleep: Some(|_| {}),
         interrupt: Some(interrupt.clone()),
+        thinking_passback: None,
     };
     let mut messages = vec![ChatMessage::user("talk")];
     let started = std::time::Instant::now();
@@ -414,6 +417,7 @@ for line in sys.stdin:
         max_retries: Some(0),
         retry_sleep: Some(|_| {}),
         interrupt: Some(interrupt.clone()),
+        thinking_passback: None,
     };
     let mut messages = vec![ChatMessage::user("talk")];
     let started = std::time::Instant::now();

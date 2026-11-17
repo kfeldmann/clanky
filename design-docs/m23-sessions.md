@@ -19,7 +19,7 @@ Split out because the doc calls it "the delicate part" and it's independent of 2
 
 - **Exit:** a resumed session produces the identical `Vec<ChatMessage>` a live session had — including a `redacted_thinking` block and a synthetic-result repair for an interrupted call.
 
-### Session 4 — Knob + honest cost docs (items 7, 8)
+### ✔ Session 4 — Knob + honest cost docs (items 7, 8) — **done** (see M23's "As built (session 4)")
 - `thinking_passback = "off" | "previous-turn" | "all"` through the full settings machinery (CLI/`/`-command optional — the doc doesn't ask for one; dump + session records + README required), window policy enforced as **prefix-only** with the unbroken-run rule (finding 6 inverts the original item 8 text — worth restating in the as-built note).
 - `session-cost.py`: prompt attribution for passed-back thinking, rewritten docstring/worked example, regression fixture; README's "never inflates a later prompt" paragraph replaced with the measured factors, **with Anthropic and DeepInfra cost models stated separately** (signature ~0.15 tok/char vs text at 4.49 chars/token).
 

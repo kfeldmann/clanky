@@ -83,6 +83,9 @@ pub enum Error {
     #[error("invalid --thinking value `{0}`; expected an integer token budget, or `off`")]
     InvalidThinking(String),
 
+    #[error("{0}")]
+    InvalidThinkingPassback(String),
+
     #[error("io error: {source}")]
     Io {
         #[from]

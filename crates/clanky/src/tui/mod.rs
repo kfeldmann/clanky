@@ -145,6 +145,10 @@ pub struct Launch {
     /// Default tool-call timeout in seconds (`timeout_seconds` setting /
     /// `--timeout-seconds`; `None` = unbounded). Live-edited by `/timeout`.
     pub timeout_seconds: Option<u64>,
+    /// Reasoning passback window (`thinking_passback` setting /
+    /// `--thinking-passback`; `None` = the built-in default,
+    /// `previous-turn`). Live-edited by `/thinking-passback`.
+    pub thinking_passback: Option<String>,
     /// Start the session named (`--name`); fed to the recorder as the
     /// pending name. `None` = the generated default name.
     pub session_name: Option<String>,
@@ -188,6 +192,7 @@ impl Launch {
             recording: settings.record_sessions(),
             project: settings.project.clone(),
             timeout_seconds: settings.timeout_seconds,
+            thinking_passback: settings.thinking_passback.clone(),
             session_name: None,
             overrides: settings.overrides(),
         }
@@ -455,6 +460,15 @@ fn spawn_turn(
                     max_retries: launch.max_retries,
                     retry_sleep: None,
                     interrupt: Some(interrupt),
+                    // Same resolution as `TurnConfig::from_settings`:
+                    // unset means the default window, not "no window".
+                    thinking_passback: Some(
+                        launch
+                            .thinking_passback
+                            .as_deref()
+                            .and_then(|raw| raw.parse().ok())
+                            .unwrap_or(crate::settings::DEFAULT_THINKING_PASSBACK),
+                    ),
                 };
                 crate::turn::run_turn_with(
                     session.client_mut(),
@@ -550,6 +564,10 @@ const PALETTE_BUILTINS: &[(&str, &str)] = &[
     ("/model", "pick a model"),
     ("/provider", "pick a provider"),
     ("/thinking", "thinking presets"),
+    (
+        "/thinking-passback ",
+        "reasoning sent back (off | previous-turn | all)",
+    ),
     ("/sampling ", "edit sampling parameters"),
     ("/system", "show the assembled system prompt"),
     ("/md ", "export the session as Markdown"),
@@ -1338,6 +1356,7 @@ fn effective_of(launch: &Launch) -> SessionSettings {
         max_retries: launch.max_retries,
         project: launch.project.clone(),
         timeout_seconds: launch.timeout_seconds,
+        thinking_passback: launch.thinking_passback.clone(),
     }
 }
 
@@ -1446,6 +1465,33 @@ fn handle_command(
             Action::None
         }
         Command::Thinking(None) => Action::OpenPicker(PickerKind::Thinking),
+        Command::ThinkingPassback(Some(raw)) => {
+            // A fixed vocabulary (unlike a sampling value, which the backend
+            // validates), so an unknown value is an error here, naming the
+            // accepted spellings — never a silently ignored setting.
+            match raw.parse::<crate::settings::ThinkingPassback>() {
+                Ok(parsed) => {
+                    launch.thinking_passback = Some(parsed.to_string());
+                    observe_settings(state, launch);
+                    app.entries.push(app::Entry::Info(format!(
+                        "thinking passback set to `{parsed}`"
+                    )));
+                }
+                Err(err) => app.entries.push(app::Entry::Error(err)),
+            }
+            Action::None
+        }
+        Command::ThinkingPassback(None) => {
+            let current = launch
+                .thinking_passback
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::settings::DEFAULT_THINKING_PASSBACK.to_string());
+            app.entries.push(app::Entry::Info(format!(
+                "thinking passback: `{current}` (off | previous-turn | all)"
+            )));
+            Action::None
+        }
         Command::Sampling(edit) => {
             apply_sampling(state, launch, &edit, app);
             Action::None
@@ -2383,7 +2429,9 @@ mod tests {
         }]);
         let picker = picker_for(&templates);
         assert_eq!(picker.title(), "commands");
-        let lines = picker.lines(10);
+        // Enough rows for every built-in plus the template: this asserts
+        // what the palette offers, not how it truncates (covered elsewhere).
+        let lines = picker.lines(32);
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
@@ -2391,6 +2439,7 @@ mod tests {
         let all = texts.join("\n");
         assert!(all.contains("/model"), "{all}");
         assert!(all.contains("/resume"), "{all}");
+        assert!(all.contains("/thinking-passback"), "{all}");
         assert!(all.contains("/review"), "{all}");
         assert!(all.contains("Review this code"), "{all}");
     }
@@ -2737,6 +2786,58 @@ mod tests {
             cfg.thinking.as_deref(),
             Some("off"),
             "rejected value is not applied; the previous setting is kept"
+        );
+    }
+
+    #[test]
+    fn thinking_passback_commands_set_show_and_reject() {
+        let mut cfg = launch();
+        let mut state = SessionState::new(SessionSettings::default());
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+
+        // No argument: report the value in effect, never invent a change.
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::ThinkingPassback(None),
+            &tx,
+        );
+        assert_eq!(cfg.thinking_passback, None, "showing changes nothing");
+        assert!(
+            matches!(app.entries.last(), Some(app::Entry::Info(text))
+            if text.contains("previous-turn")),
+            "{:?}",
+            app.entries.last()
+        );
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::ThinkingPassback(Some("off".into())),
+            &tx,
+        );
+        assert_eq!(cfg.thinking_passback.as_deref(), Some("off"));
+        assert!(matches!(app.entries.last(), Some(app::Entry::Info(_))));
+
+        handle_command(
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            Command::ThinkingPassback(Some("sometimes".into())),
+            &tx,
+        );
+        assert!(matches!(app.entries.last(), Some(app::Entry::Error(_))));
+        assert_eq!(
+            cfg.thinking_passback.as_deref(),
+            Some("off"),
+            "a rejected value is not applied; the previous setting is kept"
         );
     }
 

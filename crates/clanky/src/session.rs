@@ -53,6 +53,9 @@ pub struct SessionSettingsRecord {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    /// Reasoning passback window (`off` | `previous-turn` | `all`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_passback: Option<String>,
 }
 
 impl From<&SessionSettings> for SessionSettingsRecord {
@@ -66,6 +69,7 @@ impl From<&SessionSettings> for SessionSettingsRecord {
             max_retries: s.max_retries,
             project: s.project.clone(),
             timeout_seconds: s.timeout_seconds,
+            thinking_passback: s.thinking_passback.clone(),
         }
     }
 }
@@ -81,6 +85,7 @@ impl From<&SessionSettingsRecord> for SessionSettings {
             max_retries: r.max_retries,
             project: r.project.clone(),
             timeout_seconds: r.timeout_seconds,
+            thinking_passback: r.thinking_passback.clone(),
         }
     }
 }

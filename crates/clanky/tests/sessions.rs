@@ -105,6 +105,7 @@ fn config() -> TurnConfig {
         max_retries: Some(0),
         retry_sleep: Some(|_| {}),
         interrupt: None,
+        thinking_passback: None,
     }
 }
 
@@ -845,6 +846,40 @@ fn a_resumed_session_rebuilds_the_live_message_list_with_thinking_blocks() {
         6,
         "system, user, assistant, tool, assistant, user"
     );
+    // The rebuilt history holds the blocks in full (asserted above); whether
+    // they *ride the next request* is the passback window's call (M23 item
+    // 8). The default, `previous-turn`, keeps the current turn's rounds only
+    // — and this turn has produced none yet — so a resumed earlier turn's
+    // blocks stay home.
+    assert_eq!(
+        sent[2].thinking(),
+        None,
+        "the default window drops an earlier turn's blocks"
+    );
+    assert_eq!(sent[4].thinking(), None);
+
+    // With `all`, the replayed payload goes back verbatim — the restart
+    // changed nothing about what the model sees.
+    let all_requests = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let resumed = ScriptedProvider {
+        requests: std::rc::Rc::clone(&all_requests),
+        script: RefCell::new(VecDeque::from(vec![text_round("Continuing.")])),
+    };
+    let mut resumed_messages = vec![ChatMessage::system("Be terse.")];
+    resumed_messages.extend(session::history_from_records(&data.records));
+    resumed_messages.push(ChatMessage::user("please continue"));
+    let mut all_cfg = config();
+    all_cfg.thinking_passback = Some(clanky::settings::ThinkingPassback::All);
+    run_turn(
+        Box::new(resumed),
+        &tools,
+        &mut resumed_messages,
+        &all_cfg,
+        &mut |_| {},
+    )
+    .unwrap();
+    let requests = all_requests.borrow().clone();
+    let sent = &requests[0].messages;
     assert_eq!(sent[2].thinking(), Some(blocks.as_slice()));
     assert_eq!(
         sent[4].thinking(),

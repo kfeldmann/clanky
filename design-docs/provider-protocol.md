@@ -180,6 +180,19 @@ Field rules:
   documents as required for an Anthropic-backed model through the proxy).
   A plugin with no such concept ignores the field.
 
+  **The client decides how much is sent (M23 session 4).** A plugin always
+  sends the blocks an assistant message carries; it never applies a window
+  of its own. Trimming is the client's job and happens before the request
+  is built, so the wire is a faithful picture of one decision made in one
+  place: `thinking_passback = "off" | "previous-turn" | "all"` drops whole
+  earlier turns' blocks (`previous-turn` keeps the current turn's rounds —
+  the tool loop — and is the default), and `off` sends none, which is
+  byte-identical to a request from a provider with no such concept. Only a
+  prefix of turns is ever dropped: a run inside one assistant message is
+  never trimmed, because Anthropic accepts only a prefix of the newest
+  message's run and rejects a modified one (spec §5's unmodified rule
+  covers the plugin; the "no holes" rule covers the client's window).
+
   **Persistence is part of the field's contract (M23 session 3).** The
   client stores a round's blocks on its session `thinking` record and, on
   `/resume`, folds them back onto the assistant message of that same round,
