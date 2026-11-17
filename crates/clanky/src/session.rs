@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clanky_protocol::{ChatMessage, ToolCall, Usage};
+use clanky_protocol::{ChatMessage, ThinkingBlock, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -137,7 +137,23 @@ pub enum Record {
     User { text: String },
     /// The complete thinking text of one assistant round. A round cut
     /// short carries whatever had streamed when it was cut.
-    Thinking { text: String },
+    ///
+    /// `blocks` carries the round's opaque passback payload (M23) — the
+    /// finished reasoning blocks with their signatures / redacted data,
+    /// in the order the model produced them. They are written on this
+    /// record, which is written *before* the round's `assistant` record,
+    /// and [`history_from_records`] folds them back onto that assistant
+    /// message. Absent when the round produced no passback payload (every
+    /// record written before this field existed, a provider without the
+    /// concept, and any round cut short — a partial signature is
+    /// unusable). The blocks are stored and replayed **verbatim**: they
+    /// are provider-authored payload the provider verifies, so a resumed
+    /// session must not repair, reorder or invent them.
+    Thinking {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocks: Option<Vec<ThinkingBlock>>,
+    },
     /// The complete visible text of one assistant round plus its parsed
     /// tool calls (empty when the round made none). A round cut short by
     /// an error or quit carries whatever had streamed when it was cut,
@@ -612,30 +628,55 @@ pub fn fold_settings(data: &SessionData) -> SessionSettings {
 /// callers re-assemble it) from session records. Tool results are matched
 /// to their calls by order; calls without a result (interrupted turn)
 /// get a synthetic error result so the sequence stays backend-valid.
+///
+/// A round is recorded as a `thinking` record followed by its `assistant`
+/// record, so a `thinking` record's passback blocks (M23) are folded onto
+/// the *preceding* assistant message — the one its round produced — rather
+/// than becoming a message of their own. Positional walking cannot do
+/// this, so the fold is explicit: the blocks ride along and are attached
+/// when the round's assistant record is pushed. A `thinking` record that
+/// precedes no assistant message (a round that streamed reasoning and was
+/// cut before any text, or a hand-edited file) attaches to nothing; it is
+/// never given a message of its own, because an assistant message with
+/// neither text nor calls is not part of what the model saw.
 pub fn history_from_records(records: &[Record]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     let mut awaiting: VecDeque<String> = VecDeque::new();
+    // The passback blocks of the round whose `assistant` record has not
+    // been pushed yet (the `thinking` record immediately before it).
+    let mut pending_blocks: Option<Vec<ThinkingBlock>> = None;
     for record in records {
         match record {
-            Record::User { text } => messages.push(ChatMessage::user(text)),
-            Record::Thinking { .. }
-            | Record::Usage { .. }
+            Record::User { text } => {
+                pending_blocks = None;
+                messages.push(ChatMessage::user(text));
+            }
+            Record::Thinking { blocks, .. } => {
+                pending_blocks = blocks.clone().filter(|blocks| !blocks.is_empty());
+            }
+            // Nothing between a round's `thinking` record and its
+            // `assistant` record (the recorder writes them adjacently), so
+            // any other record ends the fold: blocks only ever attach to
+            // the assistant message of their own round.
+            Record::Usage { .. }
             | Record::Error { .. }
             | Record::StopReason { .. }
-            | Record::Settings { .. } => {}
+            | Record::Settings { .. } => pending_blocks = None,
             Record::Assistant { text, calls } => {
                 for call in calls {
                     awaiting.push_back(call.id.clone());
                 }
+                // The blocks the model generated for this round, replayed
+                // exactly as they were stored — no repair, no invention.
+                let thinking = pending_blocks.take();
                 messages.push(ChatMessage::Assistant {
                     content: text.clone(),
                     tool_calls: (!calls.is_empty()).then(|| calls.clone()),
-                    // Session fidelity for the passback payload is M23
-                    // session 3; until then a resumed session sends none.
-                    thinking: None,
+                    thinking,
                 });
             }
             Record::ToolResult { output, images, .. } => {
+                pending_blocks = None;
                 if let Some(id) = awaiting.pop_front() {
                     let message = if images.as_ref().is_some_and(|imgs| !imgs.is_empty()) {
                         ChatMessage::tool_with_images(
@@ -1202,6 +1243,143 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// M23 session 3: the passback payload of a round is written on its
+    /// `thinking` record and folded back onto the assistant message of
+    /// that same round — not into a message of its own.
+    #[test]
+    fn thinking_blocks_round_trip_and_fold_onto_their_round() {
+        let blocks = vec![
+            ThinkingBlock::thinking("", Some("sig-1".into())),
+            ThinkingBlock::redacted("blob-2"),
+            ThinkingBlock::thinking("real text", None),
+        ];
+        let records = vec![
+            Record::User { text: "go".into() },
+            Record::Thinking {
+                text: String::new(),
+                blocks: Some(blocks.clone()),
+            },
+            Record::Assistant {
+                text: "checking".into(),
+                calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: json!({}),
+                }],
+            },
+            Record::ToolResult {
+                name: "bash".into(),
+                output: "ok".into(),
+                images: None,
+            },
+            // A second round with no payload at all: it must not inherit
+            // the previous round's blocks.
+            Record::Thinking {
+                text: "more".into(),
+                blocks: None,
+            },
+            Record::Assistant {
+                text: "done".into(),
+                calls: vec![],
+            },
+        ];
+        let history = history_from_records(&records);
+        assert_eq!(history.len(), 4, "user, assistant, tool, assistant");
+        assert_eq!(
+            history[1].thinking(),
+            Some(blocks.as_slice()),
+            "blocks ride the round that produced them, verbatim and in order"
+        );
+        assert_eq!(history[3].thinking(), None, "a blockless round sends none");
+
+        // …and they survive a file round trip unchanged.
+        let dir = temp_dir("blocks");
+        let path = write_session(&dir, "blocks", &records);
+        let data = load(&path).unwrap();
+        assert_eq!(data.records, records);
+        assert_eq!(
+            history_from_records(&data.records),
+            history,
+            "a resumed session rebuilds the same message list"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Blocks attach only to the assistant message of their own round: a
+    /// `thinking` record with no following assistant record (a round cut
+    /// before any text) attaches to nothing, and a file written before
+    /// the field existed still loads with no payload.
+    #[test]
+    fn thinking_blocks_attach_only_to_their_own_round() {
+        let cut = vec![
+            Record::User { text: "go".into() },
+            Record::Thinking {
+                text: "half a thought".into(),
+                blocks: Some(vec![ThinkingBlock::thinking("", Some("sig".into()))]),
+            },
+        ];
+        let history = history_from_records(&cut);
+        assert_eq!(history.len(), 1, "no message is invented for the round");
+        assert_eq!(history[0].thinking(), None);
+
+        let legacy = vec![
+            Record::User { text: "go".into() },
+            Record::Thinking {
+                text: "old file".into(),
+                blocks: None,
+            },
+            Record::Assistant {
+                text: "answer".into(),
+                calls: vec![],
+            },
+        ];
+        let history = history_from_records(&legacy);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].thinking(), None);
+        assert_eq!(history[1].content(), "answer");
+
+        // A record between the thinking and assistant records ends the
+        // fold: blocks never leak onto a later round's message.
+        let separated = vec![
+            Record::User { text: "go".into() },
+            Record::Thinking {
+                text: "reasoning".into(),
+                blocks: Some(vec![ThinkingBlock::thinking("", Some("sig".into()))]),
+            },
+            Record::Usage {
+                prompt_tokens: Some(1),
+                completion_tokens: Some(1),
+                cached_tokens: None,
+            },
+            Record::Assistant {
+                text: "answer".into(),
+                calls: vec![],
+            },
+        ];
+        let history = history_from_records(&separated);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].thinking(), None);
+    }
+
+    /// A `thinking` record's `blocks` field is omitted when absent, so a
+    /// session file written by a blockless round is byte-identical to the
+    /// pre-M23 format.
+    #[test]
+    fn a_blockless_thinking_record_omits_the_field() {
+        let record = Record::Thinking {
+            text: "hmm".into(),
+            blocks: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            json!({"type": "thinking", "text": "hmm"})
+        );
+        // And the pre-M23 shape still loads (no `blocks` key at all).
+        let parsed: Record = serde_json::from_value(json!({"type": "thinking", "text": "hmm"}))
+            .expect("pre-M23 thinking record loads");
+        assert_eq!(parsed, record);
     }
 
     #[test]

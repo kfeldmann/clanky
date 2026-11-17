@@ -249,10 +249,14 @@ impl Recorder {
     pub fn flush_partial(&mut self, errors: &mut dyn ErrorSink) {
         let partial = std::mem::take(&mut self.partial);
         if !partial.thinking.is_empty() {
+            // A round cut short carries no passback payload: its
+            // signatures may be incomplete and nothing downstream will
+            // re-send them (M23 constraint 2).
             self.record(
                 errors,
                 session::Record::Thinking {
                     text: partial.thinking,
+                    blocks: None,
                 },
             );
         }
@@ -376,17 +380,20 @@ pub fn record_turn_event(recorder: &mut Recorder, errors: &mut dyn ErrorSink, ev
             text,
             thinking,
             calls,
-            // Session fidelity for the passback payload is M23 session 3.
-            thinking_blocks: _,
+            thinking_blocks,
         } => {
             // The records written below supersede the deltas accumulated
             // for this round.
             recorder.clear_partial();
-            if !thinking.is_empty() {
+            // The round's passback payload (M23) is stored verbatim on
+            // the thinking record, which precedes the assistant record so
+            // a resume folds it back onto that message.
+            if !thinking.is_empty() || !thinking_blocks.is_empty() {
                 recorder.record(
                     errors,
                     session::Record::Thinking {
                         text: thinking.clone(),
+                        blocks: (!thinking_blocks.is_empty()).then(|| thinking_blocks.clone()),
                     },
                 );
             }
@@ -764,5 +771,127 @@ mod tests {
         ] {
             record_turn_event(state, errors, &event);
         }
+    }
+}
+
+#[cfg(test)]
+mod m23_tests {
+    use super::*;
+    use crate::session::{self, Record};
+    use clanky_protocol::ThinkingBlock;
+
+    struct PanickySink;
+    impl ErrorSink for PanickySink {
+        fn report(&mut self, message: String) {
+            panic!("unexpected sink report: {message}");
+        }
+    }
+
+    fn state(tag: &str) -> (Recorder, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-blocks-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        (
+            Recorder::with_dir(dir.clone(), "session", SessionSettings::default()),
+            dir,
+        )
+    }
+
+    /// A completed round's blocks land on its `thinking` record, verbatim
+    /// and in order, so a resume can pass them back (M23 session 3).
+    #[test]
+    fn a_rounds_blocks_are_recorded_on_its_thinking_record() {
+        let (mut recorder, dir) = state("recorded");
+        let mut errors = PanickySink;
+        let blocks = vec![
+            ThinkingBlock::thinking("", Some("sig-1".into())),
+            ThinkingBlock::redacted("blob-2"),
+        ];
+        record_turn_event(
+            &mut recorder,
+            &mut errors,
+            &TurnEvent::Round {
+                text: String::new(),
+                thinking: String::new(),
+                calls: Vec::new(),
+                thinking_blocks: blocks.clone(),
+            },
+        );
+        let records = session::load(recorder.open_file().unwrap())
+            .unwrap()
+            .records;
+        assert_eq!(
+            records.last(),
+            Some(&Record::Thinking {
+                text: String::new(),
+                blocks: Some(blocks.clone()),
+            }),
+            "a signature-only round still writes its payload"
+        );
+        // …and the resume path folds them onto the round's message. (A
+        // round with no text and no calls writes no assistant record, so
+        // there is no message for the payload to attach to here.)
+        let history = session::history_from_records(&records);
+        assert!(history.is_empty(), "{history:?}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A round with no payload keeps the pre-M23 record shape (no `blocks`
+    /// key at all), so an old session file and a new blockless round are
+    /// byte-identical.
+    #[test]
+    fn a_blockless_round_writes_the_old_record_shape() {
+        let (mut recorder, dir) = state("blockless");
+        let mut errors = PanickySink;
+        record_turn_event(
+            &mut recorder,
+            &mut errors,
+            &TurnEvent::Round {
+                text: "answer".into(),
+                thinking: "a thought".into(),
+                calls: Vec::new(),
+                thinking_blocks: Vec::new(),
+            },
+        );
+        let file = std::fs::read_to_string(recorder.open_file().unwrap()).unwrap();
+        assert!(
+            file.contains(r#"{"type":"thinking","text":"a thought"}"#),
+            "{file}"
+        );
+        assert!(!file.contains("blocks"), "{file}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A round cut short carries no payload: its signature may be
+    /// incomplete, and nothing downstream will re-send it.
+    #[test]
+    fn a_flushed_partial_round_records_no_blocks() {
+        let (mut recorder, dir) = state("partial");
+        let mut errors = PanickySink;
+        record_turn_event(
+            &mut recorder,
+            &mut errors,
+            &TurnEvent::Thinking {
+                delta: "half a thou".into(),
+            },
+        );
+        recorder.flush_partial(&mut errors);
+        let records = session::load(recorder.open_file().unwrap())
+            .unwrap()
+            .records;
+        assert_eq!(
+            records.last(),
+            Some(&Record::Thinking {
+                text: "half a thou".into(),
+                blocks: None,
+            })
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }

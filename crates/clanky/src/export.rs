@@ -113,7 +113,7 @@ pub fn render(
                     }
                 }
             }
-            Record::Thinking { text } => {
+            Record::Thinking { text, .. } => {
                 if options.thinking && !text.trim().is_empty() {
                     out.push_str("## Thinking\n\n");
                     out.push_str(&fence(text, ""));
@@ -299,6 +299,7 @@ mod tests {
             },
             Record::Thinking {
                 text: "I should run ls.".into(),
+                blocks: None,
             },
             Record::Assistant {
                 text: "Let me check.".into(),
@@ -402,6 +403,7 @@ mod tests {
     fn fenced_content_cannot_break_the_document() {
         let records = vec![Record::Thinking {
             text: "a ``` b\n```\nmore".into(),
+            blocks: None,
         }];
         let doc = render(Some("session-a"), &header(), &records, ExportOptions::ALL);
         assert!(doc.contains("````\na ``` b\n```\nmore\n````"), "{doc}");
@@ -504,7 +506,10 @@ mod tests {
 
     #[test]
     fn empty_selection_says_so() {
-        let records = vec![Record::Thinking { text: "hmm".into() }];
+        let records = vec![Record::Thinking {
+            text: "hmm".into(),
+            blocks: None,
+        }];
         let doc = render(
             Some("session-a"),
             &header(),

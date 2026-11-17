@@ -169,12 +169,13 @@ impl Recorder {
                 text,
                 thinking,
                 calls,
-                thinking_blocks: _,
+                thinking_blocks,
             } => {
                 let mut records = Vec::new();
-                if !thinking.is_empty() {
+                if !thinking.is_empty() || !thinking_blocks.is_empty() {
                     records.push(Record::Thinking {
                         text: thinking.clone(),
+                        blocks: (!thinking_blocks.is_empty()).then(|| thinking_blocks.clone()),
                     });
                 }
                 if !text.is_empty() || !calls.is_empty() {
@@ -519,6 +520,7 @@ fn markdown_export_covers_the_session_and_honors_its_flags() {
         },
         Record::Thinking {
             text: "run ls first".into(),
+            blocks: None,
         },
         Record::Assistant {
             text: "Let me check.".into(),
@@ -670,7 +672,8 @@ fn an_interrupted_turn_keeps_the_partial_round_on_disk() {
                 text: "run it".into()
             },
             Record::Thinking {
-                text: "let me thi".into()
+                text: "let me thi".into(),
+                blocks: None,
             },
             Record::Assistant {
                 text: "The an".into(),
@@ -712,4 +715,191 @@ fn an_interrupted_turn_keeps_the_partial_round_on_disk() {
     assert_eq!(sent[2].content(), "The an");
 
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// M23 session 3 acceptance: a resumed session produces the identical
+/// `Vec<ChatMessage>` the live turn held — including a `redacted_thinking`
+/// block passed back through the session file and a synthetic-result
+/// repair for a tool call the interruption left unanswered.
+#[test]
+fn a_resumed_session_rebuilds_the_live_message_list_with_thinking_blocks() {
+    let dir = temp_dir("thinking-blocks-replay");
+    let path = dir.join("session.jsonl");
+    let mut recorder = Recorder::new(path.clone());
+
+    let blocks = vec![
+        // The `display: "omitted"` mainline: the signature is the payload.
+        clanky_protocol::ThinkingBlock::thinking("", Some("sig-round-1".into())),
+        // A redacted block, which must survive the file verbatim.
+        clanky_protocol::ThinkingBlock::redacted("EmwKAh-hidden-payload"),
+    ];
+
+    // --- first turn: a signed + redacted round that calls a tool, then a
+    // plain answer carrying its own block ---
+    let provider = ScriptedProvider {
+        requests: std::rc::Rc::new(RefCell::new(Vec::new())),
+        script: RefCell::new(VecDeque::from(vec![
+            ScriptedRound {
+                chunks: [
+                    vec![ChunkPayload::Text {
+                        text: "Checking.".into(),
+                    }],
+                    tool_call_chunks("call_1", "echo_tool", r#"{"input": "hello"}"#),
+                    blocks
+                        .iter()
+                        .cloned()
+                        .map(|block| ChunkPayload::ThinkingBlock { block })
+                        .collect(),
+                ]
+                .concat(),
+                finish_reason: FinishReason::ToolCalls,
+            },
+            ScriptedRound {
+                chunks: vec![
+                    ChunkPayload::Text {
+                        text: "It said: echoed hello.".into(),
+                    },
+                    ChunkPayload::ThinkingBlock {
+                        block: clanky_protocol::ThinkingBlock::thinking(
+                            "answer reasoning",
+                            Some("sig-round-2".into()),
+                        ),
+                    },
+                ],
+                finish_reason: FinishReason::Stop,
+            },
+        ])),
+    };
+    let tools: clanky::tools::ToolSet = vec![Box::new(EchoTool)];
+    let mut messages = vec![
+        ChatMessage::system("Be terse."),
+        ChatMessage::user("run it"),
+    ];
+    recorder
+        .writer
+        .append(&Record::User {
+            text: "run it".into(),
+        })
+        .unwrap();
+    let output = run_turn(
+        Box::new(provider),
+        &tools,
+        &mut messages,
+        &config(),
+        &mut |event| recorder.on_turn_event(&event),
+    )
+    .unwrap();
+    recorder.on_done(&Ok(output));
+
+    // The live conversation carries the blocks on the rounds that made them.
+    assert_eq!(messages[2].thinking(), Some(blocks.as_slice()));
+    assert_eq!(
+        messages[4].thinking(),
+        Some(
+            [clanky_protocol::ThinkingBlock::thinking(
+                "answer reasoning",
+                Some("sig-round-2".into())
+            )]
+            .as_slice()
+        )
+    );
+
+    // --- kill the session: drop everything, reload from disk ---
+    drop(recorder);
+    let data = session::load(&path).unwrap();
+    let rebuilt = session::history_from_records(&data.records);
+    assert_eq!(
+        rebuilt,
+        messages[1..],
+        "the resumed history is exactly what the model saw, blocks included"
+    );
+
+    // The passback payload is replayed verbatim — the redacted block keeps
+    // its data byte for byte (constraint 1: never modify a block).
+    assert_eq!(
+        rebuilt[1].thinking().expect("blocks on the tool round")[1],
+        clanky_protocol::ThinkingBlock::redacted("EmwKAh-hidden-payload")
+    );
+
+    // --- the next request sends them back, exactly as before the restart ---
+    let resumed_requests = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let resumed = ScriptedProvider {
+        requests: std::rc::Rc::clone(&resumed_requests),
+        script: RefCell::new(VecDeque::from(vec![text_round("Continuing.")])),
+    };
+    let mut resumed_messages = vec![ChatMessage::system("Be terse.")];
+    resumed_messages.extend(rebuilt);
+    resumed_messages.push(ChatMessage::user("please continue"));
+    run_turn(
+        Box::new(resumed),
+        &tools,
+        &mut resumed_messages,
+        &config(),
+        &mut |_| {},
+    )
+    .unwrap();
+    let requests = resumed_requests.borrow().clone();
+    let sent = &requests[0].messages;
+    assert_eq!(
+        sent.len(),
+        6,
+        "system, user, assistant, tool, assistant, user"
+    );
+    assert_eq!(sent[2].thinking(), Some(blocks.as_slice()));
+    assert_eq!(
+        sent[4].thinking(),
+        Some(
+            [clanky_protocol::ThinkingBlock::thinking(
+                "answer reasoning",
+                Some("sig-round-2".into())
+            )]
+            .as_slice()
+        )
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// The other half of the exit criterion: the synthetic-result repair for an
+/// interrupted tool call keeps working when the round also carried blocks,
+/// so a resumed file is still a valid chat.
+#[test]
+fn an_interrupted_call_is_repaired_even_when_its_round_had_blocks() {
+    let records = vec![
+        Record::User {
+            text: "run it".into(),
+        },
+        Record::Thinking {
+            text: String::new(),
+            blocks: Some(vec![clanky_protocol::ThinkingBlock::thinking(
+                "",
+                Some("sig-interrupted".into()),
+            )]),
+        },
+        Record::Assistant {
+            text: "Checking.".into(),
+            calls: vec![clanky_protocol::ToolCall {
+                id: "call_7".into(),
+                name: "echo_tool".into(),
+                arguments: json!({"input": "hi"}),
+            }],
+        },
+        // No tool result: the process died mid-flight.
+    ];
+    let history = session::history_from_records(&records);
+    assert_eq!(history.len(), 3, "user, assistant, synthetic tool result");
+    assert_eq!(
+        history[1].thinking(),
+        Some(
+            [clanky_protocol::ThinkingBlock::thinking(
+                "",
+                Some("sig-interrupted".into())
+            )]
+            .as_slice()
+        )
+    );
+    assert!(
+        matches!(&history[2], ChatMessage::Tool { tool_call_id, content, .. }
+            if tool_call_id == "call_7" && content.contains("interrupted"))
+    );
 }

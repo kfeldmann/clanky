@@ -14,7 +14,7 @@ The only session that touches the wire, and the one where the milestone's headli
 - DeepInfra/LiteLLM arm: `reasoning_content` only on DeepInfra; `+ thinking_blocks` on LiteLLM. Field-name asymmetry test.
 - **Exit:** live Anthropic tool loop shows `output_tokens_details` present on round 2 (the degradation bug closed); live DeepInfra +≈400 prompt tokens with a ~1800-char block. Both gated behind `#[ignore]`/env so CI stays offline-green.
 
-### Session 3 — Session fidelity (item 5, constraint 6)
+### ✔ Session 3 — Session fidelity (item 5, constraint 6) — **done** (see M23's "As built (session 3)")
 Split out because the doc calls it "the delicate part" and it's independent of 2 given 1: `Record::Thinking.blocks` (defaulted), `history_from_records` folding a round's thinking onto the *preceding* assistant message instead of walking positionally, `/resume` reconstruction tests, and the README warning that a session file / `/md --thinking` export is trusted input.
 
 - **Exit:** a resumed session produces the identical `Vec<ChatMessage>` a live session had — including a `redacted_thinking` block and a synthetic-result repair for an interrupted call.

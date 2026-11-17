@@ -481,8 +481,14 @@ impl App {
                     records.push(Record::User { text: text.clone() });
                 }
                 Entry::Thinking(text) => {
+                    // The screen keeps no passback payload: the blocks
+                    // live in the session file, and an export from the
+                    // screen is a rendering, not a resume source (M23).
                     flush_round(&mut records, &mut round);
-                    records.push(Record::Thinking { text: text.clone() });
+                    records.push(Record::Thinking {
+                        text: text.clone(),
+                        blocks: None,
+                    });
                 }
                 Entry::Assistant(text) => {
                     let r = round.get_or_insert_with(|| (String::new(), Vec::new()));
@@ -547,11 +553,19 @@ impl App {
                     self.entries.push(Entry::User(text.clone()));
                     self.input_history.push(text.clone());
                 }
-                Record::Thinking { text } => {
+                Record::Thinking { text, .. } => {
                     // Past thinking is only shown while the display is on;
                     // a resumed session with the display off keeps the
                     // collapsed placeholders (the session file still has
-                    // the text, e.g. for `/md --thinking`).
+                    // the text, e.g. for `/md --thinking`). A record with
+                    // no text (a signature-only round on a model whose
+                    // `display` is `"omitted"`) showed nothing live either,
+                    // so it adds no transcript entry — its passback payload
+                    // still reaches the history through
+                    // `history_from_records`.
+                    if text.is_empty() {
+                        continue;
+                    }
                     if self.show_thinking {
                         self.entries.push(Entry::Thinking(text.clone()));
                     } else {
@@ -2034,6 +2048,53 @@ mod tests {
         assert_eq!(app.sealed_boundary(), 3);
         app.entries.push(Entry::Info("note".into()));
         assert_eq!(app.sealed_boundary(), 5, "everything is final again");
+    }
+
+    /// M23 session 3: a restored session shows its thinking exactly as it
+    /// did live — a text-bearing block is a transcript entry (or a
+    /// collapsed placeholder), while a signature-only record adds nothing,
+    /// because nothing was printed for it live. The passback payload still
+    /// reaches the rebuilt history either way.
+    #[test]
+    fn restore_renders_thinking_records_and_keeps_their_blocks() {
+        let blocks = vec![
+            clanky_protocol::ThinkingBlock::thinking("", Some("sig-1".into())),
+            clanky_protocol::ThinkingBlock::redacted("blob-2"),
+        ];
+        let records = vec![
+            Record::User { text: "hi".into() },
+            Record::Thinking {
+                text: String::new(),
+                blocks: Some(blocks.clone()),
+            },
+            Record::Assistant {
+                text: "checking".into(),
+                calls: vec![],
+            },
+            Record::Thinking {
+                text: "readable reasoning".into(),
+                blocks: None,
+            },
+            Record::Assistant {
+                text: "done".into(),
+                calls: vec![],
+            },
+        ];
+        let mut app = App::new(None);
+        let history = app.restore(&records);
+        assert_eq!(
+            app.entries,
+            vec![
+                Entry::User("hi".into()),
+                Entry::Assistant("checking".into()),
+                Entry::Thinking("readable reasoning".into()),
+                Entry::Assistant("done".into()),
+            ],
+            "a signature-only record adds no entry; it showed nothing live"
+        );
+        assert_eq!(history.len(), 3, "user, assistant, assistant");
+        assert_eq!(history[1].thinking(), Some(blocks.as_slice()));
+        assert_eq!(history[2].thinking(), None);
     }
 
     #[test]

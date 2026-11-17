@@ -1551,10 +1551,11 @@ As built:
 
 ## ☐ M23 — Thinking passback: send reasoning back to the model
 
-**Sessions 1–2 of 4 done: the payload is captured, carried, and now sent
-back — the passback itself is live on all three providers (session 2's
-"As built" note below). Sessions 3–4 are session fidelity and the
-knob/cost docs; see `design-docs/m23-sessions.md`.**
+**Sessions 1–3 of 4 done: the payload is captured, carried, sent back —
+live on all three providers (session 2) — and now survives a quit, so a
+resumed session replays the identical message list a live one held
+(session 3's "As built" note below). Session 4 is the knob and the honest
+cost docs; see `design-docs/m23-sessions.md`.**
 
 Clanky never sends an assistant round's thinking back to the provider. The
 protocol's assistant message is `{content, tool_calls}` and nothing else
@@ -2162,6 +2163,65 @@ user-supplied value the project invariants say to pass through, not correct.
      later prompt" is replaced by a pointer to the measured cost models
      (the full item-7 rewrite is session 4's job).
 
+   **As built (session 3, 2026-11).** The passback payload now survives a
+   quit: a resumed session rebuilds the identical message list a live
+   session held, blocks included. No wire change — the field existed
+   already; what changed is that it is no longer empty after `/resume`.
+
+   - **`Record::Thinking` gained `blocks: Option<Vec<ThinkingBlock>>`**
+     (`crates/clanky/src/session.rs`), `#[serde(default,
+     skip_serializing_if = "Option::is_none")]`. A blockless round writes
+     `{"type":"thinking","text":"…"}` exactly as before, so existing files
+     load unchanged and new blockless files are byte-identical to the old
+     shape (pinned by a test). The blocks are stored **verbatim** — the
+     record is a replay source, not a repair step (constraint 1), and a
+     `thinking` record whose round was cut short carries none (constraint
+     2's "signature or nothing", matching the turn loop's rule for a
+     cancelled or errored round).
+   - **`history_from_records` folds, it does not walk positionally.** A
+     round is recorded thinking-first then assistant, so the `thinking`
+     record's blocks ride along in a `pending_blocks` slot and are attached
+     to the next `Assistant` record — the message of their own round —
+     instead of becoming a message of their own. Any other record
+     (`user`, `usage`, `error`, `stopReason`, `settings`, `toolResult`)
+     clears the slot, so blocks can never leak onto a later round even in a
+     hand-edited file. A `thinking` record that precedes no assistant
+     message (a round cut before any text) attaches to nothing and invents
+     no message. The synthetic-result repair for an interrupted call is
+     untouched and keeps working with blocks present.
+   - **Writers.** `recorder::record_turn_event` writes the round's
+     `thinking_blocks` onto the record; `Recorder::flush_partial` (the
+     error/ctrl+c path) writes `blocks: None`, like the turn loop. The TUI's
+     `screen_records` (an export from the screen) likewise writes `None`:
+     the screen keeps no payload, and a screen export is a rendering, not a
+     resume source.
+   - **TUI `restore`.** A `thinking` record with empty text (the
+     `display: "omitted"` mainline, where the signature is the whole
+     payload) adds no transcript entry — nothing was printed for it live
+     either — while its blocks still reach the rebuilt history. This keeps
+     a resumed screen identical to the live one instead of printing an
+     empty thinking block.
+   - **Tests.** Session unit: blocks round-trip through the file and fold
+     onto their own round, a blockless round sends none, a cut round
+     attaches to nothing, a separating record breaks the fold, and the
+     field is omitted when absent (the pre-M23 shape still parses).
+     Recorder: a round's blocks land on its `thinking` record, a blockless
+     round writes the old shape, a flushed partial round writes none. TUI:
+     `restore` renders text-bearing thinking and adds no entry for a
+     signature-only record. Integration (`tests/sessions.rs`): the full
+     exit criterion — a live turn whose rounds carry a signature-only and a
+     `redacted_thinking` block, killed and reloaded, rebuilds a history
+     `==` the live one, and the next request carries the same blocks
+     verbatim; plus a synthetic-result repair on a block-carrying
+     interrupted call.
+   - **Docs.** README's `/resume` section states that the restored history
+     is exactly what the model saw (blocks replayed verbatim), and both it
+     and `/md --thinking` now carry the plain warning that **a session file
+     is trusted input** — model-authored reasoning is authoritative
+     context, so a hand-edited file or export becomes an instruction
+     channel (constraint 6). `provider-protocol.md` §5 records persistence
+     as part of the field's contract.
+
 1. **[x] Capture the signature (both transports).** `AnthropicBlock` gains
    `signature: Option<String>` and `data: Option<String>` (the
    `redacted_thinking` payload); `StreamDelta` gains `signature:
@@ -2201,7 +2261,7 @@ user-supplied value the project invariants say to pass through, not correct.
    sends no blocks — partial signatures are unusable, and the existing
    partial-round flush already drops tool calls for the same reason.
 
-5. **Session fidelity.** `Record::Thinking` gains optional
+5. **[x] Session fidelity.** `Record::Thinking` gains optional
    `blocks: Option<Vec<ThinkingBlock>>` (defaulted, so existing files load),
    and `history_from_records` stops skipping thinking: it must fold a
    round's `Thinking` record back onto the preceding assistant message

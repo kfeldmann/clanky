@@ -2851,6 +2851,7 @@ mod tests {
             },
             session::Record::Thinking {
                 text: "I should run ls.".into(),
+                blocks: None,
             },
             session::Record::Assistant {
                 text: "Let me check.".into(),
@@ -3181,7 +3182,8 @@ mod tests {
             vec![
                 leading_settings_record(),
                 session::Record::Thinking {
-                    text: "let me think".into()
+                    text: "let me think".into(),
+                    blocks: None,
                 },
                 session::Record::Assistant {
                     text: "The answer".into(),

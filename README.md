@@ -298,6 +298,26 @@ a picker of saved sessions when `NAME` is omitted): the transcript and the
 full conversation history are restored, and the turn's records append to
 the same file.
 
+The restored history is exactly what the model saw, thinking included: a
+round's reasoning blocks (the opaque `signature`/`redacted` payload a later
+request passes back, see the provider notes) are stored on its `thinking`
+record and folded back onto the assistant message of that same round on
+resume, so continuing a resumed conversation sends the same passback
+payload the live session would have. They are replayed **verbatim** — a
+block is never repaired, reordered or invented, because the provider
+verifies it and rejects an altered one. A block is an opaque payload (a
+signature is often a kilobyte or two), so sessions that think get somewhat
+larger JSONL lines; a round with no payload keeps the old record shape
+exactly.
+
+> **A session file is trusted input.** Passed-back reasoning is
+> model-authored text that the model treats as authoritative context, so a
+> hand-edited session file (or a `/md --thinking` export edited and fed
+> back) becomes an instruction channel the model will follow. Treat a
+> session file you did not produce as untrusted: it can make the model do
+> things its prompt did not ask for. The same applies to `/md --thinking`
+> exports, which contain that text verbatim in fenced blocks.
+
 ### Settings records
 
 Every session file starts with a `settings` record: provider, model, and
@@ -803,8 +823,12 @@ existing file is overwritten.
 Authored text — user prompts and assistant answers — is exported
 verbatim, so its Markdown (code blocks, headings, lists) renders exactly
 as it did in the conversation. Thinking and tool output is raw
-machine-produced text and is wrapped in fenced code blocks instead. For
-example:
+machine-produced text and is wrapped in fenced code blocks instead.
+
+A `--thinking` export contains the model's reasoning verbatim, which is
+model-authored text the model treats as authoritative context. Editing
+such an export and resuming it makes the edit part of the conversation —
+see the warning under `--resume` above. For example:
 
 ```text
 /md session.md

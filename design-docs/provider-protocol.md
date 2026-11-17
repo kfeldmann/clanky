@@ -179,6 +179,16 @@ Field rules:
   sends both `reasoning_content` and `thinking_blocks` (the shape LiteLLM
   documents as required for an Anthropic-backed model through the proxy).
   A plugin with no such concept ignores the field.
+
+  **Persistence is part of the field's contract (M23 session 3).** The
+  client stores a round's blocks on its session `thinking` record and, on
+  `/resume`, folds them back onto the assistant message of that same round,
+  so a resumed session sends the same passback payload the live one would.
+  They are replayed verbatim — a session file is not a repair step, and a
+  block is never reconstructed, reordered or invented (constraint 1:
+  the payload is provider-authored and verified). A `thinking` record with
+  no blocks, or one whose round never produced an assistant message, sends
+  nothing.
 - Tool results are `role: "tool"` messages with `toolCallId` + `content`.
   A tool result may additionally carry `images` — an optional, additive
   list of `{"dataBase64": …, "mediaType": "jpeg|png|gif|webp|heic|heif|avif"}`
