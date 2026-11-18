@@ -140,6 +140,14 @@ Notes:
   that API treats as off). Leaving `thinking` unset is *not* the same thing:
   the backend's default then applies, which on reasoning models (e.g.
   DeepSeek, GLM) means a reasoning trace **is** produced.
+- `thinking` is a **budget**, and what a budget buys depends on the
+  provider. On Anthropic it becomes `{"type": "enabled", "budget_tokens":
+  N}`, which returns readable thinking text on the `4-x`/`4-6` models but
+  not on the `5-5` family (thinking runs, the signature comes back, the
+  text is empty). A `[sampling] thinking` entry — e.g.
+  `{ type = "adaptive", display = "summarized" }` — wins over the derived
+  one, which is how to get visible thinking on `5-5`; see the
+  [Anthropic notes](#anthropic).
 - `thinking_passback` decides how much of the conversation's reasoning rides
   later requests. The current turn's rounds always keep theirs — inside a
   tool loop that passback is correctness (Anthropic and DeepSeek require
@@ -727,9 +735,62 @@ Notes:
   keeps thinking enabled through tool loops — a history whose assistant
   messages lack their thinking blocks silently disables thinking on the
   `4-x`/`4-6` models, so the passback is a correctness fix there and a
-  fidelity win elsewhere. On the models whose `display` defaults to
-  `"omitted"` the thinking text is empty and the signature *is* the
-  reasoning; an empty-text block is the normal case, not an error.
+  fidelity win elsewhere. An empty-text block is the normal case, not an
+  error: the signature is the reasoning, and the text is a display
+  convenience the API may withhold (see the next section).
+
+#### Thinking: what you actually see, and how to see it
+
+`thinking = "<budget>"` is sent to the Messages API as
+`{"type": "enabled", "budget_tokens": <budget>}`. On the **`4-x`/`4-6`
+family** that mode returns readable thinking text by default, so the
+transcript shows it. On the **`5-5` family** (`claude-sonnet-5-5`,
+`claude-haiku-5-5`, `claude-opus-5-5`) `enabled` runs thinking but returns
+an **empty** `thinking` field with a populated signature — thinking is
+working and being passed back, but there is no text to display. On those
+models `display: "summarized"` is ignored under `enabled`; only `adaptive`
+produces text:
+
+| model family | request | readable thinking text |
+| --- | --- | --- |
+| `4-x` / `4-6` | `enabled` | yes (default) |
+| `4-x` / `4-6` | `enabled` + `display: "omitted"` | no |
+| `5-5` | `enabled` (+ any `display`) | **no** |
+| `5-5` | `adaptive` + `display: "summarized"` | yes |
+| `5-5` | `adaptive` (no `display`) | no |
+
+Measured live against `api.anthropic.com`: on `5-5` under `enabled`, rounds
+reported `output_tokens_details.thinking_tokens` in the 1100–1300 range
+while the thinking text was empty — the reasoning ran and the signature
+came back, but there was nothing to show.
+
+To get visible thinking on a `5-5` model, set the thinking object yourself
+in `[sampling]` (a `thinking` entry there wins over the budget-derived
+one):
+
+```toml
+provider = "anthropic"
+model = "claude-sonnet-5-5"
+thinking = "32000"          # inert while [sampling] sets `thinking`
+
+[sampling]
+thinking = { type = "adaptive", display = "summarized" }
+output_config = { effort = "xhigh" }
+```
+
+- **`display = "summarized"` is required** — `adaptive` alone also returns
+  empty text.
+- **`effort` is the dial on `5-5`, not the budget.** On the same prompt,
+  `low` and `medium` returned no thinking text while `high`, `xhigh` and
+  `max` did (155 / 309 / 552 characters). The budget setting is not sent
+  in `adaptive` mode — `adaptive` + `budget_tokens` is a 400
+  (`thinking.adaptive.budget_tokens: Extra inputs are not permitted`).
+- **A `[sampling] thinking` entry overrides `thinking = "off"` too**, since
+  the more specific setting wins. Don't set both.
+- **Expect less text when tools are present.** The same prompt produced
+  ~1900 characters of thinking with no `tools` array and ~180–210 with
+  one: the model decides a tool call needs less deliberation. That is the
+  model's choice, not a Clanky bug.
 
 ### Writing a provider plugin
 
@@ -844,6 +905,12 @@ post-quit history all work. Two details of that model are visible:
 display-only switch: the session file records every thinking block, so
 `/md --thinking` and `--all` still export the full text, and /resume
 loads the full session including all thinking text.
+
+On models that return no thinking text (Anthropic's `5-5` family under
+`enabled`; see the [Anthropic notes](#anthropic)) there is nothing to show
+or to toggle — the session file still records the round's block, signature
+included, and it is still passed back. The toggle changes only what is
+printed.
 
 Because the transcript is printed straight to the terminal, it cannot be
 rewritten to expand or collapse what is already on screen. The toggle

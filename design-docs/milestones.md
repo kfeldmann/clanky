@@ -2053,6 +2053,47 @@ user-supplied value the project invariants say to pass through, not correct.
    `thinking = "32000"` in a settings file reads as a cap and is not one
    on the configured model.
 
+   **Follow-up done (2026-11): the `5-5` family shows no thinking text
+   under `enabled`, and that is the API, not Clanky.** Reported after M23
+   as "M23 stopped Anthropic from showing thinking". It did not: the
+   session records were empty-text *before* M23 too (the earlier sessions
+   had no thinking blocks at all because no signature was captured then),
+   and M23 only added the signature — which is why blocks appear now where
+   nothing did before. Live re-measurement, driven through the real
+   `clanky` binary and a logging `ANTHROPIC_BASE_URL` proxy:
+
+   | model | request | readable text |
+   |---|---|---|
+   | `sonnet-4-5`, `haiku-4-5` | `enabled` | yes (default) |
+   | `sonnet-4-5`, `haiku-4-5` | `enabled` + `display:"omitted"` | no |
+   | `sonnet-5-5`, `haiku-5-5`, `opus-5-5` | `enabled` (+ any `display`) | **no** |
+   | `sonnet-5-5`, `haiku-5-5` | `adaptive` + `display:"summarized"` | yes |
+   | `sonnet-5-5` | `adaptive` (no `display`) | no |
+
+   On `5-5` under `enabled`, rounds reported
+   `output_tokens_details.thinking_tokens` ≈1100–1300 with an empty
+   thinking field — reasoning ran, the signature came back, no text. This
+   also corrects the spike note above ("only `adaptive` +
+   `display:"summarized"` produces text on `haiku-5-5`"): that was right,
+   but the spike did not record that `display` is *ignored* under
+   `enabled`, which is the part that made the behavior look like a
+   regression. `effort` is the dial in `adaptive` mode (`low`/`medium`
+   produced no text on `sonnet-5-5`; `high`/`xhigh`/`max` did), and
+   `adaptive` + `budget_tokens` is a 400 (`Extra inputs are not
+   permitted`), so the budget setting is inert once a `[sampling]
+   thinking` entry is set.
+
+   **No code change, per the invariants** — translating `enabled` into
+   `adaptive` would be the program overriding the user's mode, and the
+   budget→`enabled` mapping is what the milestone explicitly declined to
+   touch. The fix is documentation: README's Anthropic section now has a
+   "Thinking: what you actually see" table with the `[sampling]`
+   `adaptive` recipe, `settings.toml`'s `thinking` note points at it, and
+   the `ctrl+t` section says there is nothing to toggle when the model
+   returns no text. Making `adaptive` reachable from the `thinking`
+   setting itself is a real design decision (it needs a protocol field for
+   the mode), left open.
+
    **As built (session 1, 2026-11).** The payload is captured and carried
    end to end; nothing is sent back yet, so the wire is byte-identical to
    before and every existing golden passes unchanged.
