@@ -71,9 +71,15 @@ decisions made during implementation. Check them before redesigning something.
 - `crates/clanky-protocol` — provider plugin protocol: message types, client,
   in-process loopback transport, and `serve` (plugin-side wire rules live
   here once, shared by real binaries and tests)
+- `crates/clanky-provider-openai` — shared OpenAI-compatible machinery
+  (library, no binary): the `ureq` backend, SSE framer, `Retry-After`
+  parsing, `OpenAi*` stream types + accumulator, and the message/tool
+  serializers. Provider *policy* (URLs, catalogs, error envelopes, effort
+  ladders, reasoning passback) stays in each plugin.
 - `crates/clanky-provider-deepinfra` — DeepInfra provider plugin (OpenAI-compatible)
 - `crates/clanky-provider-litellm` — LiteLLM proxy provider plugin
-- `crates/clanky-provider-anthropic` — Anthropic provider plugin
+- `crates/clanky-provider-anthropic` — Anthropic provider plugin (uses the
+  shared SSE framer and `Retry-After` parser)
 - `crates/clanky-subagents` — parallel subagent launcher (`clanky-subagents`
   binary): runs N `clanky -pq` jobs in parallel, returns one JSON result
 - `examples/hello-world-provider/` — dependency-free Python provider plugin;

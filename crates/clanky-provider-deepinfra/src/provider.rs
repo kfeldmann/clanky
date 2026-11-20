@@ -2,9 +2,11 @@
 //! completions (streaming over SSE).
 
 use clanky_protocol::{
-    CancelFlag, Capabilities, ChatDone, ChatMessage, ChatRequest, ChunkPayload, Error, ErrorCode,
-    FinishReason, Handler, ModelInfo, PluginInfo, Thinking, Tool, Usage,
+    CancelFlag, Capabilities, ChatDone, ChatRequest, ChunkPayload, Error, ErrorCode, Handler,
+    ModelInfo, PluginInfo, Thinking, ThinkingBlock,
 };
+use clanky_provider_openai::stream::{OpenAiStreamChunk, StreamState};
+use clanky_provider_openai::wire::{openai_messages, openai_tools, reasoning_content};
 use serde_json::{Value, json};
 
 use crate::backend::{Backend, BackendError, truncate_body};
@@ -163,7 +165,10 @@ impl<B: Backend> DeepInfraProvider<B> {
         obj.insert("model".into(), json!(request.model));
         obj.insert(
             "messages".into(),
-            Value::Array(openai_messages(&request.messages)?),
+            Value::Array(openai_messages(
+                &request.messages,
+                &deepinfra_reasoning_passback,
+            )),
         );
         obj.insert("stream".into(), json!(true));
         obj.insert("stream_options".into(), json!({"include_usage": true}));
@@ -202,152 +207,25 @@ fn reasoning_effort(thinking: Thinking) -> Option<&'static str> {
     }
 }
 
-/// Serialize protocol chat messages into OpenAI-compatible JSON messages.
+/// DeepInfra's reasoning passback for an assistant message (M23): the
+/// concatenated block text is the payload here — DeepInfra counts it as
+/// prompt context (measured +≈400 tokens for a ~1800-char block), while
+/// `thinking_blocks`/`reasoning_details`/`thinking` are silently ignored
+/// (+0 tokens), so `reasoning_content` is sent and nothing else (session 2).
+/// A block with no text contributes nothing; signatures and redacted data
+/// have no wire meaning on this provider and are dropped.
 ///
-/// A tool result's inline images cannot ride in the `tool` message:
-/// DeepInfra's tool-message schema accepts only a plain string (or a
-/// text-only array) for `content` — an `image_url` part there is a 422
-/// ("messages.N.tool.content.str: Input should be a valid string",
-/// observed live against a vision model). The images instead ride in a
-/// *trailing `user` message* with `image_url` data-URI parts, emitted
-/// only when the tool result carries images (so every image-free request
-/// is byte-identical to the old shape) and deterministically ordered —
-/// directly after the `tool` message it belongs to — so replay
-/// reconstructs exactly what the model saw.
-fn openai_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, Error> {
-    let mut out = Vec::with_capacity(messages.len());
-    for m in messages {
-        match m {
-            ChatMessage::System { content } | ChatMessage::User { content } => {
-                out.push(json!({ "role": role_name(m), "content": content }));
-            }
-            ChatMessage::Tool {
-                tool_call_id,
-                content,
-                images,
-            } => {
-                // `role: "tool"` takes only a plain string `content`
-                // (see the function doc); the text is the result, the
-                // images (if any) follow in a synthetic user turn.
-                out.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": content,
-                }));
-                if let Some(images) = images.as_deref().filter(|imgs| !imgs.is_empty()) {
-                    out.push(image_parts_user_message(images));
-                }
-            }
-            ChatMessage::Assistant {
-                content,
-                tool_calls,
-                // The round's reasoning blocks (M23): the concatenated text
-                // is the payload here — DeepInfra counts it as prompt
-                // context (measured +≈400 tokens for a ~1800-char block),
-                // while `thinking_blocks`/`reasoning_details`/`thinking`
-                // are silently ignored (+0 tokens), so `reasoning_content`
-                // is sent and nothing else (session 2). A block with no
-                // text contributes nothing; signatures and redacted data
-                // have no wire meaning on this provider and are dropped.
-                thinking,
-            } => {
-                let mut msg = json!({ "role": "assistant" });
-                let obj = msg.as_object_mut().unwrap();
-                if !content.is_empty() {
-                    obj.insert("content".into(), json!(content));
-                }
-                let reasoning = reasoning_content(thinking.as_deref());
-                if !reasoning.is_empty() {
-                    obj.insert("reasoning_content".into(), json!(reasoning));
-                }
-                if let Some(calls) = tool_calls {
-                    obj.insert(
-                        "tool_calls".into(),
-                        Value::Array(
-                            calls
-                                .iter()
-                                .map(|c| {
-                                    json!({
-                                        "id": c.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": c.name,
-                                            // OpenAI carries arguments as a JSON *string*.
-                                            "arguments": c.arguments.to_string(),
-                                        }
-                                    })
-                                })
-                                .collect(),
-                        ),
-                    );
-                }
-                out.push(msg);
-            }
-        }
+/// A message whose blocks carry no text at all sends no field either —
+/// nothing to pass back must look exactly like nothing (an empty
+/// `reasoning_content` would be a forged field).
+fn deepinfra_reasoning_passback(
+    obj: &mut serde_json::Map<String, Value>,
+    blocks: &[ThinkingBlock],
+) {
+    let reasoning = reasoning_content(blocks);
+    if !reasoning.is_empty() {
+        obj.insert("reasoning_content".into(), json!(reasoning));
     }
-    Ok(out)
-}
-
-/// The `reasoning_content` an assistant message carries back to the
-/// provider: its reasoning blocks' concatenated text (M23 session 2).
-/// DeepInfra treats `reasoning` as an exact alias of this field and
-/// silently ignores `thinking_blocks`, `reasoning_details` and `thinking`
-/// (measured +0 prompt tokens) — so this field is sent and nothing else.
-/// An empty string when the message has no blocks or no text, so a
-/// blockless request stays byte-identical to the pre-M23 shape.
-fn reasoning_content(blocks: Option<&[clanky_protocol::ThinkingBlock]>) -> String {
-    blocks
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|block| block.text.as_deref())
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-/// The `user` message that carries a tool result's images: an array of
-/// bare `image_url` data-URI parts (no text — the result's text stays in
-/// the `tool` message; duplicating it would send it twice). `role:
-/// "user"` is the only role whose schema accepts `image_url` parts.
-fn image_parts_user_message(images: &[clanky_protocol::ImagePart]) -> Value {
-    json!({
-        "role": "user",
-        "content": images
-            .iter()
-            .map(|image| json!({
-                "type": "image_url",
-                "image_url": {
-                    "url": format!("data:{};base64,{}", image.media_type.as_str(), image.data_base64),
-                },
-            }))
-            .collect::<Vec<_>>(),
-    })
-}
-
-fn role_name(message: &ChatMessage) -> &'static str {
-    match message {
-        ChatMessage::System { .. } => "system",
-        ChatMessage::User { .. } => "user",
-        ChatMessage::Assistant { .. } => "assistant",
-        ChatMessage::Tool { .. } => "tool",
-    }
-}
-
-fn openai_tools(tools: &[Tool]) -> Value {
-    Value::Array(
-        tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                })
-            })
-            .collect(),
-    )
 }
 
 /// Map an HTTP-layer failure to a request-scoped protocol error. A
@@ -431,229 +309,11 @@ fn parse_models(body: &str) -> Result<Vec<ModelInfo>, Error> {
     Ok(models)
 }
 
-// --- OpenAI streaming chunk shapes (parsed leniently; DeepInfra is
-// --- OpenAI-compatible) ---
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct OpenAiStreamChunk {
-    #[serde(default)]
-    choices: Vec<OpenAiStreamChoice>,
-    #[serde(default)]
-    usage: Option<OpenAiUsage>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct OpenAiStreamChoice {
-    #[serde(default)]
-    delta: OpenAiDelta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct OpenAiDelta {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<OpenAiStreamToolCall>>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct OpenAiStreamToolCall {
-    #[serde(default)]
-    index: u32,
-    #[serde(default)]
-    id: Option<String>,
-    /// Lenient: some OpenAI-compatible backends emit index-only placeholder
-    /// deltas with no `function` object at all; treat that as an empty one.
-    #[serde(default)]
-    function: OpenAiFunction,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct OpenAiFunction {
-    #[serde(default)]
-    name: Option<String>,
-    /// OpenAI carries arguments as a JSON string; some backends send an
-    /// object. Both are accepted.
-    #[serde(default)]
-    arguments: Option<Value>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct OpenAiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
-}
-
-/// OpenAI-style cached-token breakdown inside `usage.prompt_tokens_details`.
-#[derive(Debug, Default, serde::Deserialize)]
-struct OpenAiPromptTokensDetails {
-    #[serde(default)]
-    cached_tokens: Option<u64>,
-}
-
-/// Accumulates one streamed completion and translates deltas into protocol
-/// chunks. A tool call's `id`/`name` arrive with the first delta for its
-/// index (OpenAI convention) and announce a `toolCallStart`; later deltas
-/// append argument fragments.
-#[derive(Debug, Default)]
-struct StreamState {
-    finish_reason: Option<FinishReason>,
-    usage: Option<Usage>,
-    calls: Vec<CallAccumulator>,
-}
-
-#[derive(Debug, Default)]
-struct CallAccumulator {
-    id: String,
-    name: String,
-    args: String,
-    started: bool,
-}
-
-impl StreamState {
-    fn ingest(&mut self, chunk: OpenAiStreamChunk, sink: &mut dyn FnMut(ChunkPayload)) {
-        if let Some(usage) = chunk.usage {
-            self.usage = Some(Usage {
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                cached_tokens: usage.prompt_tokens_details.and_then(|d| d.cached_tokens),
-            });
-        }
-        for choice in chunk.choices {
-            if let Some(reason) = choice.finish_reason {
-                self.finish_reason = Some(map_finish_reason(Some(&reason)));
-            }
-            let delta = choice.delta;
-            if let Some(text) = delta.reasoning_content.filter(|s| !s.is_empty()) {
-                sink(ChunkPayload::Thinking { text });
-            }
-            if let Some(text) = delta.content.filter(|s| !s.is_empty()) {
-                sink(ChunkPayload::Text { text });
-            }
-            for call in delta.tool_calls.unwrap_or_default() {
-                self.ingest_tool_call(call, sink);
-            }
-        }
-    }
-
-    fn ingest_tool_call(&mut self, call: OpenAiStreamToolCall, sink: &mut dyn FnMut(ChunkPayload)) {
-        // A malformed index (e.g. `"index": 4294967295`) must not allocate a
-        // huge accumulator buffer (~4 bytes per missing slot ⇒ OOM on a
-        // single junk chunk). Real tool-call indices are tiny; anything
-        // beyond this bound is a broken stream and the delta is dropped.
-        if call.index > MAX_TOOL_CALL_INDEX {
-            return;
-        }
-        while self.calls.len() <= call.index as usize {
-            self.calls.push(CallAccumulator::default());
-        }
-        let acc = &mut self.calls[call.index as usize];
-        // Args may arrive before the id/name: some backends lead with an
-        // index-only placeholder and put the first args fragment on the
-        // same delta as (or even before) the id. Buffer the fragment into
-        // the accumulator regardless of `started` so it is never lost.
-        let args_fragment = call
-            .function
-            .arguments
-            .and_then(args_string)
-            .filter(|s| !s.is_empty());
-        if let Some(fragment) = &args_fragment {
-            acc.args.push_str(fragment);
-        }
-        if !acc.started {
-            // The id/name may still be on later deltas (some backends lead
-            // with an index-only placeholder); wait until we have something
-            // to announce before emitting `toolCallStart`.
-            if let Some(id) = call.id.clone().filter(|id| !id.is_empty()) {
-                acc.id = id;
-            }
-            if let Some(name) = call.function.name.clone().filter(|n| !n.is_empty()) {
-                acc.name = name;
-            }
-            if acc.id.is_empty() && acc.name.is_empty() {
-                // Nothing to announce yet; buffered args stay in `acc.args`
-                // and are emitted once the call starts.
-                return;
-            }
-            if acc.id.is_empty() {
-                acc.id = format!("call_{}", call.index);
-            }
-            acc.started = true;
-            sink(ChunkPayload::ToolCallStart {
-                index: call.index,
-                id: acc.id.clone(),
-                name: acc.name.clone(),
-            });
-        } else if call
-            .id
-            .as_deref()
-            .is_some_and(|id| !id.is_empty() && id != acc.id)
-        {
-            // Defensive: a repeated id after the start is ignored — the id
-            // must stay stable for the client's `toolCallId` round trip.
-            // (Name-only updates after the start are also ignored.)
-        }
-        if let Some(fragment) = args_fragment {
-            sink(ChunkPayload::ToolCallArgs {
-                index: call.index,
-                args_chunk: fragment,
-            });
-        }
-    }
-
-    fn finish(self) -> ChatDone {
-        ChatDone {
-            finish_reason: self.finish_reason.unwrap_or(FinishReason::Stop),
-            usage: self.usage,
-        }
-    }
-
-    /// Terminal status for a cancelled turn: whatever usage was reported
-    /// before the cancel, and `cancelled` as the finish reason (spec §7).
-    fn finish_cancelled(self) -> ChatDone {
-        ChatDone {
-            finish_reason: FinishReason::Cancelled,
-            usage: self.usage,
-        }
-    }
-}
-
-fn args_string(args: Value) -> Option<String> {
-    match args {
-        Value::String(s) => Some(s),
-        other => Some(other.to_string()),
-    }
-}
-
-/// Largest tool-call index we accept in a stream delta. Real backends emit
-/// single-digit indices; anything larger is a malformed chunk, and honoring
-/// it would allocate an accumulator per skipped slot (one `"index":
-/// 4294967295` chunk would otherwise allocate ~4 GB of accumulators).
-const MAX_TOOL_CALL_INDEX: u32 = 1024;
-
-fn map_finish_reason(reason: Option<&str>) -> FinishReason {
-    match reason {
-        Some("tool_calls" | "function_call") => FinishReason::ToolCalls,
-        Some("length" | "max_tokens") => FinishReason::Length,
-        Some("content_filter") => FinishReason::ContentFilter,
-        // Unknown reasons are treated as a plain stop; `cancelled` is only
-        // ever produced by Clanky-side cancellation, never the backend.
-        _ => FinishReason::Stop,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::Backend;
-    use clanky_protocol::Sampling;
+    use clanky_protocol::{ChatMessage, FinishReason, Sampling, Tool, Usage};
     use std::cell::RefCell;
 
     /// Records URLs/bodies and streams canned SSE payloads.

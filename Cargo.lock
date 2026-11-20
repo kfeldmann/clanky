@@ -135,6 +135,7 @@ name = "clanky-provider-anthropic"
 version = "0.1.0"
 dependencies = [
  "clanky-protocol",
+ "clanky-provider-openai",
  "dirs",
  "getrandom",
  "serde",
@@ -148,14 +149,25 @@ name = "clanky-provider-deepinfra"
 version = "0.1.0"
 dependencies = [
  "clanky-protocol",
+ "clanky-provider-openai",
  "serde",
  "serde_json",
- "thiserror",
  "ureq",
 ]
 
 [[package]]
 name = "clanky-provider-litellm"
+version = "0.1.0"
+dependencies = [
+ "clanky-protocol",
+ "clanky-provider-openai",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
+name = "clanky-provider-openai"
 version = "0.1.0"
 dependencies = [
  "clanky-protocol",

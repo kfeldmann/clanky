@@ -19,8 +19,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::handler::PluginInfo;
 use crate::handler::{CancelFlag, ChatDone, ChatRequest, Handler};
-use crate::messages::{ChunkPayload, Error, ErrorCode, Message, PROTOCOL_VERSION};
+use crate::messages::{
+    Capabilities, ChunkPayload, Error, ErrorCode, Message, ModelInfo, PROTOCOL_VERSION,
+};
 
 /// Handle a non-streaming request (`hello`, `listModels`) on the plugin side,
 /// returning the response message(s) to write. `Ok(None)` means the caller
@@ -361,11 +364,104 @@ pub fn serve_stdio(handler: &mut dyn Handler) -> Result<(), Error> {
     serve(handler, reader, &mut writer)
 }
 
+/// Serve the process's stdin/stdout, substituting an [`Unavailable`] handler
+/// when the provider could not be built.
+///
+/// This is the plugin binary's whole `main` body for a provider that is
+/// constructed from the environment: a missing API key must not leave Clanky
+/// with a dead process (it would only see "plugin exited"), so the plugin
+/// still handshakes — with its real name, capabilities and default model —
+/// and reports the stored error for every request instead. The failure then
+/// reads as a normal request-scoped `auth` error on the first turn
+/// ("no API key: set DEEPINFRA_API_KEY").
+///
+/// `provider` is the construction result; `default_model` is advertised at
+/// handshake so Clanky resolves the intended model before the first request
+/// fails. `name` is the provider name reported at handshake.
+pub fn serve_unavailable(
+    name: &str,
+    default_model: Option<&str>,
+    provider: Result<Box<dyn Handler>, Error>,
+) -> Result<(), Error> {
+    let mut handler: Box<dyn Handler> = match provider {
+        Ok(handler) => handler,
+        Err(error) => Box::new(Unavailable {
+            name: name.to_string(),
+            default_model: default_model.map(str::to_string),
+            error,
+        }),
+    };
+    serve_stdio(&mut *handler)
+}
+
+/// A provider that could not be built (usually a missing API key): it
+/// handshakes like the real provider and reports the stored error for every
+/// request. This keeps the missing-key failure readable and request-scoped
+/// instead of a dead plugin process.
+///
+/// Built by [`serve_unavailable`]; public so a plugin with extra subcommands
+/// can still serve one directly.
+pub struct Unavailable {
+    name: String,
+    default_model: Option<String>,
+    error: Error,
+}
+
+impl Handler for Unavailable {
+    fn info(&self) -> PluginInfo {
+        PluginInfo {
+            name: self.name.clone(),
+            capabilities: Capabilities {
+                list_models: true,
+                thinking: true,
+                tools: true,
+            },
+            default_model: self.default_model.clone(),
+        }
+    }
+
+    fn list_models(&mut self) -> Result<Vec<ModelInfo>, Error> {
+        Err(clone_error(&self.error))
+    }
+
+    fn chat(
+        &mut self,
+        _request: &ChatRequest,
+        _sink: &mut dyn FnMut(ChunkPayload),
+    ) -> Result<ChatDone, Error> {
+        Err(clone_error(&self.error))
+    }
+}
+
+/// `Error` is not `Clone`; reissue a provider error. A non-provider error
+/// becomes an `internal` provider error carrying its `Display` text, so a
+/// construction failure always reaches the client as a request-scoped error.
+fn clone_error(err: &Error) -> Error {
+    match err {
+        Error::Provider {
+            code,
+            message,
+            retryable,
+            retry_after_ms,
+        } => Error::Provider {
+            code: *code,
+            message: message.clone(),
+            retryable: *retryable,
+            retry_after_ms: *retry_after_ms,
+        },
+        other => Error::Provider {
+            code: ErrorCode::Internal,
+            message: other.to_string(),
+            retryable: false,
+            retry_after_ms: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::PluginInfo;
-    use crate::messages::{Capabilities, FinishReason, ModelInfo, ThinkingBlock};
+    use crate::messages::{FinishReason, ThinkingBlock};
     use serde_json::json;
     use std::io::Cursor;
     use std::sync::Mutex;
@@ -955,6 +1051,109 @@ mod tests {
             Some(false),
             "a cancel for a finished request must not cancel the next chat"
         );
+    }
+
+    /// Drive an `Unavailable` handler through the same scripted wire path.
+    fn drive_unavailable(error: Error, input: &str) -> Vec<Message> {
+        let mut handler = Unavailable {
+            name: "unavailable-test".into(),
+            default_model: Some("model/x".into()),
+            error,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        serve(&mut handler, Cursor::new(input.to_string()), &mut out).unwrap();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                crate::messages::parse_message(line)
+                    .unwrap()
+                    .expect("known")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unavailable_provider_still_handshakes_and_reports_its_error_per_request() {
+        // A missing API key must not leave Clanky with a dead process: the
+        // handshake carries the real identity, and each request fails with
+        // the stored error instead of the process vanishing.
+        let error = Error::Provider {
+            code: ErrorCode::Auth,
+            message: "no API key: set TEST_API_KEY".into(),
+            retryable: false,
+            retry_after_ms: None,
+        };
+        let out = drive_unavailable(
+            error,
+            r#"{"type":"hello","protocolVersion":2}
+{"type":"listModels","id":1}
+{"type":"chat","id":2,"model":"model/x","messages":[{"role":"user","content":"hi"}]}
+"#,
+        );
+        match &out[0] {
+            Message::Hello {
+                name,
+                capabilities,
+                default_model,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("unavailable-test"));
+                assert_eq!(
+                    capabilities,
+                    &Some(Capabilities {
+                        list_models: true,
+                        thinking: true,
+                        tools: true,
+                    })
+                );
+                assert_eq!(default_model.as_deref(), Some("model/x"));
+            }
+            other => panic!("expected hello, got {other:?}"),
+        }
+        for message in &out[1..] {
+            match message {
+                Message::Error {
+                    code,
+                    message,
+                    retryable,
+                    ..
+                } => {
+                    assert_eq!(*code, ErrorCode::Auth);
+                    assert_eq!(message, "no API key: set TEST_API_KEY");
+                    assert!(!retryable);
+                }
+                other => panic!("expected a request-scoped error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unavailable_provider_wraps_a_non_provider_error_as_internal() {
+        let out = drive_unavailable(
+            Error::Protocol("construction blew up".into()),
+            r#"{"type":"listModels","id":1}"#,
+        );
+        match &out[0] {
+            Message::Error { code, message, .. } => {
+                assert_eq!(*code, ErrorCode::Internal);
+                assert!(
+                    message.contains("construction blew up"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_unavailable_passes_a_working_provider_through() {
+        // `serve_unavailable` is the plugin binary's whole body; a provider
+        // that built fine must be served as-is. stdin here is empty, so the
+        // call returns as soon as EOF arrives.
+        let provider: Result<Box<dyn Handler>, Error> = Ok(Box::new(Fake::new()));
+        serve_unavailable("fake", Some("fake/default"), provider)
+            .expect("serving an empty stdin ends cleanly");
     }
 
     #[test]

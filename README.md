@@ -626,6 +626,14 @@ cargo install \
   clanky-provider-anthropic
 ```
 
+The OpenAI-compatible plugins (DeepInfra, LiteLLM) are built on a shared
+library crate, `clanky-provider-openai`: the `ureq` backend, the SSE framer,
+`Retry-After` parsing, the OpenAI stream-chunk types and accumulator, and the
+message/tool serializers live there once. The Anthropic plugin uses the same
+SSE framer and `Retry-After` parser. Each plugin keeps only what is its own —
+URL joining, catalog parsing and hints, the error-envelope unwrapping, the
+thinking→effort ladder, and the documented reasoning passback shape.
+
 ### LiteLLM
 
 The LiteLLM plugin talks to a [LiteLLM proxy](https://docs.litellm.ai/)'s

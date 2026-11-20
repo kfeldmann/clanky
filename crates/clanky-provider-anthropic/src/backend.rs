@@ -16,8 +16,13 @@
 //!
 //!   No Claude Code identity headers on the key path: this is the standard
 //!   third-party surface, not the OAuth one.
+//!
+//! Only the Anthropic-specific parts live here: the `ureq` agent and its
+//! auth headers, the one-shot Messages calls, and the streaming request. The
+//! SSE framer, `Retry-After` parsing and `truncate_body` are re-exported from
+//! the shared OpenAI-compatible crate — the framing rules are the same and
+//! the old local date parser differed only in signedness.
 
-use std::io::BufRead;
 use std::time::Duration;
 
 use crate::auth::Credentials;
@@ -44,116 +49,26 @@ impl AuthMode {
     }
 }
 
-/// A failure at the HTTP layer: an HTTP status (when the server answered)
-/// or a connection/client error.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendError {
-    pub status: Option<u16>,
-    pub message: String,
-    /// Server-provided retry hint in milliseconds (from a `Retry-After`
-    /// header, delay-seconds or HTTP-date form). `None` when absent or
-    /// unparseable; only meaningful on rate-limit responses.
-    pub retry_after_ms: Option<u64>,
-}
+pub use clanky_provider_openai::backend::{BackendError, now_secs, sse_payloads, truncate_body};
 
 /// Attach a retry hint parsed from a `Retry-After` header value
 /// (delay-seconds or HTTP-date; the date form is measured against
-/// `now_secs`, the current UNIX time).
+/// `now_secs`, the current UNIX time). The parser is the shared
+/// OpenAI-compatible one: it returns milliseconds, clamps negative and
+/// already-past values to 0, and treats anything unparseable as "no hint".
 pub fn backend_error_with_retry_after(
     mut err: BackendError,
     value: Option<&str>,
     now_secs: u64,
 ) -> BackendError {
-    err.retry_after_ms = value
-        .and_then(|v| parse_retry_after(v, now_secs))
-        .map(|secs| secs.max(0) as u64 * 1000);
+    err.retry_after_ms = value.and_then(|v| parse_retry_after(v, now_secs));
     err
 }
 
-/// Parse a `Retry-After` header into delay seconds. Accepts the
-/// delay-seconds form (negative clamps to 0) and the HTTP-date form
-/// (RFC 9110 IMF-fixdate, measured against `now_secs`); anything else is
-/// `None`.
-fn parse_retry_after(value: &str, now_secs: u64) -> Option<i64> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let secs = value.parse::<i64>().ok();
-    if let Some(secs) = secs {
-        return Some(secs.max(0));
-    }
-    parse_http_date(value)?.checked_sub(i64::try_from(now_secs).unwrap_or(i64::MAX))
-}
-
-/// Parse an IMF-fixdate HTTP date (`Sun, 06 Nov 1994 08:49:37 GMT`) to
-/// UNIX seconds via the days-from-civil algorithm (Howard Hinnant), which
-/// is exact for the proleptic Gregorian calendar. The weekday name and the
-/// `GMT` zone suffix are validated leniently (any 3-letter weekday, any
-/// `GMT`/`UT`+offset spelling of zero). Returns `None` on anything else.
-fn parse_http_date(value: &str) -> Option<i64> {
-    const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    ];
-    let (weekday, rest) = value.split_once(',')?;
-    if weekday.len() != 3 || !weekday.chars().all(|c| c.is_ascii_alphabetic()) {
-        return None;
-    }
-    let mut parts = rest.trim_start().split_ascii_whitespace();
-    let day: i64 = parts.next()?.parse().ok()?;
-    let month_str = parts.next()?;
-    let month = MONTHS
-        .iter()
-        .position(|m| month_str.eq_ignore_ascii_case(m))? as i64;
-    let year: i64 = parts.next()?.parse().ok()?;
-    let time = parts.next()?;
-    let zone = parts.next()?;
-    if !zone.eq_ignore_ascii_case("gmt") && !zone.eq_ignore_ascii_case("ut") {
-        return None;
-    }
-    let (hour, minute, second) = {
-        let mut t = time.split(':');
-        let h: i64 = t.next()?.parse().ok()?;
-        let m: i64 = t.next()?.parse().ok()?;
-        let s: i64 = t.next()?.parse().ok()?;
-        (h, m, s)
-    };
-    // days_from_civil: counts days since 1970-01-01 for a civil date.
-    // `month` is a 0-based index; Hinnant's formula wants the 1-based
-    // month folded into March-based years (Jan/Feb roll into the
-    // previous year as months 10/11).
-    let (y, m) = (
-        if month <= 1 { year - 1 } else { year },
-        if month <= 1 { month + 10 } else { month - 2 },
-    );
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400; // [0, 399]
-    let doy = (153 * m + 2) / 5 + day - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
-}
-
-/// Cap error bodies so a chatty backend cannot flood the UI.
-pub fn truncate_body(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
-    } else {
-        let mut out: String = text.chars().take(max_chars).collect();
-        out.push('…');
-        out
-    }
-}
-
-impl BackendError {
-    pub fn new(status: Option<u16>, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-            retry_after_ms: None,
-        }
-    }
-}
+/// Parse a `Retry-After` header into milliseconds. Re-exported from the
+/// shared crate so the Anthropic plugin and the OpenAI-compatible ones
+/// cannot drift apart (the old local copy differed only in signedness).
+pub use clanky_provider_openai::backend::parse_retry_after;
 
 /// Talks to the Anthropic API. Auth headers are applied here because the
 /// token never leaves the plugin; the provider passes the credential
@@ -195,10 +110,9 @@ impl UreqBackend {
     }
 
     fn call(&self, req: ureq::Request, body: Option<&str>) -> Result<String, BackendError> {
-        let prepared = req;
         let result = match body {
-            Some(body) => prepared.send_string(body),
-            None => prepared.call(),
+            Some(body) => req.send_string(body),
+            None => req.call(),
         };
         match result {
             Ok(resp) => resp
@@ -222,16 +136,6 @@ impl Default for UreqBackend {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Current UNIX time in seconds; used to resolve HTTP-date `Retry-After`
-/// values. A missing clock falls back to 0, which turns date-form hints
-/// into large delays rather than errors.
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 impl Backend for UreqBackend {
@@ -274,84 +178,6 @@ impl Backend for UreqBackend {
     }
 }
 
-/// Frame a byte stream of Server-Sent-Events into payloads: one item per
-/// event, the joined `data:` lines with the `data:` prefix and a single
-/// leading space stripped. Lines with no `data:` field (comments, `event:`,
-/// `id:`) are ignored — Anthropic's stream emits `event: content_block_delta`
-/// beside each `data:` line. EOF flushes a trailing event that never saw a
-/// blank line; a read error is surfaced (after any buffered event).
-pub fn sse_payloads(
-    reader: impl BufRead + 'static,
-) -> impl Iterator<Item = Result<String, BackendError>> {
-    SseLines {
-        reader,
-        data: Vec::new(),
-        finished: false,
-        pending_error: None,
-    }
-}
-
-struct SseLines<R: BufRead> {
-    reader: R,
-    data: Vec<String>,
-    finished: bool,
-    pending_error: Option<String>,
-}
-
-impl<R: BufRead> Iterator for SseLines<R> {
-    type Item = Result<String, BackendError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.finished {
-                return None;
-            }
-            if let Some(message) = self.pending_error.take() {
-                return Some(Err(BackendError::new(None, message)));
-            }
-            let mut line = String::new();
-            match self.reader.read_line(&mut line) {
-                Ok(0) => {
-                    // EOF: flush a trailing event that never saw a blank line.
-                    self.finished = true;
-                    if self.data.is_empty() {
-                        return None;
-                    }
-                    let payload = std::mem::take(&mut self.data).join("\n");
-                    return Some(Ok(payload));
-                }
-                Ok(_) => {
-                    let line = line.trim_end_matches(['\n', '\r']);
-                    if line.is_empty() {
-                        // End of event: yield accumulated data, if any.
-                        if !self.data.is_empty() {
-                            let payload = std::mem::take(&mut self.data).join("\n");
-                            return Some(Ok(payload));
-                        }
-                        continue;
-                    }
-                    if let Some(rest) = line.strip_prefix("data:") {
-                        self.data
-                            .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
-                    }
-                    // Other fields (`event:`, `id:`, comments) are ignored.
-                }
-                Err(source) => {
-                    // Surface any buffered event first; the error follows on
-                    // the next call (self.finished bounds it to one).
-                    self.finished = true;
-                    if self.data.is_empty() {
-                        return Some(Err(BackendError::new(None, source.to_string())));
-                    }
-                    let payload = std::mem::take(&mut self.data).join("\n");
-                    self.pending_error = Some(source.to_string());
-                    return Some(Ok(payload));
-                }
-            }
-        }
-    }
-}
-
 /// Attach the mode's auth headers. The bearer path uses the exact strings
 /// the spike captured (Claude Code identity required by the OAuth surface);
 /// the key path uses the documented plain headers — no Claude Code
@@ -371,8 +197,10 @@ fn apply_auth(req: ureq::Request, auth: &AuthMode) -> ureq::Request {
     }
 }
 
-/// `parse_retry_after` covers both header forms (the same coverage the
-/// DeepInfra/LiteLLM backends pin).
+/// The shared `parse_retry_after` covers both header forms (delay-seconds
+/// and HTTP-date). These pin the Anthropic plugin's behavior through its own
+/// `backend_error_with_retry_after` wrapper: negative and already-past
+/// values clamp to 0, and an absent or unparseable header leaves no hint.
 #[cfg(test)]
 mod retry_after_tests {
     use super::*;
@@ -465,10 +293,12 @@ mod auth_headers_tests {
     }
 }
 
+/// The SSE framer is the shared one; these pin the shapes Anthropic's
+/// stream actually uses (`event:` lines interleaved with `data:` ones).
 #[cfg(test)]
 mod sse_tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{BufRead, Cursor};
 
     fn payloads(text: &str) -> Vec<Result<String, BackendError>> {
         sse_payloads(Cursor::new(text.to_string())).collect()

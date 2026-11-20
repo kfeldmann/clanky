@@ -36,6 +36,6 @@ pub use messages::{
     Tool, ToolCall, Usage, parse_message,
 };
 pub use process::{CANCEL_TIMEOUT, CancelHandle, ProcessOptions, ProcessTransport};
-pub use serve::{serve, serve_stdio};
+pub use serve::{Unavailable, serve, serve_stdio, serve_unavailable};
 pub use stream::StreamAssembler;
 pub use transport::{LoopbackTransport, Transport};

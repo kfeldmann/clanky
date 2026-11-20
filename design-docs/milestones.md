@@ -2789,7 +2789,7 @@ the OpenAPI spec (`openapi.yaml`), and a live `GET /api/v1/models` dump
 
 ### Steps
 
-#### ☐ M24a — Extract `clanky-provider-openai` (refactor only, no new behavior)
+#### ✔ M24a — Extract `clanky-provider-openai` (refactor only, no new behavior)
 - New workspace member `crates/clanky-provider-openai`, a library (no
   binary): `backend` (the `ureq` agent, `Backend`/`BackendError`, SSE
   framer, `Retry-After` parsing in both forms, `truncate_body`) and
@@ -2814,6 +2814,49 @@ the OpenAPI spec (`openapi.yaml`), and a live `GET /api/v1/models` dump
 - Done when: three plugins build against the shared crate, all workspace
   tests and `tests/golden/` pass with **no fixture or golden edits**, and
   the diff of the moved code is byte-identical modulo imports.
+
+  **As built (M24a).** `crates/clanky-provider-openai` exists as a library
+  with exactly the three planned modules: `backend` (`Backend`,
+  `BackendError`, `UreqBackend`, `sse_payloads`, `parse_retry_after` /
+  `parse_http_date`, `now_secs`, `truncate_body`), `stream` (`OpenAi*` chunk
+  types, `StreamState`, `CallAccumulator`, `args_string`,
+  `MAX_TOOL_CALL_INDEX`, `map_finish_reason`) and `wire`
+  (`openai_messages`, `openai_tools`, `role_name`, `reasoning_content`,
+  `image_parts_user_message`). The moved bodies are unchanged; only
+  visibility (`pub`) and the doc comments that named a single provider were
+  rewritten. The moved mechanism's own tests moved into the crate
+  (`backend::tests` verbatim, plus `stream`/`wire` tests covering the
+  accumulator rules and the passback callback); the plugins' own tests —
+  DeepInfra 26, LiteLLM 30 — are the provider-specific ones and were not
+  edited. The new crate starts at 19 tests; no fixture or golden changed.
+
+  Two small decisions the plan left open, both settled toward "shared":
+  - **`Backend::get_status` is on the shared trait**, with a default that
+    assumes a `200` from `get`. LiteLLM's `/model/info` degradation needs
+    it; DeepInfra's mock backend doesn't implement it and still compiles.
+    The shared `UreqBackend` implements it once, so `get` is defined in
+    terms of it rather than the reverse (same requests, same errors).
+  - **The reasoning passback is a callback** (`openai_messages` takes a
+    `&dyn Fn(&mut Map, &[ThinkingBlock])`). That is what lets DeepInfra
+    keep "send `reasoning_content` and nothing else" and LiteLLM keep
+    "`reasoning_content` *and* `thinking_blocks`" without either plugin
+    reimplementing the message loop — the shared crate owns the mechanism
+    and each plugin owns its policy, which was decision 1's whole point.
+
+  The Anthropic plugin re-exports the shared `sse_payloads`,
+  `parse_retry_after`, `now_secs` and `truncate_body`; its `Retry-After`
+  wrapper now delegates to the unsigned shared parser. Behavior is
+  preserved: negative and already-past dates still clamp to 0 (the shared
+  parser saturates before the ×1000, the old one clamped after — same
+  values), and its own three `retry_after_tests` and four `sse_tests`
+  still pass unmodified. Its 81 tests are untouched.
+
+  `main.rs`'s `Unavailable`/`clone_error` glue is now
+  `clanky_protocol::serve_unavailable(name, default_model, provider)` (plus
+  the public `clanky_protocol::Unavailable` for a plugin that needs to serve
+  one directly). Both OpenAI-compatible plugin binaries are three lines of
+  glue over it; the protocol crate gained three tests for it (handshake
+  identity, per-request error, non-provider error → `internal`).
 
 #### ☐ M24b — Capture, then the adapter
 - Capture first (the LiteLLM M10 pattern), into
