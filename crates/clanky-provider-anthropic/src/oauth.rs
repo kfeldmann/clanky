@@ -183,12 +183,19 @@ pub(crate) mod cache_test_hooks {
     // response instead of the network, so `provider::tests` can exercise
     // the credential cache without an HTTP round trip. Production code is
     // untouched.
+    //
+    // Thread-local, not a global: `cargo test` runs tests in parallel and
+    // several tests arm a *different* canned response. A shared slot let one
+    // test's `disarm` (or its response) land in another's turn, which made
+    // the cache tests flaky in either direction. Each test gets its own.
 
-    use std::sync::Mutex;
+    use std::cell::RefCell;
 
-    /// The canned response while armed: `Ok(body)` on success,
-    /// `Err((status, body))` on an HTTP error status.
-    pub(crate) static CANNED: Mutex<Option<Result<String, (u16, String)>>> = Mutex::new(None);
+    thread_local! {
+        /// The canned response while armed: `Ok(body)` on success,
+        /// `Err((status, body))` on an HTTP error status.
+        static CANNED: RefCell<Option<Result<String, (u16, String)>>> = const { RefCell::new(None) };
+    }
 
     /// Begin serving `canned` from refresh POSTs; an `Err` status serves
     /// the canned `invalid_grant` error body. Subsequent tests must reset
@@ -200,20 +207,24 @@ pub(crate) mod cache_test_hooks {
                 r#"{"error":"invalid_grant","error_description":"test canned"}"#.to_string(),
             )
         });
-        *CANNED.lock().unwrap() = Some(canned);
+        CANNED.with(|slot| *slot.borrow_mut() = Some(canned));
     }
 
     /// Tear the hooks down: every later refresh POST fails loudly rather
     /// than silently hitting the network from a test.
     pub fn disarm() {
-        *CANNED.lock().unwrap() = None;
+        CANNED.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// The armed response for the calling test, if any.
+    pub(crate) fn armed() -> Option<Result<String, (u16, String)>> {
+        CANNED.with(|slot| slot.borrow().clone())
     }
 }
 
 #[cfg(test)]
 fn post_token_request(_body: &str) -> Result<String, OAuthError> {
-    let canned = cache_test_hooks::CANNED.lock().unwrap().clone();
-    match canned {
+    match cache_test_hooks::armed() {
         Some(Ok(body)) => Ok(body),
         Some(Err((status, body))) => Err(OAuthError::Http { status, body }),
         // Not armed: refuse to hit the network from a test.

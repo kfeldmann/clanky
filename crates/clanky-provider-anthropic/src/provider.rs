@@ -9,9 +9,16 @@
 //!   flag wins over settings (user's choice, not the program's).
 //! - **OAuth** otherwise: credentials come from the on-disk store
 //!   (`~/.clanky/providers/anthropic/credentials.json`, written by the
-//!   `login` subcommand) and are refreshed automatically before expiry. A
-//!   failed refresh surfaces as an actionable `auth` error — the refresh
-//!   token is finite, so "login expired" will be the most common failure.
+//!   `login` subcommand) and are refreshed automatically before expiry —
+//!   including mid-session: an access token lives ~8 h, so a long-running
+//!   session drops an expired in-process token and refreshes from the store
+//!   rather than reusing the one it started with. A 401 from the API is
+//!   also authoritative (a token can be revoked or expire server-side
+//!   before our local `expires_at`): the rejected token is dropped and
+//!   replaced by a re-`login`'d store token or a refresh, and the request
+//!   retried once. A failed refresh surfaces as an actionable `auth` error
+//!   — the refresh token is finite, so "login expired" will be the most
+//!   common failure.
 
 use std::cell::RefCell;
 
@@ -80,8 +87,10 @@ pub struct AnthropicProvider<B: crate::backend::Backend> {
     /// `session_credentials` instead, so the disk stays authoritative.
     credentials: RefCell<Option<Result<Credentials, Error>>>,
     /// Live credentials obtained this process (a fresh load or a
-    /// successful in-place refresh); checked before the disk. Always
-    /// unexpired — every past-expiry reload goes back to the disk.
+    /// successful in-place refresh); checked before the disk. Used only
+    /// while unexpired: past expiry they are dropped and re-resolved (see
+    /// `current_credentials`), so a long-running session keeps refreshing
+    /// instead of pinning the token it started with.
     session_credentials: RefCell<Option<Credentials>>,
     /// Test-only introspection (set by `provider::tests`): the refresh
     /// tokens `oauth::refresh` was called with, in order.
@@ -174,6 +183,12 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
     /// (not re-attempted per request) until the disk store changes or a
     /// key is set — see `current_credentials`.
     fn current_auth(&self) -> Result<AuthMode, Error> {
+        self.auth_after(None)
+    }
+
+    /// Resolve request auth, treating `rejected` as a token the server has
+    /// already refused (see [`Self::current_credentials`]).
+    fn auth_after(&self, rejected: Option<&str>) -> Result<AuthMode, Error> {
         // The key wins: an explicitly set env var is the user's choice.
         if let Some(key) = (self.key_loader)() {
             // The key's arrival resets any cached "no usable credentials"
@@ -182,19 +197,36 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
             *self.credentials.borrow_mut() = None;
             return Ok(AuthMode::ApiKey(key));
         }
-        self.current_credentials().map(AuthMode::Bearer)
+        self.current_credentials(rejected).map(AuthMode::Bearer)
     }
 
-    /// Current OAuth credentials: the in-process ones if live, else a
-    /// (re)load from disk — refreshing past-expiry tokens in place. A
+    /// Current OAuth credentials: the in-process ones while still live, else
+    /// a (re)load from disk — refreshing past-expiry tokens in place. A
     /// failed load is cached until the disk store changes (a `login`
     /// while Clanky runs) or a key is set — see `current_auth`.
-    fn current_credentials(&self) -> Result<Credentials, Error> {
+    ///
+    /// `rejected` is an access token the API has just refused with 401.
+    /// The server is the authority on validity (a token can be revoked, or
+    /// expire server-side before our local `expires_at` says so), so a
+    /// rejected token is never handed back — even if the clock says it is
+    /// live. It is dropped and resolution continues, which is what makes a
+    /// `login` run while Clanky is up take effect, and what lets a revoked
+    /// token be replaced by a refresh.
+    fn current_credentials(&self, rejected: Option<&str>) -> Result<Credentials, Error> {
+        let is_rejected = |creds: &Credentials| rejected.is_some_and(|t| t == creds.access_token);
         // In-process credentials first: they may be fresher than the disk
-        // (a token refreshed in this process, persisted best-effort). They
-        // are always live — every past-expiry refresh reloads from disk.
-        if let Some(creds) = self.session_credentials.borrow().as_ref() {
-            return Ok(creds.clone());
+        // (a token refreshed in this process, persisted best-effort). An
+        // access token lives ~8 h, so a long session outlives the token it
+        // started with: an expired or rejected entry is dropped here, not
+        // returned, and resolution falls through to the disk (which
+        // refreshes).
+        let cached = self.session_credentials.borrow_mut().take();
+        if let Some(creds) = cached
+            && !creds.expired()
+            && !is_rejected(&creds)
+        {
+            *self.session_credentials.borrow_mut() = Some(creds.clone());
+            return Ok(creds);
         }
         // A cached failure means "the load ran and found no usable
         // credentials" — the per-request cost (one token-endpoint POST) is
@@ -212,22 +244,19 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
         if let Some(err) = cached_err {
             if let Some(creds) = (self.loader)()
                 && !creds.expired()
+                && !is_rejected(&creds)
             {
-                *self.credentials.borrow_mut() = None;
-                *self.session_credentials.borrow_mut() = Some(creds.clone());
+                self.remember(creds.clone());
                 return Ok(creds);
             }
             return Err(err);
         }
         // Otherwise (re)load: `login` may have written credentials after
-        // this process started, or the cached token has since expired.
-        match self.load_and_refresh() {
+        // this process started, the cached token has since expired, or the
+        // server rejected it.
+        match self.load_and_refresh(rejected) {
             Ok(creds) => {
-                // Live credentials live in `session_credentials` until they
-                // expire; the next (past-expiry) request reloads from disk
-                // and refreshes there, keeping the disk authoritative.
-                *self.credentials.borrow_mut() = None;
-                *self.session_credentials.borrow_mut() = Some(creds.clone());
+                self.remember(creds.clone());
                 Ok(creds)
             }
             Err(err) => {
@@ -237,11 +266,72 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
         }
     }
 
+    /// Make `creds` the in-process credentials, clearing any cached load
+    /// failure (they are now usable, so the failure is stale).
+    fn remember(&self, creds: Credentials) {
+        *self.credentials.borrow_mut() = None;
+        *self.session_credentials.borrow_mut() = Some(creds);
+    }
+
+    /// Run one backend request, recovering once if the API rejects the
+    /// OAuth token with 401. Auth is resolved per attempt; a rejected token
+    /// is reported back to resolution (see [`Self::current_credentials`])
+    /// so a re-`login`'d or refreshed token replaces it, and the request is
+    /// retried exactly once. The API-key path never retries: a bad key is
+    /// not something a re-resolution can fix (invariant: the user's key is
+    /// authoritative; surface the server's error).
+    ///
+    /// Retrying once is safe and cheap here: a 401 means the request was
+    /// rejected before any generation, so nothing was billed or streamed.
+    fn with_auth<T>(
+        &self,
+        context: &str,
+        call: impl FnMut(&AuthMode) -> Result<T, crate::backend::BackendError>,
+    ) -> Result<T, Error> {
+        let auth = self.current_auth()?;
+        self.with_auth_mode(&auth, context, call)
+    }
+
+    /// [`Self::with_auth`] over an already-resolved auth mode. Callers that
+    /// build a request body from the auth (the chat paths derive the Claude
+    /// Code identity from it) resolve once and pass the result here, so the
+    /// body and the wire request can never come from different credentials.
+    ///
+    /// A retry is only taken on the bearer path: the body was built for the
+    /// bearer identity, so switching to a key that appeared mid-session
+    /// (or retrying a rejected key) would put the wrong identity on the
+    /// wire. In that case the original 401 is reported instead.
+    fn with_auth_mode<T>(
+        &self,
+        auth: &AuthMode,
+        context: &str,
+        mut call: impl FnMut(&AuthMode) -> Result<T, crate::backend::BackendError>,
+    ) -> Result<T, Error> {
+        match call(auth) {
+            Err(err) if err.status == Some(401) => {
+                let Some(rejected) = auth.bearer_token() else {
+                    // A rejected API key: report it, do not re-resolve.
+                    return Err(map_backend_error(err, context));
+                };
+                let retry = self.auth_after(Some(rejected))?;
+                if retry.bearer_token().is_none() {
+                    // A key appeared mid-session; the body carries the bearer
+                    // identity, so it cannot be sent on the key path.
+                    return Err(map_backend_error(err, context));
+                }
+                call(&retry).map_err(|e| map_backend_error(e, context))
+            }
+            other => other.map_err(|e| map_backend_error(e, context)),
+        }
+    }
+
     /// Load credentials via the injected loader; if they exist but are
-    /// expired, refresh them first (persisting the rotated refresh token).
-    fn load_and_refresh(&self) -> Result<Credentials, Error> {
+    /// expired (or are the token the server just `rejected`), refresh them
+    /// first (persisting the rotated refresh token).
+    fn load_and_refresh(&self, rejected: Option<&str>) -> Result<Credentials, Error> {
         let loaded = (self.loader)().ok_or_else(no_credentials_error)?;
-        if !loaded.expired() {
+        let rejected = rejected.is_some_and(|t| t == loaded.access_token);
+        if !loaded.expired() && !rejected {
             return Ok(loaded);
         }
         self.refresh(&loaded)
@@ -392,11 +482,9 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
     }
 
     fn list_models(&mut self) -> Result<Vec<ModelInfo>, Error> {
-        let auth = self.current_auth()?;
-        let body = self
-            .backend
-            .get_model_list(&self.url("v1/models"), &auth)
-            .map_err(|e| map_backend_error(e, "listing models"))?;
+        let body = self.with_auth("listing models", |auth| {
+            self.backend.get_model_list(&self.url("v1/models"), auth)
+        })?;
         parse_model_list(&body)
     }
 
@@ -423,10 +511,10 @@ impl<B: crate::backend::Backend> Handler for AnthropicProvider<B> {
         if !streaming {
             return self.chat_non_streaming(&auth, &body, sink);
         }
-        let payloads = self
-            .backend
-            .post_stream(&self.url("v1/messages"), &auth, &body)
-            .map_err(|e| map_backend_error(e, "chat completion"))?;
+        let payloads = self.with_auth_mode(&auth, "chat completion", |auth| {
+            self.backend
+                .post_stream(&self.url("v1/messages"), auth, &body)
+        })?;
         let mut state = adapter::StreamState::default();
         for payload in payloads {
             // Spec §7: stop promptly once the client cancels. The check runs
@@ -472,10 +560,10 @@ impl<B: crate::backend::Backend> AnthropicProvider<B> {
         body: &str,
         sink: &mut dyn FnMut(ChunkPayload),
     ) -> Result<ChatDone, Error> {
-        let response = self
-            .backend
-            .post_message(&self.url("v1/messages"), auth, body)
-            .map_err(|e| map_backend_error(e, "chat completion"))?;
+        let response = self.with_auth_mode(auth, "chat completion", |auth| {
+            self.backend
+                .post_message(&self.url("v1/messages"), auth, body)
+        })?;
         let trimmed = response.trim();
         if trimmed.is_empty() {
             return Err(Error::Protocol(
@@ -618,6 +706,13 @@ mod tests {
         posts: RefCell<Vec<(String, String)>>,
         /// API keys seen by `post_stream` (empty on the bearer path).
         api_keys: RefCell<Vec<String>>,
+        /// Bearer access tokens seen by `post_stream`, in order (the
+        /// token-rotation tests pin which token each attempt carried).
+        bearer_tokens: RefCell<Vec<String>>,
+        /// Bearer access tokens the mock API answers with 401 — the
+        /// server-side "this token is dead" signal that a local
+        /// `expires_at` check cannot predict (revocation, early expiry).
+        reject_tokens: RefCell<Vec<String>>,
         /// Bodies recorded by `post_message` (the non-streaming path).
         non_stream_posts: RefCell<Vec<(String, String)>>,
         /// The canned non-streaming body `post_message` returns.
@@ -626,12 +721,36 @@ mod tests {
         post_error: Option<crate::backend::BackendError>,
     }
 
+    impl MockBackend {
+        /// The 401 the API returns for an access token it no longer honors.
+        fn unauthorized() -> crate::backend::BackendError {
+            crate::backend::BackendError::new(
+                Some(401),
+                r#"{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has expired. Re-authenticate to continue."}}"#,
+            )
+        }
+
+        /// Record the bearer token and return the 401 if the mock is set to
+        /// reject it.
+        fn check_token(&self, auth: &AuthMode) -> Result<(), crate::backend::BackendError> {
+            let AuthMode::Bearer(c) = auth else {
+                return Ok(());
+            };
+            self.bearer_tokens.borrow_mut().push(c.access_token.clone());
+            if self.reject_tokens.borrow().contains(&c.access_token) {
+                return Err(Self::unauthorized());
+            }
+            Ok(())
+        }
+    }
+
     impl crate::backend::Backend for MockBackend {
         fn get_model_list(
             &self,
             _url: &str,
-            _auth: &AuthMode,
+            auth: &AuthMode,
         ) -> Result<String, crate::backend::BackendError> {
+            self.check_token(auth)?;
             Ok(r#"{"data": []}"#.into())
         }
 
@@ -644,17 +763,10 @@ mod tests {
             self.non_stream_posts
                 .borrow_mut()
                 .push((url.to_string(), body.to_string()));
-            match auth {
-                AuthMode::Bearer(c) => {
-                    assert_eq!(
-                        c.access_token, "sk-ant-oat01-test",
-                        "unexpected auth: {auth:?}"
-                    )
-                }
-                AuthMode::ApiKey(k) => {
-                    assert_eq!(k, "sk-ant-api03-test", "unexpected auth: {auth:?}")
-                }
+            if let AuthMode::ApiKey(k) = auth {
+                assert_eq!(k, "sk-ant-api03-test", "unexpected auth: {auth:?}")
             }
+            self.check_token(auth)?;
             self.response
                 .borrow_mut()
                 .take()
@@ -670,18 +782,14 @@ mod tests {
             Box<dyn Iterator<Item = Result<String, crate::backend::BackendError>>>,
             crate::backend::BackendError,
         > {
-            assert!(
-                matches!(auth, AuthMode::Bearer(c) if c.access_token == "sk-ant-oat01-test")
-                    || matches!(auth, AuthMode::Bearer(c) if c.access_token == "sk-ant-oat01-fresh")
-                    || matches!(auth, AuthMode::ApiKey(k) if k == "sk-ant-api03-test"),
-                "unexpected auth mode: {auth:?}"
-            );
             if let AuthMode::ApiKey(key) = auth {
+                assert_eq!(key, "sk-ant-api03-test", "unexpected auth: {auth:?}");
                 self.api_keys.borrow_mut().push(key.clone());
             }
             self.posts
                 .borrow_mut()
                 .push((url.to_string(), body.to_string()));
+            self.check_token(auth)?;
             if let Some(err) = &self.post_error {
                 return Err(err.clone());
             }
@@ -1379,6 +1487,336 @@ mod tests {
             refreshes(&mut provider),
             vec!["r0".to_string()],
             "only the first turn's stale token reached the token endpoint"
+        );
+    }
+
+    // --- token lifetime in a long-running session --------------------------
+
+    /// BUG (reported): a session that outlived its access token never
+    /// refreshed. `session_credentials` was returned unconditionally, so the
+    /// token loaded at process start was used forever — the ~8 h token
+    /// silently expired mid-session and every later turn 401'd with "OAuth
+    /// access token has expired", even though the refresh token was still
+    /// good. Resolution now drops an expired in-process token and goes back
+    /// to the store, which refreshes.
+    #[test]
+    fn an_expired_in_process_token_is_refreshed_instead_of_reused() {
+        oauth::cache_test_hooks::arm(Ok(r#"{"access_token":"sk-ant-oat01-fresh",
+            "refresh_token":"sk-ant-ort01-rotated","expires_in":28800}"#));
+        let _guard = defer(oauth::cache_test_hooks::disarm);
+
+        // The token loaded at process start.
+        let start = Credentials {
+            access_token: "sk-ant-oat01-test".into(),
+            refresh_token: "sk-ant-ort01-test".into(),
+            expires_at: auth::now_ms() + 3_600_000,
+            refresh_token_expires_at: None,
+        };
+        let disk: Rc<RefCell<Option<Credentials>>> = Rc::new(RefCell::new(Some(start)));
+        let read_disk = Rc::clone(&disk);
+        let write_disk = Rc::clone(&disk);
+        let offered: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut provider = AnthropicProvider::new(
+            MockBackend {
+                sse: payloads(STREAM_BASIC),
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_api_key(Box::new(|| None))
+        .with_credentials(
+            Box::new(move || read_disk.borrow().clone()),
+            Box::new(move |c| *write_disk.borrow_mut() = Some(c.clone())),
+        );
+        provider.refresh_tokens_offered = Some(offered.clone());
+
+        // Turn 1: the token is live — used as-is, no refresh.
+        run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap();
+        assert_eq!(
+            provider.backend.bearer_tokens.borrow().as_slice(),
+            ["sk-ant-oat01-test"]
+        );
+        assert!(offered.borrow().is_empty(), "a live token needs no refresh");
+
+        // The access token expires while the process keeps running. (The
+        // in-process copy is expired directly: the session cache is what
+        // the bug pinned, and a real 8 h wait is not testable.)
+        let stale = provider.session_credentials.borrow().clone().unwrap();
+        *provider.session_credentials.borrow_mut() = Some(Credentials {
+            expires_at: auth::now_ms() - 1_000,
+            ..stale
+        });
+        // The store still holds the same token — also past its expiry.
+        let stored = disk.borrow().clone().unwrap();
+        *disk.borrow_mut() = Some(Credentials {
+            expires_at: auth::now_ms() - 1_000,
+            ..stored
+        });
+        provider.backend.bearer_tokens.borrow_mut().clear();
+
+        // Turn 2: the expired in-process token must not be handed out
+        // again — the store is re-read and the token refreshed.
+        run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap();
+        assert_eq!(
+            offered.borrow().as_slice(),
+            ["sk-ant-ort01-test"],
+            "the expired token was refreshed with the stored refresh token"
+        );
+        assert_eq!(
+            provider.backend.bearer_tokens.borrow().as_slice(),
+            ["sk-ant-oat01-fresh"],
+            "the request carried the refreshed token"
+        );
+    }
+
+    /// BUG (reported): after the 401 above, re-running `login` did not help
+    /// — the next turn failed identically. The stale in-process token was
+    /// still returned, so the fresh credentials on disk were never read.
+    /// A 401 now reports the rejected token to resolution, which drops it
+    /// and prefers the re-`login`'d store.
+    #[test]
+    fn a_401_is_recovered_by_the_credentials_a_live_login_wrote() {
+        // Turn 1's recovery refresh fails the way an expired refresh token
+        // does in practice (`invalid_grant`), so the user sees the
+        // actionable "login expired" error and goes to re-login.
+        oauth::cache_test_hooks::arm(Err(400));
+        let _guard = defer(oauth::cache_test_hooks::disarm);
+
+        // The in-process token is *not* expired by the local clock — the
+        // server rejected it anyway (revoked / expired server-side early).
+        // Only the API's 401 can tell us, which is why recovery is driven
+        // by the response rather than by `expires_at`.
+        let start = Credentials {
+            access_token: "sk-ant-oat01-test".into(),
+            refresh_token: "sk-ant-ort01-test".into(),
+            expires_at: auth::now_ms() + 3_600_000,
+            refresh_token_expires_at: None,
+        };
+        let disk: Rc<RefCell<Option<Credentials>>> = Rc::new(RefCell::new(Some(start)));
+        let read_disk = Rc::clone(&disk);
+        let write_disk = Rc::clone(&disk);
+        let mut provider = AnthropicProvider::new(
+            MockBackend {
+                sse: payloads(STREAM_BASIC),
+                reject_tokens: RefCell::new(vec!["sk-ant-oat01-test".into()]),
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_api_key(Box::new(|| None))
+        .with_credentials(
+            Box::new(move || read_disk.borrow().clone()),
+            Box::new(move |c| *write_disk.borrow_mut() = Some(c.clone())),
+        );
+
+        // Turn 1: the server rejects the token. With nothing fresher on
+        // disk and no armed token endpoint, the refresh fails — the user
+        // sees the actionable error and goes to re-login.
+        let err = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Provider {
+                    code: ErrorCode::Auth,
+                    ..
+                }
+            ),
+            "unexpected: {err:?}"
+        );
+
+        // The user re-authenticates while Clanky is still running: `login`
+        // writes a *different* token to the store. (The old token is still
+        // the one in memory, and still the one the mock rejects.)
+        *disk.borrow_mut() = Some(Credentials {
+            access_token: "sk-ant-oat01-fresh".into(),
+            refresh_token: "sk-ant-ort01-new".into(),
+            expires_at: auth::now_ms() + 3_600_000,
+            refresh_token_expires_at: None,
+        });
+
+        // Turn 2, same process: the fresh store token is used — no restart,
+        // no refresh, and the rejected token is never offered again.
+        let (chunks, done) = run_chat(
+            &mut provider,
+            &request(
+                "claude-haiku-4-5-20251001",
+                vec![ChatMessage::user("list 5 numbers")],
+            ),
+        );
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ChunkPayload::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "1,2,3,4,5");
+        assert_eq!(done.unwrap().finish_reason, FinishReason::Stop);
+        assert_eq!(
+            provider.backend.bearer_tokens.borrow().as_slice(),
+            ["sk-ant-oat01-test", "sk-ant-oat01-fresh"],
+            "the rejected token was replaced by the re-login'd one"
+        );
+    }
+
+    /// A 401 on a token the store still holds (no re-login happened) is
+    /// recovered by refreshing: the server's rejection is authoritative,
+    /// so the token is not handed back even though the clock says it lives.
+    #[test]
+    fn a_401_on_a_locally_live_token_triggers_a_refresh() {
+        oauth::cache_test_hooks::arm(Ok(r#"{"access_token":"sk-ant-oat01-fresh",
+            "refresh_token":"sk-ant-ort01-rotated","expires_in":28800}"#));
+        let _guard = defer(oauth::cache_test_hooks::disarm);
+
+        let start = Credentials {
+            access_token: "sk-ant-oat01-test".into(),
+            refresh_token: "sk-ant-ort01-test".into(),
+            expires_at: auth::now_ms() + 3_600_000,
+            refresh_token_expires_at: None,
+        };
+        let disk: Rc<RefCell<Option<Credentials>>> = Rc::new(RefCell::new(Some(start)));
+        let read_disk = Rc::clone(&disk);
+        let write_disk = Rc::clone(&disk);
+        let offered: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut provider = AnthropicProvider::new(
+            MockBackend {
+                sse: payloads(STREAM_BASIC),
+                reject_tokens: RefCell::new(vec!["sk-ant-oat01-test".into()]),
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_api_key(Box::new(|| None))
+        .with_credentials(
+            Box::new(move || read_disk.borrow().clone()),
+            Box::new(move |c| *write_disk.borrow_mut() = Some(c.clone())),
+        );
+        provider.refresh_tokens_offered = Some(offered.clone());
+
+        // The first attempt 401s, the refresh succeeds, and the retry with
+        // the new token goes through — the user never sees the 401.
+        run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap();
+        assert_eq!(offered.borrow().as_slice(), ["sk-ant-ort01-test"]);
+        assert_eq!(
+            provider.backend.bearer_tokens.borrow().as_slice(),
+            ["sk-ant-oat01-test", "sk-ant-oat01-fresh"],
+            "the rejected attempt, then the refreshed retry"
+        );
+    }
+
+    /// A rejected API key is reported, never retried: a re-resolution
+    /// cannot fix it, and the server's message is the actionable one
+    /// (invariant: don't second-guess the provider).
+    #[test]
+    fn a_rejected_api_key_is_reported_without_a_retry() {
+        let mut provider = AnthropicProvider::new(
+            MockBackend {
+                sse: payloads(STREAM_BASIC),
+                post_error: Some(crate::backend::BackendError::new(
+                    Some(401),
+                    r#"{"error":{"message":"invalid x-api-key"}}"#,
+                )),
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_api_key(Box::new(|| Some("sk-ant-api03-test".into())))
+        .with_credentials(Box::new(|| None), Box::new(|_| {}));
+
+        let err = run_chat(
+            &mut provider,
+            &request("claude-haiku-4-5-20251001", vec![ChatMessage::user("hi")]),
+        )
+        .1
+        .unwrap_err();
+        match err {
+            Error::Provider { code, message, .. } => {
+                assert_eq!(code, ErrorCode::Auth);
+                assert!(message.contains("invalid x-api-key"), "{message}");
+            }
+            other => panic!("unexpected: {other}"),
+        }
+        assert_eq!(
+            provider.backend.posts.borrow().len(),
+            1,
+            "one attempt, no retry"
+        );
+    }
+
+    /// A key that appears mid-session is not used for a retry: the request
+    /// body was built with the bearer identity, so the bearer 401 is
+    /// reported rather than sent on the key path with the wrong identity.
+    #[test]
+    fn a_key_appearing_mid_session_does_not_capture_a_bearer_retry() {
+        let _guard = defer(oauth::cache_test_hooks::disarm);
+        let disk: Rc<RefCell<Option<Credentials>>> = Rc::new(RefCell::new(Some(test_creds())));
+        let read_disk = Rc::clone(&disk);
+        let key: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let read_key = Rc::clone(&key);
+        let provider = AnthropicProvider::new(
+            MockBackend {
+                sse: payloads(STREAM_BASIC),
+                reject_tokens: RefCell::new(vec!["sk-ant-oat01-test".into()]),
+                ..Default::default()
+            },
+            "https://api.anthropic.com",
+        )
+        .with_api_key(Box::new(move || read_key.borrow().clone()))
+        .with_credentials(
+            Box::new(move || read_disk.borrow().clone()),
+            Box::new(|_| {}),
+        );
+
+        // Auth resolves (bearer), then a key appears before the 401 is
+        // handled — the retry must not switch paths.
+        let auth = provider.current_auth().unwrap();
+        assert!(auth.bearer_token().is_some());
+        *key.borrow_mut() = Some("sk-ant-api03-test".into());
+
+        let err = provider
+            .with_auth_mode(&auth, "chat completion", |auth| {
+                crate::backend::Backend::post_stream(
+                    &provider.backend,
+                    "https://api.anthropic.com/v1/messages",
+                    auth,
+                    "{}",
+                )
+                .map(|_| ())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Provider {
+                    code: ErrorCode::Auth,
+                    ..
+                }
+            ),
+            "unexpected: {err:?}"
+        );
+        assert!(
+            provider.backend.api_keys.borrow().is_empty(),
+            "the bearer-built body must not go out on the key path"
         );
     }
 

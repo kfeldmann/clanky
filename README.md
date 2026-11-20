@@ -690,11 +690,15 @@ clanky --provider anthropic -p "say hi"
 The `login` subcommand runs a PKCE flow with no browser: it prints an
 authorize URL, you open it anywhere, and paste the code back. Credentials
 live in `~/.clanky/providers/anthropic/credentials.json` (0600) and are
-refreshed automatically before expiry. The refresh token is finite and
-rotates on every refresh — when it expires (weeks later), requests start
-failing with an actionable `auth` error and you re-run `login`. Re-running
-`login` works while Clanky is up: the next request picks up the fresh
-credentials, no restart needed.
+refreshed automatically before expiry — a running session included, since an
+access token only lives about 8 hours: when it expires mid-session the next
+request refreshes it rather than failing. If the API rejects a token anyway
+(revoked, or expired server-side early), that 401 is taken as authoritative:
+the token is replaced and the request retried once. The refresh token is
+finite and rotates on every refresh — when it expires (weeks later),
+requests start failing with an actionable `auth` error and you re-run
+`login`. Re-running `login` works while Clanky is up: the next request picks
+up the fresh credentials, no restart needed.
 
 **API key (if your account has one):**
 

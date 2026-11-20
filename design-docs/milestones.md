@@ -406,6 +406,48 @@ real tenant.
   values the same way the DeepInfra/LiteLLM backends do (delay-seconds or
   IMF-fixdate, negative/past dates clamping to 0).
 
+  Later fix (user report): the OAuth token was never refreshed in a
+  long-running session, and a re-`login` did not take effect either.
+  `current_credentials` returned `session_credentials` unconditionally and
+  *before* any other check, so the token loaded at process start was used
+  for the life of the process. Access tokens live ~8 h, so a session open
+  longer than that kept sending a token that had expired: the API answered
+  `401: OAuth access token has expired`, and since nothing cleared the
+  cache, every later turn failed the same way — and re-running `login`
+  (which writes fresh credentials to disk) changed nothing, because the
+  stale in-process token still short-circuited. The `README` promise
+  ("re-running `login` works while Clanky is up") only ever held on the
+  *cached failure* path, where a refresh had already failed; a token that
+  merely expired hit the silent-reuse path instead.
+
+  Fix, in two parts. (1) Resolution drops an **expired** in-process token
+  instead of returning it, falling through to the store, which refreshes —
+  so auto-refresh now works mid-session, not just at startup. (2) A 401
+  from the API is taken as authoritative about the token: a local
+  `expires_at` check cannot see a revoked token or one expired server-side
+  early, so `with_auth_mode` reports the rejected token back to resolution,
+  which refuses to hand it out again (even if the clock says it is live)
+  and prefers a re-`login`'d store token or a refresh, retrying the request
+  exactly once. A 401 is rejected before any generation, so the retry
+  cannot double-bill or replay a partial stream. The API-key path never
+  retries — a bad key is not fixed by re-resolution, and the user's key is
+  authoritative (project invariant), so the server's message is surfaced
+  as-is.
+
+  Chat resolves auth once and passes the mode to both the body builder (the
+  Claude Code identity is derived from it) and the request, so the body and
+  the wire request cannot come from different credentials; a 401 retry can
+  only stay on the bearer path, so a body built for the bearer identity is
+  still correct. Coverage: `an_expired_in_process_token_is_refreshed_instead_of_reused`,
+  `a_401_on_a_locally_live_token_triggers_a_refresh`,
+  `a_401_is_recovered_by_the_credentials_a_live_login_wrote`,
+  `a_rejected_api_key_is_reported_without_a_retry` — the first three fail
+  against the old code. Test plumbing: the `oauth::cache_test_hooks` canned
+  response became thread-local (it was one global slot, so parallel tests
+  could arm/disarm each other's refresh — the pre-existing re-login test
+  was already racy against any new cache test), and the mock backend can
+  now reject named bearer tokens to model the server's 401.
+
 ### ✔ M12 — Refinements, Bug Fixes
 1. [x] Add support for ctl+u in the input field (clear from cursor to beginning of line)
 2. [x] Print-mode (-p) output changes

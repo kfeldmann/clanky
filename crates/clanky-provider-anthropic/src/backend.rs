@@ -32,6 +32,18 @@ pub enum AuthMode {
     ApiKey(String),
 }
 
+impl AuthMode {
+    /// The OAuth access token, or `None` on the API-key path. Used to tell
+    /// *which* token a 401 rejected (and whether it can be refreshed at
+    /// all: a key cannot).
+    pub fn bearer_token(&self) -> Option<&str> {
+        match self {
+            Self::Bearer(creds) => Some(&creds.access_token),
+            Self::ApiKey(_) => None,
+        }
+    }
+}
+
 /// A failure at the HTTP layer: an HTTP status (when the server answered)
 /// or a connection/client error.
 #[derive(Debug, Clone, PartialEq, Eq)]
