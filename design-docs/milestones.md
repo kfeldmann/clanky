@@ -2551,3 +2551,315 @@ provider.
   attribution includes passed-back thinking, so the "never inflates a later
   prompt" claim cannot creep back into the docs while the code does
   otherwise.
+
+## ☐ M24 — OpenRouter provider plugin
+
+New provider plugin `crates/clanky-provider-openrouter` (binary
+`clanky-provider-openrouter`), talking to OpenRouter's OpenAI-compatible
+`POST /api/v1/chat/completions`. Read env `OPENROUTER_API_KEY` (required;
+`sk-or-v1-…`), optional `OPENROUTER_BASE_URL` (default
+`https://openrouter.ai/api/v1`), optional `OPENROUTER_HTTP_REFERER` /
+`OPENROUTER_TITLE` for the app-attribution headers. Provider name
+`openrouter`; default model advertised at handshake
+`deepseek/deepseek-v4.1-flash` (see "Default model" below). Same shape as
+M10's LiteLLM plugin: `clanky_protocol::serve_stdio` does the wire, the
+adapter is the work, and every behavior is pinned to captured fixtures.
+
+Docs reviewed: `api_reference/overview.md`, `api_reference/models.md`,
+`api_reference/streaming.md`, `api_reference/errors-and-debugging.md`,
+`api_reference/authentication.md`, `api_reference/limits.md`,
+`guides/best-practices/reasoning-tokens.md`, the chat-completions page in
+the OpenAPI spec (`openapi.yaml`), and a live `GET /api/v1/models` dump
+(478 models, 2026-11).
+
+### What the docs say that changes the design
+
+1. **Reasoning has its own request shape, and `reasoning_content` is not
+   documented for requests.** Chat Completions exposes a top-level
+   `reasoning` object (`effort`, `max_tokens`, `enabled`, `exclude`,
+   `summary`, `mode`, `context`) plus a `reasoning_effort` shorthand, and
+   `reasoning_details` as the structured passback. The prose says
+   "`reasoning_content` … functions identically to `reasoning`", but the
+   OpenAPI schema for `ChatAssistantMessage` lists only `reasoning` and
+   `reasoning_details` — `reasoning_content` appears in **zero** of the
+   chat-completions schema sections. So the DeepInfra/LiteLLM passback
+   field is an undocumented alias here; the documented one is
+   `reasoning_details`.
+2. **`stream_options.include_usage` is deprecated and has no effect** — full
+   usage is always returned. Sending it is harmless; the plan is to not send
+   it and pin the always-on behavior with a fixture instead (see decision 6).
+3. **The terminal usage chunk deliberately deviates from OpenAI**: it
+   carries one choice with a content-free delta that *repeats*
+   `finish_reason`. A strict "empty choices means usage frame" parser would
+   be wrong here; the existing accumulator already ignores content-free
+   deltas and a repeated finish reason, so this is a pin-with-a-test item,
+   not a code change.
+4. **Mid-stream errors arrive as a 200 with a top-level `error` object** and
+   a choice whose `finish_reason` is `"error"`. `finish_reason` values are
+   normalized to `tool_calls` / `stop` / `length` / `content_filter` /
+   `error`. A plugin that maps unknown finish reasons to `stop` would
+   silently turn a provider failure into a successful empty answer.
+5. **`402` exists and is not one thing.** Credits exhausted
+   (`openrouter_credits`, `openrouter_key_limit`) is a hard stop; the
+   in-flight budget variant (`openrouter_in_flight_budget`) carries a
+   `Retry-After` and *is* transient. `503` (no provider meets the routing
+   requirements) and `429` also carry `Retry-After`. The docs note no SDK
+   retries a `402` on its own, so the `Retry-After` header is the only
+   signal that distinguishes the two cases.
+6. **The catalog is rich but full of sentinels.** `pricing` values are
+   **strings** (`"0.000003"`), some entries carry an `overrides` array
+   (87 of 478 models: prompt-length tiers, UTC time-of-day tiers,
+   `input_cache_write_1h`), and two sentinels mean "not a normal price":
+   `-1` for dynamic routers (`openrouter/auto`, `openrouter/fusion`, 8
+   models) and `0` for `:free` variants. 92 catalog entries are `:batch`
+   and are **not** on `/api/v1/chat/completions` at all; 19 are `~`
+   rolling aliases; 60 chat models have no `tools` in
+   `supported_parameters`. Context window is `context_length` (per model),
+   not `top_provider.context_length` (per endpoint).
+7. **Per-model reasoning metadata exists** (`reasoning.supported_efforts`,
+   `default_effort`, `default_enabled`, `mandatory`, `supports_max_tokens`)
+   on 356 of 478 models — 151 of them `mandatory: true`, meaning the model
+   **rejects** `effort: "none"`.
+8. **`/api/v1/models` is public and unfiltered; `/api/v1/models/user` is
+   the key-scoped view.** The first returns 478 models including ones this
+   key cannot call (guardrails, provider preferences, privacy settings).
+9. **`HTTP-Referer` / `X-OpenRouter-Title` are optional app-attribution
+   headers**; they change nothing functionally and are the one place a
+   plugin may identify itself.
+
+### Decisions to settle before implementation
+
+1. **Shared OpenAI-compatible core — yes, and as its own step (M24a).**
+   The duplication is measurable, not stylistic. `backend.rs` is **85%
+   identical** between the DeepInfra and LiteLLM plugins, ignoring comments
+   (`BackendError`, `parse_retry_after`, `parse_http_date`, `UreqBackend`,
+   `map_ureq_error`, the whole SSE framer, `truncate_body` and all of its
+   tests) — and the Anthropic plugin carries a **third** copy of the SSE
+   framer plus a third copy of the HTTP-date `Retry-After` parser
+   (`backend.rs:82`, differing from the other two only in `i64` vs `u64`).
+   In `provider.rs` the picture is different and worth stating honestly:
+   only **16% of the non-comment lines** are verbatim-identical, but the
+   *same blocks* are present in all three plugins — the seven
+   `OpenAi*` chunk structs, `StreamState` + `CallAccumulator` (with its
+   hard-won index/args-before-id/oversized-index handling), `args_string`,
+   `MAX_TOOL_CALL_INDEX`, `map_finish_reason`, `openai_tools`,
+   `role_name`, `reasoning_content`, `image_parts_user_message`, and
+   `backend_to_protocol_error`'s status→`ErrorCode` mapping. They differ
+   by doc comments and by a handful of provider-specific lines
+   (LiteLLM's extra `thinking_blocks`, LiteLLM's error-envelope
+   unwrapping), which is precisely why the shared crate should own the
+   *mechanism* and leave the *policy* in each plugin. A fourth copy is not
+   defensible. Extract a
+   `crates/clanky-provider-openai` library crate holding: the `ureq`
+   backend + SSE framer + `Retry-After` parsing + `truncate_body`; the
+   OpenAI stream-chunk types and `StreamState`; and the message/tool
+   serializers. Each plugin then keeps only what is genuinely its own
+   (URL joining, catalog parsing, error-envelope unwrapping, thinking
+   mapping). Do this **as a separate, mechanically verified step** (see
+   M24a) so the refactor's only acceptance criterion is "all existing
+   tests and goldens pass unchanged" — mixing it into new-provider work
+   makes a regression impossible to attribute.
+2. **`reasoning_details` is the passback field, not `reasoning_content`.**
+   The protocol's `ThinkingBlock` maps cleanly onto OpenRouter's
+   `reasoning_details` union: `Thinking` → `{"type":"reasoning.text",
+   "text":…,"signature":…}`, `Redacted` → `{"type":"reasoning.encrypted",
+   "data":…}`. OpenRouter also carries `id`, `index` and `format` on each
+   detail; those are not in the protocol's `ThinkingBlock`. Two options:
+   (a) send `reasoning_details` with only `type` + payload, letting
+   OpenRouter fill the rest; (b) extend `ThinkingBlock` with optional
+   `id`/`index`/`format` (additive, no version bump) so blocks round-trip
+   verbatim as the docs require ("the entire sequence … must match the
+   outputs generated by the model … you cannot rearrange or modify").
+   Recommendation: **start with (a), and capture a live round-trip to see
+   whether OpenRouter's verifier accepts a block missing `id`/`format`
+   before deciding (b) is needed.** Do not send `reasoning_content` as
+   well "to be safe": unlike DeepInfra, an extra field here is an
+   undocumented one, and the project rule is to send what the provider
+   documents.
+3. **Thinking maps to `reasoning.effort`, with the budget as the source.**
+   Reuse the budget→effort ladder (`0`→`none`, then the rungs), but note
+   the semantics differ from DeepInfra: OpenRouter's rungs are *fractions
+   of the output token limit* (`max`/`xhigh`≈95%, `high`≈80%,
+   `medium`≈50%, `low`≈20%, `minimal`≈10%), not absolute budgets. That is
+   a lossy but documented translation, and it is what every other client
+   does. **`mandatory: true` models reject `effort: "none"`** — per
+   invariant 2 the plugin still sends what the user asked for and surfaces
+   the 400; the catalog hint exists so the `/model` picker can show it,
+   not so the request can be rewritten. `--thinking <budget>` therefore
+   keeps its meaning ("how hard to think"), and README must say the
+   mapping is a fraction of the output limit here. Note also that the
+   ladder is not universal: 240 of 478 catalog entries expose no
+   `supported_efforts` list at all, `minimal` is absent from 196 models'
+   lists, and `none` from 122. Sending an effort the model does not list
+   is a 400; that is the documented, actionable answer, so nothing is
+   clamped — but it does mean `--thinking off` is only reliable on models
+   whose `supported_efforts` includes `none` (or which list no efforts and
+   are non-`mandatory`), and README should say so.
+4. **Default model: `deepseek/deepseek-v4.1-flash`.** Cheap
+   ($0.30/$1.20 per Mtok, cache read $0.006), 1M context, tools,
+   non-mandatory reasoning (so `--thinking off` is legal), and priced in
+   the same band as the DeepInfra plugin's default
+   (`zai-org/GLM-5.3-Flash`), which keeps a cross-provider comparison
+   meaningful. Note that "match DeepInfra's default model" is *not* an
+   option here: the same GLM 5.3 Flash is `mandatory: true` on OpenRouter,
+   so it would reject `--thinking off`. The alternatives are
+   `z-ai/glm-5.3-flash` (cheaper, mandatory — a bad default for a plugin
+   whose README documents the off switch) and
+   `anthropic/claude-haiku-4.5` (10× the input price, 200k context, no
+   effort ladder exposed). Whatever is chosen goes in the handshake (core
+   keeps no provider table) and in README.
+5. **Catalog: `/api/v1/models/user`, not `/api/v1/models`.** The public
+   catalog is 478 models including ones this key cannot call; the
+   key-scoped one is what a picker should show. Both are optional-auth, so
+   the plugin sends its key either way. Filter the picker by what the
+   model can actually do: drop `:batch` entries (no chat endpoint),
+   drop entries without `/api/v1/chat/completions` in `endpoints`, and
+   flag `supportsTools: false` when `tools` is missing from
+   `supported_parameters` (the LiteLLM precedent: hints curate the
+   *list*, never the request). Keep `~` aliases and `:free` variants —
+   they are legitimate user choices.
+6. **`include_usage` is not sent; usage is asserted instead.** Since the
+   docs say the field is deprecated and ignored, sending it is noise. Pin
+   with a fixture that the final usage chunk arrives with no
+   `stream_options` in the request, and that its content-free choice does
+   not confuse the accumulator.
+7. **Errors: `402` is the interesting one.** `401`/`403` → `auth`, `429` →
+   `rateLimit` (with `Retry-After`), `400`/`404`/`422` → `invalidRequest`,
+   `502`/`503` → `backend` (retryable; `503` carries `Retry-After`).
+   `402` is two cases wearing one status: credits exhausted
+   (`openrouter_credits`, `openrouter_key_limit`) is a hard stop that no
+   retry fixes, while the in-flight budget
+   (`openrouter_in_flight_budget`) carries `Retry-After` and is transient.
+   The docs are explicit that "none of the SDKs retries a `402` on its own",
+   so the rule is: **retryable only when a `Retry-After` is present**, and
+   map it to `rateLimit` in that case, `auth` otherwise — with the
+   provider's own message either way. The protocol's `retryable` hint
+   already expresses exactly this and core already honors `retryAfterMs`,
+   so no protocol change is needed. And **mid-stream errors must not be
+   swallowed**: a chunk with a top-level `error` object, or a
+   `finish_reason` of `"error"`, terminates the stream with a
+   request-scoped error carrying the provider's `message`, not a `done`
+   with `stop`.
+8. **App attribution headers are opt-in and pass through exactly.** Read
+   `OPENROUTER_HTTP_REFERER` and `OPENROUTER_TITLE` verbatim; send nothing
+   when unset. No invented default (no "clanky" title): that would be the
+   plugin deciding something the user did not.
+
+### Steps
+
+#### ☐ M24a — Extract `clanky-provider-openai` (refactor only, no new behavior)
+- New workspace member `crates/clanky-provider-openai`, a library (no
+  binary): `backend` (the `ureq` agent, `Backend`/`BackendError`, SSE
+  framer, `Retry-After` parsing in both forms, `truncate_body`) and
+  `stream` (the `OpenAi*` chunk types, `StreamState`, `CallAccumulator`,
+  `map_finish_reason`, `MAX_TOOL_CALL_INDEX`) and `wire` (`openai_tools`,
+  `role_name`, `reasoning_content`, `image_parts_user_message`, the
+  message serializer).
+- Point DeepInfra and LiteLLM at it; **their public behavior must not
+  change**. Their existing tests stay where they are and must pass
+  unmodified — the refactor's acceptance criterion is exactly that, plus
+  `cargo fmt`/`clippy`/`test` green. Keep each plugin's own doc comments
+  (the measured DeepInfra notes, the LiteLLM `thinking_blocks` note) by
+  keeping the provider-specific *policy* in the plugin and only the
+  mechanism in the shared crate.
+- Move the Anthropic plugin's SSE framer and `Retry-After` parser onto
+  the shared ones too (its parser differs only in signedness; unify on
+  one and keep its behavior — past dates clamp to 0).
+- Also fold `main.rs`'s `Unavailable`/`clone_error` glue (DeepInfra and
+  LiteLLM have near-identical copies) into a shared
+  `clanky_protocol::serve_unavailable(...)` helper or a small
+  `clanky-provider-openai` entry point.
+- Done when: three plugins build against the shared crate, all workspace
+  tests and `tests/golden/` pass with **no fixture or golden edits**, and
+  the diff of the moved code is byte-identical modulo imports.
+
+#### ☐ M24b — Capture, then the adapter
+- Capture first (the LiteLLM M10 pattern), into
+  `crates/clanky-provider-openrouter/tests/fixtures/`: `models_user.json`
+  (key-scoped catalog), `stream_plain.txt`, `stream_reasoning.txt`
+  (`reasoning_details` deltas), `stream_tools.txt`, `stream_usage.txt`
+  (the duplicated-finish-reason usage chunk), `stream_error.txt` (the
+  mid-stream `error` chunk), `err_401.txt`, `err_402.txt`, `err_404.txt`.
+  A `dumps.sh` beside them, like `litellm-reference/dumps.sh`.
+- Adapter: `from_env` (key required; missing key is an `auth` error at
+  first request, plugin still handshakes — the DeepInfra pattern),
+  `list_models` from `/models/user` with the picker filters above,
+  `chat` streaming with the `reasoning` object built from
+  `thinking.budget_tokens`, `reasoning_details` passback, tools, and the
+  error mapping from decision 7.
+- Model metadata: `display_name` from `name`, `context_window` from
+  `context_length`, `supports_tools` from `supported_parameters`,
+  `supports_thinking` from the presence of `reasoning` (+ `mandatory`),
+  prices from `pricing.prompt`/`completion`/`input_cache_read` × 1e6
+  (strings → f64; `-1` and `0` are sentinels, and the `overrides` tiers
+  are *not* representable in `ModelInfo` v1 — document that the displayed
+  price is the base tier).
+- Done when: `clanky --provider openrouter -p "count files in /tmp"`
+  runs a bash tool loop against the live API, streamed, and every fixture
+  above is pinned by a test.
+
+#### ☐ M24c — Docs, packaging, and the invariants pass
+- README: a `### OpenRouter` section beside DeepInfra/LiteLLM/Anthropic
+  (env vars, default model, the effort-as-fraction caveat, the
+  `reasoning_details` passback, the `402` meaning, the picker filters,
+  the `:batch`/`:free`/`~` distinctions), plus the built-in providers
+  table and the `cargo install` line.
+- `build-linux-musl`, `build-runner`, `docker/`, `AGENTS.md`'s workspace
+  layout, and `Cargo.toml` members.
+- `provider-protocol.md` gets one note: an OpenAI-compatible plugin sends
+  its backend's documented passback shape, which may be
+  `reasoning_details` rather than `reasoning_content` — the protocol
+  field is the same `ThinkingBlock`, the wire shape is per provider.
+- Re-read `design-docs/code-reviews/invariants-and-defaults-review.md`
+  against the new plugin: no local validation, no silent drops, no
+  rewritten user values (prices, budgets, model ids and app headers all
+  pass through).
+
+### Design constraints
+
+1. **Send what the provider documents, not what the last plugin did.**
+   `reasoning_content` is an undocumented alias on OpenRouter's Chat
+   Completions schema; `reasoning_details` is the documented passback.
+   Copying the DeepInfra line because it is one line shorter is exactly
+   the kind of silent divergence this milestone's doc review exists to
+   catch.
+2. **A 200 is not a success.** OpenRouter reports mid-generation failures
+   inside the stream. The plugin's `done` must only ever follow a real
+   `finish_reason` that is not `error`; an `error` chunk (or a top-level
+   `error` object on any chunk) becomes an `error` message with the
+   provider's text.
+3. **Sentinels are not prices.** `-1` (dynamic routers) and `0`
+   (`:free`) must not be shown as "$-1.00 /Mtok" or "$0.00" in the status
+   line and the picker; both mean "no fixed price", so the field is
+   omitted and the cost display falls back to its no-pricing path.
+4. **The picker filters, the request does not.** `supportsTools: false`
+   hides a model in `/model`; `--model` can still name it, and the
+   server's error answers. Same rule as LiteLLM, restated here because
+   OpenRouter's catalog makes it tempting to filter the request too.
+5. **`mandatory` reasoning is a server-side rule.** `--thinking off` on a
+   `mandatory: true` model sends `effort: "none"` and surfaces the 400.
+   The plugin may *hint* in the picker (a `mandatory` marker), never
+   silently upgrade `none` to `low`.
+6. **Prices are strings with tiers.** Parse `pricing.*` as `f64` from
+   strings; ignore `overrides` for v1 and say so in README. Do not
+   invent a "representative" tier.
+7. **No invented identity headers.** `HTTP-Referer`/`X-OpenRouter-Title`
+   are sent only when the user set them.
+
+### Done when
+
+`clanky --provider openrouter -p "say hi"` and a bash tool loop both work
+against the live API with `OPENROUTER_API_KEY` alone; the shared
+OpenAI-compatible crate exists and the DeepInfra/LiteLLM/Anthropic plugins
+build on it with unchanged behavior (goldens untouched); the `/model`
+picker lists the key-scoped catalog with context windows and prices, hides
+`:batch` and tool-less models, and never shows a sentinel price; a
+mid-stream provider error surfaces as an error rather than an empty
+successful answer; a `402` with no `Retry-After` reads as a credits problem
+and is not retried, while the in-flight-budget `402` (which carries one)
+backs off and retries;
+`thinking`/`--thinking off` map onto `reasoning.effort` (and the 400 on a
+`mandatory` model comes through verbatim); reasoning round-trips through
+`reasoning_details` in a tool loop; and README, `provider-protocol.md`,
+`AGENTS.md`, the workspace layout and the release scripts all mention the
+new plugin.
