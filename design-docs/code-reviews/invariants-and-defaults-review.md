@@ -45,6 +45,7 @@
 | Provider | `deepinfra` | `clanky/src/provider.rs:28` | `provider` / `--provider` |
 | DeepInfra model | `zai-org/GLM-5.3-Flash` | `clanky-provider-deepinfra/src/provider.rs:15` | `model` / `--model` |
 | LiteLLM model | `claude-haiku-4-5` | `clanky-provider-litellm/src/provider.rs:49` | yes |
+| OpenRouter model | `deepseek/deepseek-v4.1-flash` | `clanky-provider-openrouter/src/provider.rs` | yes |
 | Anthropic model | **none** (same) | `clanky-provider-anthropic` | yes |
 | Max tool rounds per turn | `0` = **unlimited** (deliberate: user judges runaway turns) | `clanky/src/turn.rs:28` | `max_tool_rounds` / `--max-tool-rounds` |
 | Max retries | `5` (`0` = never) | `clanky/src/turn.rs:36` | `max_retries` / `--max-retries` |
@@ -115,3 +116,59 @@
 6. **✅ REMOVED — HTTP request timeout 600 s** — dropped from all three provider backends: requests and streams are now unbounded (connect stays at 15 s), so a long answer is never killed mid-stream. Trade-off: a stuck upstream now holds a turn indefinitely instead of 10 min.
 
 If you'd like, I can turn any of the invariant findings (1–4) into concrete patches — #1 (temperature pass-through + `--thinking 0` edge) and #2 (docs vs. named levels) are small; #3/#4 are design decisions worth recording in `milestones.md` either way.
+
+---
+
+# Part 3: The OpenRouter plugin (M24c re-read)
+
+Re-read against the plugin added in M24. Every finding below is a check, not
+a change — the plugin was written to these rules.
+
+**Invariant 1 (user values are authoritative) — clean.**
+
+- **No value is rewritten.** `sampling` is merged verbatim and a `reasoning`
+  or `reasoning_effort` the user set in `[sampling]` suppresses the derived
+  object entirely (`build_request_body`), so the derived ladder only ever
+  fills a gap. The model id is passed through untouched, including
+  `~` aliases, `:free` variants and `openrouter/auto`.
+- **App-attribution headers pass through exactly.** `OPENROUTER_HTTP_REFERER`
+  / `OPENROUTER_TITLE` are read verbatim and sent only when non-empty
+  (`from_env`); there is no invented default title or referer, which would
+  be the plugin deciding something the user did not.
+- **Prices are not invented.** `-1` and `0` are sentinels, and the fields are
+  omitted rather than shown as `$-1.00`/`$0.00`; `pricing.overrides` tiers are
+  deliberately not represented (the base tier is shown, and README says so).
+  Not showing a price is honest; inventing a "representative" tier would not
+  be.
+- **The thinking budget is translated, not clamped into silence.** The
+  budget→effort ladder is lossy by the provider's design (effort is a
+  fraction of the output limit), and README states the loss explicitly.
+  Nothing rejects a budget the user typed.
+
+**Invariant 2 (don't pre-validate the server's job) — clean.**
+
+- **No local validation of effort against `supported_efforts`.** `--thinking
+  off` on a `mandatory: true` model sends `effort: "none"` and OpenRouter's
+  400 comes through verbatim (constraint 5). The catalog hint feeds the
+  picker, never the request.
+- **The catalog filters the list, never the request.** `:batch` entries and
+  non-chat endpoints are dropped from `list_models`; a tool-less model is
+  flagged so the picker hides it. `--model` can still name any of them and
+  the server's answer ("No endpoints found that support tool use…") reaches
+  the user unchanged.
+- **No speculative local error messages were added.** The only message the
+  plugin composes is the missing-key `auth` error (the DeepInfra pattern,
+  and the one case where no server message can exist) and the two
+  stream-shape errors (no `finish_reason`; `finish_reason: "error"` with no
+  error object) — cases where the provider's own signal is absent by
+  construction.
+
+**Defaults inventory additions.**
+
+| What | Default | Where | Configurable? |
+|---|---|---|---|
+| OpenRouter model | `deepseek/deepseek-v4.1-flash` | `clanky-provider-openrouter/src/provider.rs` | `model` / `--model` |
+| OpenRouter base URL | `https://openrouter.ai/api/v1` | same | `OPENROUTER_BASE_URL` |
+| Attribution headers | **none sent** | same | `OPENROUTER_HTTP_REFERER` / `OPENROUTER_TITLE` |
+| `stream_options` | **not sent** | same | n/a (deprecated upstream) |
+| Price display for sentinels | field omitted | same | n/a |

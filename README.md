@@ -614,25 +614,131 @@ field but silently ignores `thinking_blocks`, `reasoning_details` and
 | --- | --- | --- |
 | DeepInfra | `clanky-provider-deepinfra` | `DEEPINFRA_API_KEY` (or `DEEPINFRA_TOKEN`), optional `DEEPINFRA_URL` |
 | LiteLLM proxy | `clanky-provider-litellm` | `LITELLM_API_KEY`, optional `LITELLM_BASE_URL` |
+| OpenRouter | `clanky-provider-openrouter` | `OPENROUTER_API_KEY`, optional `OPENROUTER_BASE_URL`, `OPENROUTER_HTTP_REFERER`, `OPENROUTER_TITLE` |
 | Anthropic | `clanky-provider-anthropic` | `clanky-provider-anthropic login` (OAuth) — or `ANTHROPIC_API_KEY`; optional `ANTHROPIC_BASE_URL` |
 
-All three ship from this workspace:
+All four ship from this workspace:
 
 ```sh
 cargo install \
   clanky \
   clanky-provider-deepinfra \
   clanky-provider-litellm \
+  clanky-provider-openrouter \
   clanky-provider-anthropic
 ```
 
-The OpenAI-compatible plugins (DeepInfra, LiteLLM) are built on a shared
+The OpenAI-compatible plugins (DeepInfra, LiteLLM, OpenRouter) are built on a shared
 library crate, `clanky-provider-openai`: the `ureq` backend, the SSE framer,
 `Retry-After` parsing, the OpenAI stream-chunk types and accumulator, and the
 message/tool serializers live there once. The Anthropic plugin uses the same
 SSE framer and `Retry-After` parser. Each plugin keeps only what is its own —
 URL joining, catalog parsing and hints, the error-envelope unwrapping, the
 thinking→effort ladder, and the documented reasoning passback shape.
+
+### OpenRouter
+
+The OpenRouter plugin reaches every model on [OpenRouter](https://openrouter.ai/)
+through its OpenAI-compatible `POST /api/v1/chat/completions`.
+
+```sh
+export OPENROUTER_API_KEY=sk-or-v1-...    # required
+clanky --provider openrouter -p "say hi"
+```
+
+Optional:
+
+```sh
+export OPENROUTER_BASE_URL=https://openrouter.ai/api/v1   # the default; used verbatim
+export OPENROUTER_HTTP_REFERER=https://your.app           # app attribution, sent as HTTP-Referer
+export OPENROUTER_TITLE="Your App"                        # app attribution, sent as X-OpenRouter-Title
+```
+
+The two attribution headers change nothing functionally and are sent only when
+you set them — no default title, no default referer.
+
+The built-in default model is `deepseek/deepseek-v4.1-flash` (1M context,
+tools, non-mandatory reasoning). Override it with `model` in settings or
+`--model`. Clanky still defaults to the `deepinfra` provider, so an
+OpenRouter-only setup also sets `provider = "openrouter"` (or passes
+`--provider openrouter`).
+
+Notes:
+
+- **Thinking maps onto `reasoning.effort`, and the translation is lossy.**
+  `--thinking <budget>` becomes a top-level `reasoning: {"effort": …}` object
+  on the same ladder as DeepInfra/LiteLLM (`0`→`none`, `<500`→`minimal`,
+  `<1682`→`low`, `<5661`→`medium`, `<19051`→`high`, `<64107`→`xhigh`, else
+  `max`). Unlike DeepInfra, an OpenRouter effort is **a fraction of the
+  request's output token limit**, not an absolute budget: `max`/`xhigh` ≈95%,
+  `high` ≈80%, `medium` ≈50%, `low` ≈20%, `minimal` ≈10%. The budget keeps its
+  meaning ("how hard to think"); the number itself does not reach the API. A
+  `reasoning` (or `reasoning_effort`) entry in `[sampling]` wins over the
+  derived object.
+- **`--thinking off` is only reliable where the model allows it.** `none` is
+  rejected by models whose catalog entry says `reasoning.mandatory: true`
+  (53 of the 248 models a key sees, in the 2026-11 catalog), and it is absent
+  from many models' `supported_efforts` lists. The plugin sends what you asked
+  for and OpenRouter's 400 comes back verbatim. The catalog hint is not
+  surfaced in the picker yet — `ModelInfo` v1 has no field for it — so check
+  the model's OpenRouter page if `--thinking off` 400s. Nothing is ever
+  silently upgraded from `none` to a higher effort.
+- **Reasoning is passed back as `reasoning_details`.** Each round's finished
+  blocks go back on its assistant message in OpenRouter's documented union:
+  a readable block as `{"type":"reasoning.text","text":…,"signature":…}` and an
+  encrypted one as `{"type":"reasoning.encrypted","data":…}`. Only `type` and
+  the payload are sent; `id`/`format`/`index` are omitted, which live
+  round-trips confirmed the API accepts. The payload itself goes back
+  byte-exact, whatever the backend checks: an Anthropic-signed block is
+  verified (an altered signature is a 400), while an OpenAI/Grok encrypted
+  blob is accepted unchanged. Clanky does **not** send `reasoning_content`
+  here: that field is an undocumented alias on OpenRouter's
+  chat-completions schema.
+- **What you see is not always what is passed back.** There are two reasoning
+  shapes in the wild and they behave differently:
+
+  | what the stream carries | what you see | what is passed back |
+  | --- | --- | --- |
+  | `reasoning.text` deltas (DeepSeek, most open models) | the text | the same text as `reasoning.text` |
+  | `reasoning.text` with a `signature` (Anthropic) | the text | text **and** signature, merged into one block |
+  | `reasoning.summary` deltas (OpenAI o-series/GPT reasoning, Grok) | the summary | **nothing from the summary** — the opaque `reasoning.encrypted` blob that follows is the payload |
+  | `reasoning.encrypted` | nothing (it is opaque) | the blob, verbatim |
+
+  A summary is a *description* of the reasoning, not the reasoning: passing it
+  back as `reasoning.text` would forge a payload the model never produced. On
+  those models Clanky therefore shows you the summary and sends back only the
+  encrypted blob — which is why OpenAI/Grok rounds look like they have
+  reasoning to show but carry no readable trace in the request.
+- **A `200` is not a success.** OpenRouter reports mid-generation failures
+  inside the stream — a chunk with a top-level `error` object, and/or a choice
+  whose `finish_reason` is `"error"`. Both end the turn as an error carrying
+  the provider's own text; a stream that stops with no `finish_reason` at all
+  is reported as a cut-off answer, never as a successful `stop`.
+- **`402` means two different things.** Credits or the key's own limit
+  exhausted (`openrouter_credits`, `openrouter_key_limit`) is a hard stop and
+  is not retried. The in-flight spending budget
+  (`openrouter_in_flight_budget`) is transient — it is the only `402`
+  OpenRouter sends a `Retry-After` with, so the plugin honors the hint and
+  retries. `429` and `503` carry `Retry-After` too and back off the same way.
+- **The picker lists what your key can actually call.** The model list comes
+  from `GET /api/v1/models/user` (key-scoped), not the public `/models`
+  (which also lists models the key cannot use). `:batch` entries are dropped
+  (they are not served by the chat endpoint at all), and a model whose
+  `supported_parameters` lacks `tools` is flagged so the `/model` picker hides
+  it — Clanky is agentic, so a tool-less model is a dead end. `~` rolling
+  aliases and `:free` variants stay: they are legitimate choices. `--model`
+  can still name anything, and OpenRouter's own error answers.
+- **Prices are the base tier.** `pricing.prompt` / `completion` /
+  `input_cache_read` are per-token strings, scaled to dollars per Mtok. The
+  `-1` (dynamic routers like `openrouter/auto`) and `0` (`:free`) values are
+  sentinels, not prices: those fields are omitted so the status line and
+  picker fall back to their no-pricing path rather than showing `$-1.00` or
+  `$0.00`. Per-model `pricing.overrides` tiers (prompt-length or
+  time-of-day pricing) are **not** represented — the displayed price is the
+  base tier.
+- **`stream_options.include_usage` is not sent.** OpenRouter documents it as
+  deprecated and without effect (full usage is always returned), so the plugin
+  omits it and relies on the usage always arriving.
 
 ### LiteLLM
 

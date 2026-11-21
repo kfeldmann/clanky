@@ -78,6 +78,9 @@ decisions made during implementation. Check them before redesigning something.
   ladders, reasoning passback) stays in each plugin.
 - `crates/clanky-provider-deepinfra` — DeepInfra provider plugin (OpenAI-compatible)
 - `crates/clanky-provider-litellm` — LiteLLM proxy provider plugin
+- `crates/clanky-provider-openrouter` — OpenRouter provider plugin
+  (OpenAI-compatible; `reasoning` request object, `reasoning_details`
+  passback, mid-stream errors)
 - `crates/clanky-provider-anthropic` — Anthropic provider plugin (uses the
   shared SSE framer and `Retry-After` parser)
 - `crates/clanky-subagents` — parallel subagent launcher (`clanky-subagents`
@@ -110,6 +113,8 @@ decisions made during implementation. Check them before redesigning something.
 - DeepInfra: `DEEPINFRA_API_KEY` (fallback `DEEPINFRA_TOKEN`), optional
   `DEEPINFRA_URL` override
 - LiteLLM: `LITELLM_API_KEY`, `LITELLM_BASE_URL`
+- OpenRouter: `OPENROUTER_API_KEY`, optional `OPENROUTER_BASE_URL`,
+  `OPENROUTER_HTTP_REFERER`, `OPENROUTER_TITLE`
 - Anthropic: `ANTHROPIC_API_KEY` (optional; key path) or
   `clanky-provider-anthropic login` (OAuth path, no key needed), optional
   `ANTHROPIC_BASE_URL`

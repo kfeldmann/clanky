@@ -1,0 +1,17 @@
+[package]
+name = "clanky-provider-openrouter"
+description = "OpenRouter provider for Clanky (OpenAI-compatible chat completions)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clanky-protocol = { path = "../clanky-protocol" }
+clanky-provider-openai = { path = "../clanky-provider-openai" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[lints]
+workspace = true

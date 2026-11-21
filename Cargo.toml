@@ -8,6 +8,7 @@ members = [
     "crates/clanky-provider-openai",
     "crates/clanky-provider-deepinfra",
     "crates/clanky-provider-litellm",
+    "crates/clanky-provider-openrouter",
     "crates/clanky-provider-anthropic",
     "crates/clanky-subagents",
 ]

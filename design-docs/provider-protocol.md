@@ -177,8 +177,18 @@ Field rules:
   else (DeepInfra counts `reasoning` as an alias but silently ignores
   `thinking_blocks`/`reasoning_details`/`thinking`); the LiteLLM plugin
   sends both `reasoning_content` and `thinking_blocks` (the shape LiteLLM
-  documents as required for an Anthropic-backed model through the proxy).
-  A plugin with no such concept ignores the field.
+  documents as required for an Anthropic-backed model through the proxy);
+  the OpenRouter plugin sends `reasoning_details`, its backend's documented
+  passback (`reasoning.text` / `reasoning.encrypted` items), and *not*
+  `reasoning_content`, which is an undocumented alias on that API (M24). A
+  plugin with no such concept ignores the field.
+
+  **The wire shape is the backend's, the protocol field is the same.** An
+  OpenAI-compatible plugin sends whatever passback shape its backend
+  documents — `reasoning_content` (DeepInfra), `reasoning_content` +
+  `thinking_blocks` (LiteLLM), or `reasoning_details` (OpenRouter) — built
+  from the same `ThinkingBlock`s. Nothing about the protocol field changes
+  per provider; only the serialization does.
 
   **The client decides how much is sent (M23 session 4).** A plugin always
   sends the blocks an assistant message carries; it never applies a window

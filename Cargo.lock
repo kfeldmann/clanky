@@ -177,6 +177,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "clanky-provider-openrouter"
+version = "0.1.0"
+dependencies = [
+ "clanky-protocol",
+ "clanky-provider-openai",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "clanky-subagents"
 version = "0.1.0"
 dependencies = [

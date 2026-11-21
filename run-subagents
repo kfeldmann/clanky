@@ -42,6 +42,10 @@ docker run \
   --env LITELLM_API_KEY \
   --env ANTHROPIC_API_KEY \
   --env ANTHROPIC_BASE_URL \
+  --env OPENROUTER_API_KEY \
+  --env OPENROUTER_BASE_URL \
+  --env OPENROUTER_HTTP_REFERER \
+  --env OPENROUTER_TITLE \
   -v "$(pwd):/work" \
   -v "$HOME/.clanky:/home/clanky/.clanky" \
   -w /work \

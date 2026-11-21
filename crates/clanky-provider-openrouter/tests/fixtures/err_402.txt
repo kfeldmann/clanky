@@ -1,0 +1,20 @@
+# OpenRouter 402, two cases wearing one status. NOT a live capture: producing
+# one needs an account out of credits or an exhausted in-flight budget. Both
+# bodies are the documented shapes (api_reference/limits.md#handling-402-errors).
+#
+# The distinguishing signal is the `Retry-After` header: present means the
+# in-flight spending budget (transient, retry); absent means credits or the
+# key's own limit (a hard stop that no retry fixes).
+
+# credits exhausted -- no Retry-After, not retryable
+HTTP/2 402
+content-type: application/json
+
+{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 100000 tokens, but can only afford 5000.","code":402,"metadata":{"limit_source":"openrouter_credits","remedy_hint":"Add credits at https://openrouter.ai/settings/credits, or reduce the request size."}},"user_id":"user_example"}
+
+# in-flight spending budget exhausted -- Retry-After present, retryable
+HTTP/2 402
+retry-after: 12
+content-type: application/json
+
+{"error":{"message":"This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits.","code":402,"metadata":{"reason":"in_flight_budget_exhausted","limit_source":"openrouter_in_flight_budget","remedy_hint":"Retry after your in-flight requests settle (see the Retry-After header)."}},"user_id":"user_example"}

@@ -1,0 +1,15 @@
+HTTP/2 401 
+date: Sat, 21 Nov 2026 00:27:18 GMT
+content-type: application/json
+access-control-allow-origin: *
+access-control-expose-headers: WWW-Authenticate,PAYMENT-REQUIRED,Payment-Receipt,PAYMENT-RESPONSE,Location,X-Generation-Id,x-openrouter-error-origin,x-openrouter-error-tool,X-Provider-Name,request-id,cf-ray
+x-openrouter-error-origin: client
+set-cookie: __cf_bm=kG2k58AnfBROFhe18q5kSEffRe.L4cra.1FZMCv5cRQ-1795220838.2926846-1.0.1.1-pJ0owIB2qM.lq6yb71KhP8vDABaipkzrlTlbDC0LRH8XYpAB3_uiEpUTaDQfw97TVzCW148fSw9YqhFmLICbhuqNe16PYuvC4tQuetVYSugpHG2MaUr9G09yKXeAgIr2; HttpOnly; SameSite=None; Partitioned; Secure; Path=/; Domain=openrouter.ai; Expires=Sat, 21 Nov 2026 00:57:18 GMT
+permissions-policy: payment=(self "https://checkout.stripe.com" "https://connect-js.stripe.com" "https://js.stripe.com" "https://*.js.stripe.com" "https://hooks.stripe.com")
+referrer-policy: no-referrer, strict-origin-when-cross-origin
+x-content-type-options: nosniff
+server: cloudflare
+cf-ray: a5db915f5a640d10-PDX
+alt-svc: h3=":443"; ma=86400
+
+{"error":{"message":"User not found.","code":401}}

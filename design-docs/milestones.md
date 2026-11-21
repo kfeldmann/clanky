@@ -2594,7 +2594,7 @@ provider.
   prompt" claim cannot creep back into the docs while the code does
   otherwise.
 
-## ☐ M24 — OpenRouter provider plugin
+## ✔ M24 — OpenRouter provider plugin
 
 New provider plugin `crates/clanky-provider-openrouter` (binary
 `clanky-provider-openrouter`), talking to OpenRouter's OpenAI-compatible
@@ -2858,7 +2858,7 @@ the OpenAPI spec (`openapi.yaml`), and a live `GET /api/v1/models` dump
   glue over it; the protocol crate gained three tests for it (handshake
   identity, per-request error, non-provider error → `internal`).
 
-#### ☐ M24b — Capture, then the adapter
+#### ✔ M24b — Capture, then the adapter
 - Capture first (the LiteLLM M10 pattern), into
   `crates/clanky-provider-openrouter/tests/fixtures/`: `models_user.json`
   (key-scoped catalog), `stream_plain.txt`, `stream_reasoning.txt`
@@ -2883,7 +2883,88 @@ the OpenAPI spec (`openapi.yaml`), and a live `GET /api/v1/models` dump
   runs a bash tool loop against the live API, streamed, and every fixture
   above is pinned by a test.
 
-#### ☐ M24c — Docs, packaging, and the invariants pass
+  **As built (M24b).** `crates/clanky-provider-openrouter` exists with the
+  planned shape: `backend` (re-exports the shared `Backend`/`BackendError`/
+  `UreqBackend`/`truncate_body`), `provider` (the adapter), a three-line
+  `main.rs` over `clanky_protocol::serve_unavailable`, and 40 tests.
+  Fixtures in `tests/fixtures/` with `dumps.sh` beside them, all captured
+  live against `deepseek/deepseek-v4-flash-0731` unless noted:
+
+  - `models_user.json` — the key-scoped catalog (248 models), trimmed to the
+    fields the plugin reads so it stays reviewable. Every model is kept, so
+    the picker filters run against the real `:batch` / `~` / `:free` /
+    sentinel-price entries.
+  - `stream_plain.txt` (`reasoning.effort: "none"`), `stream_reasoning.txt`
+    (`reasoning_details` deltas), `stream_tools.txt` (reasoning → tool call),
+    `stream_reasoning_signed.txt` (Anthropic via OpenRouter: text deltas then
+    a signature-only detail). `stream_usage.txt` is the tail of
+    `stream_plain.txt` (the repeated-finish-reason chunk plus the usage
+    chunk) split out so the usage-frame rule is pinned on its own.
+  - `err_400.txt`, `err_401.txt`, `err_429.txt` — real `curl -i` captures.
+    The plan said `err_404`; an unknown model id is a **400** on this API
+    ("… is not a valid model ID"), so that is what is captured. The 429 is
+    the interesting one: `error.message` is the generic "Provider returned
+    error" and the actionable text is in `error.metadata.raw`, so the plugin
+    appends the raw text when it adds something.
+  - `stream_error.txt` and `err_402.txt` are **not** live captures — see
+    below.
+
+  Three decisions the plan left open, and how the captures settled them:
+
+  - **Decision 2 resolved to option (a): no new `ThinkingBlock` fields.** A
+    signed Anthropic block sent as `{"type":"reasoning.text","text":…,
+    "signature":…}` — no `id`, no `format`, no `index` — was accepted by both
+    Bedrock and Google on a live round-trip, and the same block with an
+    altered signature is a 400. So `type` + payload is enough, the block goes
+    back byte-exact, and the protocol needs no `id`/`index`/`format`. The same
+    holds for `reasoning.encrypted` on OpenAI/Grok.
+  - **How much the API verifies varies by backend, and it is less than
+    assumed.** Measured on `openai/gpt-6-luna`: an encrypted blob sent with
+    `id`/`format` stripped, and even one whose tail was replaced with junk,
+    both returned 200. Only the Anthropic signature is actually checked. The
+    plugin sends payloads byte-exact anyway — we cannot validate them, so we
+    must not alter them, and the provider may tighten its checks later.
+  - **Mid-stream errors could not be captured live.** They need a provider to
+    fail after the 200 is committed; every attempt (free-tier models, huge
+    `max_tokens`, provider pinning, concurrent load) either succeeded or
+    failed *before* streaming. `stream_error.txt` is therefore the documented
+    shape from `api_reference/errors-and-debugging.md`, and the file says so.
+    The same applies to `err_402.txt` (needs an account without credits); both
+    documented 402 bodies are pinned, and the `Retry-After` header — the only
+    thing that distinguishes the transient case — is what the mapping keys on.
+  - **`reasoning.summary` items stream but are never passed back.** They are a
+    display summary, not the reasoning payload; sending one back as
+    `reasoning.text` would forge a payload the provider never produced. This
+    was not in the plan and is the one place the adapter is more careful than
+    the plan required. It turned out to be the *common* case on OpenAI and
+    Grok, not an exotic one: `openai/gpt-6-luna` streamed 78 `reasoning.summary`
+    deltas and one `reasoning.encrypted` blob, with no `reasoning.text` at all
+    (`x-ai/grok-4.7` the same shape). So on those models the visible thinking
+    is a summary and the passback is the blob — pinned by
+    `stream_reasoning_summary.txt`, a live capture.
+  - **The `mandatory` hint is read but not surfaced.** `supports_thinking`
+    comes from the presence of `reasoning` (so `mandatory` models show as
+    thinking-capable, which they are), but `ModelInfo` v1 has no field to
+    carry "`effort: "none"` will be rejected", and inventing one is a
+    protocol change M24 did not scope. README says so instead of claiming the
+    picker warns.
+
+  Live verification (all through the real plugin process): a plain turn, a
+  one-round and a two-round bash tool loop, `--thinking off` (→ `reasoning.
+  effort: "none"`, no `stream_options` in the body), `reasoning_details`
+  present on round 2's assistant message, a mid-stream `error` chunk
+  surfacing as `error: provider error: backend: 502: …` with the partial
+  output kept, and both 402 cases (credits → `auth`, not retried; in-flight
+  → `rateLimit` with backoff). `list_models` through the plugin returned 249
+  models, no `:batch` entries, 44 tool-less models flagged, and no sentinel
+  prices.
+
+  One shared-crate change: `UreqBackend::with_headers` (and a private
+  `authorize` helper) so a plugin can send extra headers verbatim.
+  `UreqBackend::new` is unchanged, so DeepInfra/LiteLLM/Anthropic behavior
+  and their tests are untouched — goldens included.
+
+#### ✔ M24c — Docs, packaging, and the invariants pass
 - README: a `### OpenRouter` section beside DeepInfra/LiteLLM/Anthropic
   (env vars, default model, the effort-as-fraction caveat, the
   `reasoning_details` passback, the `402` meaning, the picker filters,
@@ -2948,3 +3029,19 @@ backs off and retries;
 `reasoning_details` in a tool loop; and README, `provider-protocol.md`,
 `AGENTS.md`, the workspace layout and the release scripts all mention the
 new plugin.
+
+**As built (M24c).** README gained an `### OpenRouter` section beside
+LiteLLM/Anthropic (env vars, the lossy effort-as-fraction caveat, the
+`--thinking off` / `mandatory` caveat, the `reasoning_details` passback, the
+`200`-is-not-a-success rule, the two `402`s, the picker filters, the
+`:batch`/`:free`/`~` distinctions and the base-tier price caveat), plus the
+provider table row, the `cargo install` line, and the shared-crate paragraph
+now naming OpenRouter. `provider-protocol.md` §5 gained the per-backend
+passback note (same `ThinkingBlock`, wire shape is the provider's) and
+records OpenRouter's choice of `reasoning_details`. `AGENTS.md` lists the
+crate and its env vars. `build-linux-musl`, `build-runner` and
+`docker/runner.Dockerfile` carry the new binary. The invariants review
+(`design-docs/code-reviews/invariants-and-defaults-review.md`) gained a
+Part 3 re-read of the new plugin: no local validation, no silent drops, no
+rewritten user values — prices, budgets, model ids and app headers all pass
+through.

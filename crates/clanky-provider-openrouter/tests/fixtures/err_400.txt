@@ -1,0 +1,17 @@
+HTTP/2 400 
+date: Sat, 21 Nov 2026 00:27:18 GMT
+content-type: application/json
+access-control-allow-origin: *
+access-control-expose-headers: WWW-Authenticate,PAYMENT-REQUIRED,Payment-Receipt,PAYMENT-RESPONSE,Location,X-Generation-Id,x-openrouter-error-origin,x-openrouter-error-tool,X-Provider-Name,request-id,cf-ray
+x-generation-id: gen-1795220838-RMDS2i0skSSHEnfB7ERZ
+x-openrouter-error-origin: client
+x-openrouter-release: api;bd2a9af6-ca00-40c2-b5ed-f6a9cf52fbce
+set-cookie: __cf_bm=781qeqT_YPMx1TZMkqFiDxPOpWHJCr7X0Ugij41b0EQ-1795220838.4193847-1.0.1.1-RZZkjz5xY3Pf7tTHQlFqc7Y7ecBSv56oWz663HbPjxolL7ng_cpXGzwEpu34hoSgL67qrI4qskReBf44abEHG6oovKAoAimiwILogS4wyVpzONytxWBYSqm1cVtsFzZN; HttpOnly; SameSite=None; Partitioned; Secure; Path=/; Domain=openrouter.ai; Expires=Sat, 21 Nov 2026 00:57:18 GMT
+permissions-policy: payment=(self "https://checkout.stripe.com" "https://connect-js.stripe.com" "https://js.stripe.com" "https://*.js.stripe.com" "https://hooks.stripe.com")
+referrer-policy: no-referrer, strict-origin-when-cross-origin
+x-content-type-options: nosniff
+server: cloudflare
+cf-ray: a5db91601de0962a-PDX
+alt-svc: h3=":443"; ma=86400
+
+{"error":{"message":"no-such-model is not a valid model ID","code":400},"user_id":"user_3MOEiUubEsmRIBq24bMtAlhHOdk"}

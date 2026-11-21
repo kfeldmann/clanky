@@ -138,10 +138,23 @@ pub trait Backend {
 pub struct UreqBackend {
     agent: ureq::Agent,
     api_key: String,
+    /// Extra headers sent verbatim on every request. Empty for every plugin
+    /// that needs none; OpenRouter's optional app-attribution headers
+    /// (`HTTP-Referer` / `X-OpenRouter-Title`) are the reason the seam
+    /// exists.
+    headers: Vec<(String, String)>,
 }
 
 impl UreqBackend {
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_headers(api_key, Vec::new())
+    }
+
+    /// Like [`UreqBackend::new`], plus extra headers applied verbatim to
+    /// every request. Values are never rewritten or defaulted here — the
+    /// caller decides what to send (an unset attribution header means the
+    /// list stays short).
+    pub fn with_headers(api_key: impl Into<String>, headers: Vec<(String, String)>) -> Self {
         let agent = ureq::AgentBuilder::new()
             // Connect is bounded, but the request itself has no timeout:
             // a long stream must never be killed mid-answer.
@@ -150,7 +163,17 @@ impl UreqBackend {
         Self {
             agent,
             api_key: api_key.into(),
+            headers,
         }
+    }
+
+    /// Attach the bearer token and the backend's extra headers.
+    fn authorize(&self, call: ureq::Request) -> ureq::Request {
+        let mut call = call.set("Authorization", &format!("Bearer {}", self.api_key));
+        for (name, value) in &self.headers {
+            call = call.set(name, value);
+        }
+        call
     }
 }
 
@@ -160,10 +183,7 @@ impl Backend for UreqBackend {
     }
 
     fn get_status(&self, url: &str) -> Result<(u16, String), BackendError> {
-        let call = self
-            .agent
-            .get(url)
-            .set("Authorization", &format!("Bearer {}", self.api_key));
+        let call = self.authorize(self.agent.get(url));
         match call.call() {
             Ok(resp) => {
                 let status = resp.status();
@@ -181,9 +201,7 @@ impl Backend for UreqBackend {
         body: &str,
     ) -> Result<Box<dyn Iterator<Item = Result<String, BackendError>>>, BackendError> {
         let call = self
-            .agent
-            .post(url)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
+            .authorize(self.agent.post(url))
             .set("Content-Type", "application/json")
             .set("Accept", "text/event-stream");
         match call.send_string(body) {

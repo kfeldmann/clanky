@@ -1,0 +1,17 @@
+HTTP/2 429 
+date: Sat, 21 Nov 2026 00:27:30 GMT
+content-type: application/json
+access-control-allow-origin: *
+access-control-expose-headers: WWW-Authenticate,PAYMENT-REQUIRED,Payment-Receipt,PAYMENT-RESPONSE,Location,X-Generation-Id,x-openrouter-error-origin,x-openrouter-error-tool,X-Provider-Name,request-id,cf-ray
+x-generation-id: gen-1795220849-4fSqB0165cmPDxpWie5j
+x-openrouter-error-origin: provider
+x-openrouter-release: api;bd2a9af6-ca00-40c2-b5ed-f6a9cf52fbce
+set-cookie: __cf_bm=OrwQPLr01NE6bklC5PuBgUPgi7ZB9veYX2OApLW.y6s-1795220849.2238817-1.0.1.1-G9Kz7zh8XKaM577z2fdje9CaWhzEDu24ocpZqHWRUIptxMHiv2r.0SLm_D5Rsa89yZTW5Se0i.OvR4al86XQLQG48Fri48ChXGELZZTxZq2YvCSAmz5RZ5VrP3qtPfAx; HttpOnly; SameSite=None; Partitioned; Secure; Path=/; Domain=openrouter.ai; Expires=Sat, 21 Nov 2026 00:57:30 GMT
+permissions-policy: payment=(self "https://checkout.stripe.com" "https://connect-js.stripe.com" "https://js.stripe.com" "https://*.js.stripe.com" "https://hooks.stripe.com")
+referrer-policy: no-referrer, strict-origin-when-cross-origin
+x-content-type-options: nosniff
+server: cloudflare
+cf-ray: a5db91a3a8ab5ef5-PDX
+alt-svc: h3=":443"; ma=86400
+
+{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"inclusionai/ling-3.2-flash:free is temporarily rate-limited upstream. Please retry shortly, or add your own provider key to use your own limits: https://openrouter.ai/workspaces/default/byok","provider_name":"Ant Digital","is_byok":false,"provider_error_code":"TooManyRequests","limit_source":"upstream_provider_shared_pool","remedy_hint":"Retry shortly, add your own provider key to use your own limits (https://openrouter.ai/workspaces/default/byok), or route to another provider with provider routing: https://openrouter.ai/docs/features/provider-routing."}},"user_id":"user_3MOEiUubEsmRIBq24bMtAlhHOdk"}

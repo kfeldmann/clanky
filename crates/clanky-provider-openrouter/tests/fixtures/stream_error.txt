@@ -1,0 +1,12 @@
+# OpenRouter mid-stream error, Chat Completions shape.
+#
+# NOT a live capture: producing one needs a provider to fail after the 200 is
+# already committed, which cannot be provoked on demand (the attempts made
+# while writing this plugin either succeeded or failed before streaming). This
+# is the shape from OpenRouter's "Errors and Debugging" / "Streaming" docs
+# (api_reference/errors-and-debugging.md#mid-stream-errors), which is what the
+# test pins. HTTP status stays 200; the error rides at the top level and the
+# choice repeats `finish_reason: "error"` to terminate the stream.
+data: {"id":"gen-abc123","object":"chat.completion.chunk","created":1234567890,"model":"deepseek/deepseek-v4-flash-0731","provider":"Example","error":{"code":502,"message":"Provider disconnected unexpectedly","metadata":{"error_type":"server"}},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}
+
+data: [DONE]
