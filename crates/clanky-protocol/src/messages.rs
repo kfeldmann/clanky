@@ -617,7 +617,8 @@ pub enum Error {
         message: String,
         retryable: bool,
         /// Server-provided retry hint in milliseconds (spec §8: optional,
-        /// on `rateLimit`). `None` when the backend gave no usable hint.
+        /// on `rateLimit` and `backend`). `None` when the backend gave no
+        /// usable hint.
         retry_after_ms: Option<u64>,
     },
 }

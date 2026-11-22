@@ -1129,14 +1129,19 @@ entries read as units:
   output character, newlines kept, and the preview capped at a few lines
   with a `… (+N more lines)` note.
 - Retry notices print as `INFO: ↻ message — retrying in Ns
-  (attempt/max)`.
+  (attempt/max)` — in `-q` mode too (they are diagnostics, not activity),
+  and every attempt is recorded in the session file as a `retry` record
+  (`attempt`, `maxRetries`, `delayMs`, `message`), so a session that ends
+  in `error` shows how many retries were spent before the failure.
 - A startup dump prints as `INFO: settings: …` — provider, model, and
   the merged settings (unset fields elided) — so a `-p` run's effective
   configuration is visible in a log with the session file's settings
   record next to it.
 
 `-q` / `--quiet` (print mode only; rejected in TUI mode) prints just the
-agent's response and errors — no thinking, tool calls, or tool results:
+agent's response on stdout — no thinking, tool calls, or tool results.
+Errors and retry notices still go to stderr, so a quiet run is never
+silent about why it failed or slowed:
 
 ```sh
 clanky -p -q "summarize this repo" > summary.txt

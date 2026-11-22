@@ -462,6 +462,9 @@ impl PrintSink {
             TurnEvent::Usage { .. } => {}
             // Retries go to stderr, keeping stdout a clean stream of the
             // answer; without this the turn would look hung during backoff.
+            // They are diagnostics, not activity: even in quiet mode a
+            // retry notice reaches stderr, because a quiet turn that ends
+            // in an error after five silent retries is undiagnosable.
             TurnEvent::Retrying {
                 attempt,
                 max_retries,
@@ -469,9 +472,6 @@ impl PrintSink {
                 message,
             } => {
                 self.close_blocks(out, err);
-                if self.quiet {
-                    return;
-                }
                 Self::out_write(
                     err,
                     &format!(
@@ -878,6 +878,28 @@ mod tests {
         );
         assert_eq!(out, "answer\n\n");
         assert_eq!(err, "");
+    }
+
+    #[test]
+    fn quiet_still_shows_retry_notices() {
+        // A retry notice is a diagnostic, not activity: a quiet turn that
+        // ends in an error after five silent retries is undiagnosable.
+        // stdout stays clean; the notice goes to stderr like in loud mode.
+        let (out, err) = run_events(
+            true,
+            &[TurnEvent::Retrying {
+                attempt: 2,
+                max_retries: 5,
+                delay: Duration::from_millis(625),
+                message: "backend: 504: Upstream idle timeout exceeded".into(),
+            }],
+        );
+        assert_eq!(out, "");
+        assert!(
+            err.contains("INFO: ↻ backend: 504") && err.contains("retrying in 0.6s (2/5)"),
+            "{err:?}"
+        );
+        assert!(err.ends_with("\n\n"), "{err:?}");
     }
 
     #[test]

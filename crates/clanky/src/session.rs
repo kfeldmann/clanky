@@ -22,7 +22,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clanky_protocol::{ChatMessage, ThinkingBlock, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
@@ -200,6 +200,19 @@ pub enum Record {
     },
     /// A turn or write error, kept so the transcript survives resume.
     Error { message: String },
+    /// A retryable provider failure is being retried (`attempt` counts
+    /// from 1, `delay_ms` is the backoff the turn waited). Not
+    /// conversation content — nothing is folded into the history on
+    /// resume — but it is the difference between "the provider failed
+    /// five times" and "the provider failed once", which is exactly what
+    /// a session file otherwise cannot tell about a turn that ended in
+    /// `error`.
+    Retry {
+        attempt: u32,
+        max_retries: u32,
+        delay_ms: u64,
+        message: String,
+    },
     /// Why a turn ended (`FinishReason`, protocol §8), appended when the
     /// turn's terminal `done` arrives — the last record of a completed
     /// turn, after its content, tool results, and usage. A turn cut short
@@ -573,6 +586,7 @@ pub fn load(path: &Path) -> Result<SessionData> {
                     | "toolResult"
                     | "usage"
                     | "error"
+                    | "retry"
                     | "stopReason"
                     | "settings",
             )
@@ -665,6 +679,7 @@ pub fn history_from_records(records: &[Record]) -> Vec<ChatMessage> {
             // the assistant message of their own round.
             Record::Usage { .. }
             | Record::Error { .. }
+            | Record::Retry { .. }
             | Record::StopReason { .. }
             | Record::Settings { .. } => pending_blocks = None,
             Record::Assistant { text, calls } => {
@@ -723,6 +738,19 @@ pub fn usage_record(usage: Usage) -> Record {
 pub fn settings_record(settings: &SessionSettings) -> Record {
     Record::Settings {
         settings: SessionSettingsRecord::from(settings),
+    }
+}
+
+/// Convenience: one retry of a chat round as a record. Called from
+/// [`crate::turn::TurnEvent::Retrying`], once per attempt, so a session
+/// file shows how many times a provider failure was retried before the
+/// turn gave up (or rode it out).
+pub fn retry_record(attempt: u32, max_retries: u32, delay: Duration, message: &str) -> Record {
+    Record::Retry {
+        attempt,
+        max_retries,
+        delay_ms: delay.as_millis() as u64,
+        message: message.to_string(),
     }
 }
 
@@ -821,6 +849,55 @@ mod tests {
         let path = write_session(&dir, "usage", &records);
         let data = load(&path).unwrap();
         assert_eq!(data.records, records);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A `retry` record serializes with a camelCase `delayMs` and loads
+    /// back unchanged — and a retry sitting between a round's `thinking`
+    /// and `assistant` records (the only place one can appear) neither
+    /// breaks the fold nor becomes conversation content.
+    #[test]
+    fn retry_records_round_trip_and_stay_out_of_the_history() {
+        use clanky_protocol::ChatMessage;
+        let dir = temp_dir("retry");
+        let records = vec![
+            Record::User { text: "hi".into() },
+            retry_record(
+                2,
+                5,
+                Duration::from_millis(625),
+                "backend: 504: Upstream idle timeout exceeded",
+            ),
+            Record::Thinking {
+                text: "hmm".into(),
+                blocks: None,
+            },
+            Record::Assistant {
+                text: "hello".into(),
+                calls: vec![],
+            },
+        ];
+        let path = write_session(&dir, "retry", &records);
+        let data = load(&path).unwrap();
+        assert_eq!(data.records, records);
+        let json = serde_json::to_string(&records[1]).unwrap();
+        assert!(
+            json.contains(r#""type":"retry""#) && json.contains(r#""delayMs":625"#),
+            "{json}"
+        );
+        let history = history_from_records(&data.records);
+        assert_eq!(
+            history,
+            vec![
+                ChatMessage::user("hi"),
+                ChatMessage::Assistant {
+                    content: "hello".into(),
+                    tool_calls: None,
+                    thinking: None,
+                }
+            ],
+            "a retry is not conversation content"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

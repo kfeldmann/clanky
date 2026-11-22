@@ -333,7 +333,7 @@ fn thinking_block_wire(block: &ThinkingBlock) -> Value {
 /// is unwrapped from LiteLLM's error envelope (`{"error":{"message":…}}` or
 /// `{"detail":…}`) when possible, so the user sees the proxy's own words
 /// rather than raw JSON. A `Retry-After` hint is carried through as
-/// `retry_after_ms` (spec §8 allows it on `rateLimit`).
+/// `retry_after_ms` (spec §8 allows it on `rateLimit` and `backend`).
 fn backend_to_protocol_error(err: BackendError, context: &str) -> Error {
     let BackendError {
         status,
@@ -356,8 +356,10 @@ fn backend_to_protocol_error(err: BackendError, context: &str) -> Error {
         code,
         message: format!("{status_note}{detail}"),
         retryable: matches!(code, ErrorCode::RateLimit | ErrorCode::Backend),
-        // Spec §8: `retryAfterMs` rides on `rateLimit` errors only.
-        retry_after_ms: if code == ErrorCode::RateLimit {
+        // Spec §8: `retryAfterMs` rides on `rateLimit` and `backend`
+        // errors — a 503/504 that carries a `Retry-After` is telling the
+        // client exactly when to come back.
+        retry_after_ms: if matches!(code, ErrorCode::RateLimit | ErrorCode::Backend) {
             retry_after_ms
         } else {
             None
@@ -1372,6 +1374,30 @@ mod tests {
                 ..
             } => {
                 assert_eq!(code, ErrorCode::RateLimit);
+                assert!(retryable);
+                assert_eq!(retry_after_ms, Some(7_000));
+            }
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn backend_errors_carry_a_retry_after_hint_too() {
+        // Spec §8: `retryAfterMs` rides on `backend` as well — a 503 with
+        // a `Retry-After` tells the client exactly when to come back.
+        let mut provider = provider(CATALOG, MODEL_INFO, Vec::new());
+        provider.backend.post_error = Some(
+            BackendError::new(Some(503), r#"{"error":{"message":"overloaded"}}"#)
+                .with_retry_after_header("7", 0),
+        );
+        match run_chat(&mut provider, &request("x")).1.unwrap_err() {
+            Error::Provider {
+                code,
+                retryable,
+                retry_after_ms,
+                ..
+            } => {
+                assert_eq!(code, ErrorCode::Backend);
                 assert!(retryable);
                 assert_eq!(retry_after_ms, Some(7_000));
             }

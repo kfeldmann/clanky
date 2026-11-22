@@ -15,8 +15,9 @@ pub struct Cli {
     #[arg(short = 'p', long = "print")]
     pub print: bool,
 
-    /// Quiet print mode (`-p` only): just the agent's response and errors —
-    /// no thinking, tool calls, or tool results. Rejected in TUI mode.
+    /// Quiet print mode (`-p` only): just the agent's response on stdout —
+    /// no thinking, tool calls, or tool results. Diagnostics (errors and
+    /// retry notices) still go to stderr. Rejected in TUI mode.
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
 

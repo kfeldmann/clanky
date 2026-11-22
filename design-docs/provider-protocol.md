@@ -358,7 +358,7 @@ Plugin → client:
 
 - `code` is one of: `auth` | `rateLimit` | `invalidRequest` | `backend` |
   `protocol` | `protocolVersion` | `internal`. `retryable` is a hint;
-  `retryAfterMs` (optional, on `rateLimit`) may refine it. The client acts
+  `retryAfterMs` (optional, on `rateLimit` and `backend`) may refine it. The client acts
   on the hint: a `retryable` request-scoped error is retried (default 5
   attempts, backoff growing ×1.25 per retry, honoring `retryAfterMs`), so providers
   should set it for transient conditions (`rateLimit`, `backend` — network

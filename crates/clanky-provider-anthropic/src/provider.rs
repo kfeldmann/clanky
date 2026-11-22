@@ -656,7 +656,10 @@ fn map_backend_error(err: crate::backend::BackendError, context: &str) -> Error 
         code,
         message: format!("{status_note}{detail}"),
         retryable: matches!(code, ErrorCode::RateLimit | ErrorCode::Backend),
-        retry_after_ms: if code == ErrorCode::RateLimit {
+        // Spec §8: `retryAfterMs` rides on `rateLimit` and `backend`
+        // errors — a 503/529 that carries a `Retry-After` is telling the
+        // client exactly when to come back.
+        retry_after_ms: if matches!(code, ErrorCode::RateLimit | ErrorCode::Backend) {
             retry_after_ms
         } else {
             None

@@ -614,8 +614,10 @@ fn provider_error(
         code,
         message: format!("{status_note}{detail}"),
         retryable: matches!(code, ErrorCode::RateLimit | ErrorCode::Backend),
-        // Spec §8: `retryAfterMs` rides on `rateLimit` errors only.
-        retry_after_ms: if code == ErrorCode::RateLimit {
+        // Spec §8: `retryAfterMs` rides on `rateLimit` and `backend`
+        // errors — a 503/504 that carries a `Retry-After` is telling the
+        // client exactly when to come back.
+        retry_after_ms: if matches!(code, ErrorCode::RateLimit | ErrorCode::Backend) {
             retry_after_ms
         } else {
             None
@@ -1992,15 +1994,26 @@ b"
     }
 
     #[test]
-    fn the_retry_after_hint_only_rides_on_rate_limit_errors() {
-        // Spec §8: `retryAfterMs` is meaningful on `rateLimit` only.
+    fn the_retry_after_hint_rides_on_rate_limit_and_backend_errors() {
+        // Spec §8: `retryAfterMs` is meaningful on `rateLimit` and
+        // `backend` — a 503 that carries `Retry-After` is telling the
+        // client exactly when to come back.
         match error_for(Some(503), Some(5_000)) {
             Error::Provider {
                 code,
+                retryable,
                 retry_after_ms,
                 ..
             } => {
                 assert_eq!(code, ErrorCode::Backend);
+                assert!(retryable);
+                assert_eq!(retry_after_ms, Some(5_000));
+            }
+            other => panic!("expected a provider error, got {other:?}"),
+        }
+        // No hint on the codes that cannot be retried anyway.
+        match error_for(Some(400), Some(5_000)) {
+            Error::Provider { retry_after_ms, .. } => {
                 assert_eq!(retry_after_ms, None);
             }
             other => panic!("expected a provider error, got {other:?}"),

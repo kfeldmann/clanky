@@ -613,10 +613,11 @@ impl App {
                 }
                 // Metadata, not conversation content: usage is applied
                 // round-by-round through [`TurnEvent::Usage`], the stop
-                // reason has no transcript entry of its own, and a
-                // settings snapshot is a settings fact (already visible
-                // in the status line), not a transcript entry.
-                Record::StopReason { .. } | Record::Settings { .. } => {}
+                // reason has no transcript entry of its own, a settings
+                // snapshot is a settings fact (already visible in the
+                // status line), and a retry already happened before the
+                // session was resumed — its live notice was on stderr.
+                Record::StopReason { .. } | Record::Settings { .. } | Record::Retry { .. } => {}
             }
         }
         crate::session::history_from_records(records)

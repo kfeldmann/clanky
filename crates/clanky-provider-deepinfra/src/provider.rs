@@ -230,7 +230,7 @@ fn deepinfra_reasoning_passback(
 
 /// Map an HTTP-layer failure to a request-scoped protocol error. A
 /// server-provided `Retry-After` hint is carried through as
-/// `retry_after_ms` (spec §8 allows it on `rateLimit`).
+/// `retry_after_ms` (spec §8 allows it on `rateLimit` and `backend`).
 fn backend_to_protocol_error(err: BackendError, context: &str) -> Error {
     let BackendError {
         status,
@@ -253,8 +253,10 @@ fn backend_to_protocol_error(err: BackendError, context: &str) -> Error {
         code,
         message: format!("{status_note}{detail}"),
         retryable: matches!(code, ErrorCode::RateLimit | ErrorCode::Backend),
-        // Spec §8: `retryAfterMs` rides on `rateLimit` errors only.
-        retry_after_ms: if code == ErrorCode::RateLimit {
+        // Spec §8: `retryAfterMs` rides on `rateLimit` and `backend`
+        // errors — a 503/504 that carries a `Retry-After` is telling the
+        // client exactly when to come back.
+        retry_after_ms: if matches!(code, ErrorCode::RateLimit | ErrorCode::Backend) {
             retry_after_ms
         } else {
             None
@@ -1109,6 +1111,31 @@ mod tests {
                 }
                 other => panic!("unexpected: {other}"),
             }
+        }
+    }
+
+    #[test]
+    fn backend_errors_carry_a_retry_after_hint_too() {
+        // Spec §8: `retryAfterMs` rides on `backend` as well — a 503/504
+        // with a `Retry-After` tells the client exactly when to come back.
+        let mut provider =
+            DeepInfraProvider::new(MockBackend::new(Vec::new(), "[]"), "https://x.invalid");
+        provider.backend.fail = Some(
+            BackendError::new(Some(504), "Upstream idle timeout exceeded")
+                .with_retry_after_header("7", 0),
+        );
+        match provider.chat(&simple_request(), &mut |_| {}).unwrap_err() {
+            Error::Provider {
+                code,
+                retryable,
+                retry_after_ms,
+                ..
+            } => {
+                assert_eq!(code, ErrorCode::Backend);
+                assert!(retryable);
+                assert_eq!(retry_after_ms, Some(7_000));
+            }
+            other => panic!("unexpected: {other}"),
         }
     }
 

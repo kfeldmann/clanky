@@ -424,15 +424,30 @@ pub fn record_turn_event(recorder: &mut Recorder, errors: &mut dyn ErrorSink, ev
         TurnEvent::Usage { usage } => {
             recorder.record(errors, session::usage_record(*usage));
         }
+        TurnEvent::Retrying {
+            attempt,
+            max_retries,
+            delay,
+            message,
+        } => {
+            // A retry is not conversation content, but it is the only
+            // trace of how often a provider failed before the turn gave
+            // up (or rode it out) — without it, a session ending in
+            // `error` cannot be told apart from one where every retry
+            // was already spent.
+            recorder.record(
+                errors,
+                session::retry_record(*attempt, *max_retries, *delay, message),
+            );
+        }
         // Streaming deltas are accumulated and consolidated into the
         // round's records when the round completes (or is cut short; see
         // `Recorder::flush_partial`).
         TurnEvent::Text { delta } => recorder.accumulate(delta, false),
         TurnEvent::Thinking { delta } => recorder.accumulate(delta, true),
-        // Retry notices and tool-call activity are UI-only: they are not
-        // conversation content, so nothing is recorded in the session
-        // file.
-        TurnEvent::ToolCall { .. } | TurnEvent::Retrying { .. } => {}
+        // Tool-call activity is UI-only: it is not conversation content,
+        // so nothing is recorded in the session file.
+        TurnEvent::ToolCall { .. } => {}
     }
 }
 
@@ -454,6 +469,7 @@ impl ErrorSink for StderrErrors {
 mod tests {
     use super::*;
     use crate::turn::TurnEvent;
+    use std::time::Duration;
 
     struct PanickySink;
     impl ErrorSink for PanickySink {
@@ -594,6 +610,51 @@ mod tests {
     /// The records on disk (settings record included).
     fn records_on_disk(dir: &Path) -> Vec<session::Record> {
         session::load(&dir.join("session.jsonl")).unwrap().records
+    }
+
+    #[test]
+    fn a_retry_event_is_recorded_so_the_file_shows_how_many_attempts_were_spent() {
+        // The point of the record: a session ending in `error` must show
+        // whether the provider failed once or five times.
+        let dir = std::env::temp_dir().join(format!(
+            "clanky-retry-record-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut recorder = Recorder::with_dir(dir.clone(), "session", SessionSettings::default());
+        let mut errors = PanickySink;
+        record_turn_event(
+            &mut recorder,
+            &mut errors,
+            &TurnEvent::Retrying {
+                attempt: 3,
+                max_retries: 5,
+                delay: Duration::from_millis(781),
+                message: "backend: 504: Upstream idle timeout exceeded".into(),
+            },
+        );
+        recorder.record_done(&mut errors, &Err(crate::error::Error::NoPrompt));
+        let records = records_on_disk(&dir);
+        assert!(
+            records.contains(&session::retry_record(
+                3,
+                5,
+                Duration::from_millis(781),
+                "backend: 504: Upstream idle timeout exceeded"
+            )),
+            "{records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, session::Record::Error { .. })),
+            "the terminal error record is still written: {records:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

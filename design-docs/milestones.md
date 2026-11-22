@@ -216,6 +216,11 @@ cheap rate is still being applied.
   backoff growing ×1.25 per retry (500 ms … 30 s cap), honoring `Retry-After`; a retry
   is surfaced in the transcript (TUI) or on stderr (pipe), and a round that
   already streamed content is never replayed
+  As built (revised): `Retry-After` is honored on `backend` errors too
+  (spec §8 now allows `retryAfterMs` on `rateLimit` and `backend`), and each
+  retry attempt writes a `retry` record to the session file — the file
+  previously could not distinguish a failure after five retries from a
+  failure on the first.
 - DONE - TUI reworked to linear terminal output: the transcript is printed straight
   to the normal buffer (no alternate screen, no mouse capture), so native
   scrolling and selection work and history persists after quitting; replaced
@@ -461,6 +466,10 @@ real tenant.
        was deleted. Print-mode events go through `PrintSink` in `main.rs` (testable against
        captured streams). `-q` in TUI mode is a usage error (`Error::QuietRequiresPrint`); in
        quiet mode retry notices are suppressed too (they're activity, not errors).
+       *(Revised: retry notices are diagnostics, not activity — they now reach stderr
+       in `-q` as well, and every retry attempt is recorded in the session file as a
+       `retry` record. A quiet turn that died after five silent retries was
+       undiagnosable.)*
        Note: the TUI rejection was documented here but not actually implemented until the
        front-end choice was extracted into `select_front_end` (main.rs) — the flag was
        accepted and silently ignored, leaving `QuietRequiresPrint` as dead code. The

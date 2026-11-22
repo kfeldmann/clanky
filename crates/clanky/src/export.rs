@@ -153,6 +153,11 @@ pub fn render(
                 // Usage is summarized once, after the transcript.
                 saw_usage = true;
             }
+            Record::Retry { .. } => {
+                // A retry is diagnostics, not transcript content: it
+                // changed nothing the model said. Its effect — a turn
+                // that failed despite them — is in the `error` record.
+            }
             Record::StopReason { reason } => {
                 // The last turn's stop reason is metadata, like usage:
                 // one footer line, not a transcript entry.
