@@ -1277,6 +1277,7 @@ fn apply_picker_selection(
             if let Some(model) = models.get(index) {
                 let id = model.id.clone();
                 launch.model = Some(id.clone());
+                observe_settings(state, launch);
                 app.entries
                     .push(app::Entry::Info(format!("model set to `{id}`")));
             }
@@ -1295,6 +1296,7 @@ fn apply_picker_selection(
                 // falling back to the backend default.
                 let parsed = crate::turn::parse_thinking(value).ok();
                 launch.thinking = parsed.map(|_| value.to_string());
+                observe_settings(state, launch);
                 let disabled = parsed.is_some_and(|t| t.budget_tokens == Some(0));
                 app.entries.push(app::Entry::Info(if disabled {
                     "thinking disabled".into()
@@ -3124,6 +3126,92 @@ mod tests {
                 provider: Some("deepinfra".into()),
                 model: Some("m/picked".into()),
                 timeout_seconds: Some(5),
+                ..SessionSettings::default()
+            })
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn picker_selections_write_settings_records() {
+        // Picking from the `/model` and `/thinking` pickers mutates the
+        // same live settings the typed commands do, so it must be
+        // observed the same way: one settings record after the session
+        // has started (this is how the missing records in a real
+        // session file were traced to the picker paths).
+        let (mut state, dir) = recording_state("picker-records");
+        let mut cfg = launch();
+        let mut app = app::App::new(None);
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let mut catalog = Catalog::new("deepinfra".into());
+        let _interrupt = Interrupt::new();
+
+        // The session starts (the front end records the prompt first).
+        state.record(&mut NoErrors, session::Record::User { text: "hi".into() });
+
+        let model = |id: &str| ModelInfo {
+            id: id.into(),
+            display_name: None,
+            context_window: None,
+            supports_thinking: None,
+            supports_tools: Some(true),
+            supports_text_generation: Some(true),
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            cache_read_price_per_mtok: None,
+        };
+        let models = vec![model("chat/model"), model("other/model")];
+        let mut picker = Some((
+            picker_for(&PickerKind::Models(models.clone())),
+            PickerKind::Models(models),
+        ));
+        apply_picker_selection(
+            &mut picker,
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+        );
+        assert_eq!(cfg.model.as_deref(), Some("chat/model"));
+        let data = session::load(&dir.join("session.jsonl")).unwrap();
+        assert_eq!(
+            data.records.len(),
+            3,
+            "the model picker must append a settings record: {data:?}"
+        );
+        assert_eq!(
+            data.records[2],
+            session::settings_record(&SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("chat/model".into()),
+                ..SessionSettings::default()
+            })
+        );
+
+        // Same for the thinking picker.
+        let mut picker = Some((picker_for(&PickerKind::Thinking), PickerKind::Thinking));
+        apply_picker_selection(
+            &mut picker,
+            &mut app,
+            &mut state,
+            &mut cfg,
+            &mut catalog,
+            &tx,
+        );
+        assert!(cfg.thinking.is_some(), "a thinking option was picked");
+        let data = session::load(&dir.join("session.jsonl")).unwrap();
+        assert_eq!(
+            data.records.len(),
+            4,
+            "the thinking picker must append a settings record: {data:?}"
+        );
+        assert_eq!(
+            data.records[3],
+            session::settings_record(&SessionSettings {
+                provider: Some("deepinfra".into()),
+                model: Some("chat/model".into()),
+                thinking: cfg.thinking.clone(),
                 ..SessionSettings::default()
             })
         );
